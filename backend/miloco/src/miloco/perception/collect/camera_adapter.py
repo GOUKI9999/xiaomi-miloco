@@ -149,7 +149,10 @@ class CameraDeviceAdapter(BaseDeviceAdapter):
         require_lan: bool = True,
         cap: bool = True,
     ) -> dict[str, PerceptionDevice]:
-        if not self._miot_proxy.is_authenticated:
+        # 判「可用」而非「存在」：授权被云端永久拒绝后，拉相机列表这一步本身就会
+        # 401，拿不到列表就没有相机可感知。与其让感知空转到访问令牌自然到期，
+        # 不如当场停下并告知住户重新授权。瞬时故障不走这条——见 is_operational。
+        if not self._miot_proxy.is_operational:
             return {}
         return self._filter_cameras_from_all(
             all_devices if all_devices else await self._miot_proxy.get_cameras(),
@@ -249,7 +252,7 @@ class CameraDeviceAdapter(BaseDeviceAdapter):
         ``online_only`` / ``require_lan`` / ``cap`` 同理也是透传生效的——基类
         重算保留集用的 ``require_lan=False, cap=False`` 正是这条不变量的实现。）
         """
-        if all_devices is None and self._miot_proxy.is_authenticated:
+        if all_devices is None and self._miot_proxy.is_operational:
             await self._check_stalled_cameras()
             try:
                 # 判据用**严格门**（require_lan 默认 True，与 refresh_cameras 建销

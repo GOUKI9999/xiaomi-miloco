@@ -17,7 +17,11 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
-from miloco.database.kv_repo import DeviceInfoKeys, ScopeConfigKeys
+from miloco.database.kv_repo import (
+    AuthConfigKeys,
+    DeviceInfoKeys,
+    ScopeConfigKeys,
+)
 from miloco.middleware.exceptions import (
     MiotServiceException,
     ResourceNotFoundException,
@@ -304,6 +308,9 @@ def test_set_in_use_no_op_skips_kv_write():
 def _make_service(devices: dict | None = None, cameras: dict | None = None, kv: _FakeKV | None = None) -> MiotService:
     kv = kv or _FakeKV({ScopeConfigKeys.HOME_WHITE_LIST_KEY: json.dumps(["H1"])})
     proxy = SimpleNamespace(
+        # 真实代理有这个判据，夹具也要有：缺了它，生产侧任何「先问一句能不能用」
+        # 的检查都会在这里撞 AttributeError，而那不是生产缺陷、是夹具没建模。
+        is_operational=True,
         _kv_repo=SimpleNamespace(
             db_connector=SimpleNamespace(
                 execute_update=lambda *a, **kw: 0,
@@ -317,6 +324,11 @@ def _make_service(devices: dict | None = None, cameras: dict | None = None, kv: 
         ),
         get_devices=AsyncMock(return_value=devices or {}),
         get_cameras=AsyncMock(return_value=cameras or {}),
+        # 真实代理另有一对**不触发刷新**的取数口（降级态下写台账走它们，避免为一行
+        # 留痕去打一趟注定 401 的云端）。夹具让它们与上面那两个刷新口返回同一份，
+        # 缺了它们，被拒那条路会在这里撞 AttributeError。
+        cached_devices=devices or {},
+        get_cached_camera=lambda did: (cameras or {}).get(did),
         refresh_devices=AsyncMock(return_value=None),
         refresh_cameras=AsyncMock(return_value=None),
         refresh_scenes=AsyncMock(return_value=None),
@@ -979,6 +991,34 @@ def _lru_cleared(db_connector) -> bool:
         for c in db_connector.execute_update.call_args_list
         if "device_lru" in str(c)
     )
+
+
+@pytest.mark.asyncio
+async def test_authorize_clears_scope_when_it_fails_after_the_token_landed():
+    """换票已落库、其后某一步失败时，范围也必须清——那道比对根本跑不到。
+
+    授权这条路上「取账号身份」刻意不兜异常（当场报错让住户重试一次，比留下
+    「绑上了但收不到推送」更诚实）。于是存在「新账号的令牌已经落库、而身份未知」
+    的中间态：此时上面那道 fail-closed 比对整个跳过，库里剩下「新账号的令牌 +
+    旧账号的家庭与摄像头范围」。跨账号残留的拾音白名单若在新账号下命中，会让住户
+    从未授权的摄像头麦克风直接生效——那是唯一「误命中等于隐私泄露」的键。
+    """
+    kv = _scope_kv("old-uid")
+    kv.set(AuthConfigKeys.MIOT_TOKEN_INFO_KEY, json.dumps({"access_token": "old"}))
+    svc, proxy, _db = _authorize_fixture(kv, new_uid="new-uid")
+
+    async def _exchange_then_fail(code, state):
+        # 模拟真实顺序：落库先发生（SDK 的 persist 回调），之后那一步才抛
+        kv.set(AuthConfigKeys.MIOT_TOKEN_INFO_KEY, json.dumps({"access_token": "new"}))
+        raise TimeoutError("fetching account identity timed out")
+
+    proxy.get_miot_auth_info = AsyncMock(side_effect=_exchange_then_fail)
+
+    with pytest.raises(MiotServiceException):
+        await svc.authorize_with_code(code="test_code", state="test_state")
+
+    assert kv.get(ScopeConfigKeys.HOME_WHITE_LIST_KEY) is None
+    assert kv.get(ScopeConfigKeys.CAMERA_BLACK_LIST_KEY) is None
 
 
 @pytest.mark.asyncio
