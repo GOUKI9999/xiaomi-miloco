@@ -19,7 +19,12 @@ import {
   actionTypeKey,
   type BackendActionRow,
 } from "@/components/ActionsFeed";
-import { mergeFeedRows } from "@/components/ActivityFeed";
+import {
+  feedLowerBound,
+  mergeFeedRows,
+  nextHasMore,
+  nextOffset,
+} from "@/components/ActivityFeed";
 import type { ActivityEvent } from "@/lib/types";
 
 const originalFetch = globalThis.fetch;
@@ -198,5 +203,159 @@ describe("mergeFeedRows — 单流合并 / 交错 / 窗口", () => {
     const r = mergeFeedRows([ev("e", 200)], [row({ id: "a", timestamp: 200 })], true, true);
     expect(r[0].kind).toBe("event");
     expect(r[1].kind).toBe("action");
+  });
+});
+
+/**
+ * 回归:「勾上事件+动作后,稍旧的感知事件消失、下面全是动作条目」。
+ *
+ * 成因是两个下界写成了 `sinceMs ?? 事件地平线`,而默认视图的 since 恒为今天 00:00
+ * ——`??` 永远短路,地平线那支从来没跑过。老测试全都不传 sinceMs,恰好只覆盖了
+ * 生产环境永远不会走的那条分支,所以这个 bug 带着绿灯上线。
+ *
+ * 这一组的共同前提:**sinceMs 已定义**(和生产默认态一致)。
+ */
+describe("mergeFeedRows — 事件地平线(回归:事件断流)", () => {
+  const DAY = 1_000_000; // 今天 00:00
+  // 已加载的一页事件(生产里是 PAGE_SIZE=50 条中最旧的那批)
+  const loaded = [ev("e-new", DAY + 900), ev("e-oldest-loaded", DAY + 500)];
+  // 动作一次拉全,铺满整个 since 窗口——包含地平线以下那段
+  const acts = [
+    row({ id: "a-top", timestamp: DAY + 950 }),
+    row({ id: "a-in", timestamp: DAY + 600 }),
+    row({ id: "a-at-horizon", timestamp: DAY + 500 }),
+    row({ id: "a-below-1", timestamp: DAY + 400 }),
+    row({ id: "a-below-2", timestamp: DAY + 100 }),
+  ];
+  const ids = (rows: ReturnType<typeof mergeFeedRows>) =>
+    rows.map((x) => (x.kind === "event" ? x.event.id : x.action.id));
+  /** since/before 只约束动作:事件是后端按同一时间窗查回来的,前端不再二次过滤。 */
+  const actIds = (rows: ReturnType<typeof mergeFeedRows>) =>
+    rows.flatMap((x) => (x.kind === "action" ? [x.action.id] : []));
+
+  it("sinceMs 已定义时地平线仍生效:地平线以下的动作被裁(核心回归)", () => {
+    const r = mergeFeedRows(loaded, acts, true, true, DAY, undefined, true);
+    expect(ids(r)).toEqual([
+      "a-top",
+      "e-new",
+      "a-in",
+      "e-oldest-loaded",
+      "a-at-horizon", // 同 ts:事件在前、动作在后
+    ]);
+    // 老实现在这里会把 a-below-1 / a-below-2 也放出来,列表尾部成为"只有动作"的墙
+    expect(ids(r)).not.toContain("a-below-1");
+    expect(ids(r)).not.toContain("a-below-2");
+  });
+
+  it("hasMoreEvents=false(事件已全部加载)→ 不设地平线,动作铺到 sinceMs", () => {
+    const r = mergeFeedRows(loaded, acts, true, true, DAY, undefined, false);
+    expect(ids(r)).toContain("a-below-1");
+    expect(ids(r)).toContain("a-below-2");
+  });
+
+  it("翻页把地平线推下去,原先被裁的动作显出来", () => {
+    const nextPage = [...loaded, ev("e-page2", DAY + 200)];
+    const r = mergeFeedRows(nextPage, acts, true, true, DAY, undefined, true);
+    expect(ids(r)).toContain("a-below-1"); // 400 >= 新地平线 200
+    expect(ids(r)).not.toContain("a-below-2"); // 100 < 200,仍在地平线下
+  });
+
+  it("sinceMs 比地平线更晚时由 sinceMs 说了算(取 max,不是取地平线)", () => {
+    const r = mergeFeedRows(loaded, acts, true, true, DAY + 700, undefined, true);
+    // 地平线是 DAY+500,sinceMs 是 DAY+700 → 下界 700,a-in(600) 也被卡掉
+    expect(actIds(r)).toEqual(["a-top"]);
+  });
+
+  it("事件 checkbox 关掉 → 无地平线,动作在 since 窗内全展示", () => {
+    const r = mergeFeedRows(loaded, acts, false, true, DAY, undefined, true);
+    expect(ids(r)).toEqual(["a-top", "a-in", "a-at-horizon", "a-below-1", "a-below-2"]);
+  });
+
+  it("beforeMs 与地平线同时生效(上下界互不干扰)", () => {
+    const r = mergeFeedRows(loaded, acts, true, true, DAY, DAY + 700, true);
+    // 上界 700 卡掉 a-top(950),下界(地平线 500)卡掉 a-below-*
+    expect(actIds(r)).toEqual(["a-in", "a-at-horizon"]);
+  });
+
+  it("事件不受 since/before 二次过滤(后端已按同一时间窗查回)", () => {
+    const r = mergeFeedRows(loaded, acts, true, true, DAY + 700, DAY + 800, true);
+    // 两条事件都在窗外,但仍原样保留——窗只管动作
+    expect(ids(r).filter((id) => id.startsWith("e-"))).toEqual([
+      "e-new",
+      "e-oldest-loaded",
+    ]);
+  });
+});
+
+describe("feedLowerBound — 两个下界取 max", () => {
+  const evs = [ev("a", 500), ev("b", 900)];
+
+  it("sinceMs 与地平线取较晚的那个", () => {
+    expect(feedLowerBound(evs, true, 100, true)).toBe(500); // 地平线赢
+    expect(feedLowerBound(evs, true, 800, true)).toBe(800); // sinceMs 赢
+  });
+
+  it("sinceMs 未定义时退回纯地平线", () => {
+    expect(feedLowerBound(evs, true, undefined, true)).toBe(500);
+  });
+
+  it("hasMoreEvents=false / 不显事件 / 无事件 → 无地平线", () => {
+    expect(feedLowerBound(evs, true, undefined, false)).toBe(-Infinity);
+    expect(feedLowerBound(evs, false, undefined, true)).toBe(-Infinity);
+    expect(feedLowerBound([], true, undefined, true)).toBe(-Infinity);
+  });
+
+  it("无事件但有 sinceMs → sinceMs 仍是硬界", () => {
+    expect(feedLowerBound([], true, 300, true)).toBe(300);
+  });
+
+  it("默认 hasMoreEvents=true 是保守侧(不知道有没有更多时宁可裁)", () => {
+    expect(feedLowerBound(evs, true, 100)).toBe(500);
+  });
+});
+
+/**
+ * hasMore 现在身兼两职:既控「查看更早」按钮,又是 feedLowerBound 的地平线闸。
+ * 写错一次就会把地平线关掉、退回那堵动作墙,所以三种模式的规则单独钉住。
+ * PAGE_SIZE = 50。
+ */
+describe("nextHasMore — 取数后的分页标记", () => {
+  it("replace / append:满页=还有更早,短页=到底", () => {
+    expect(nextHasMore("replace", false, 50)).toBe(true);
+    expect(nextHasMore("replace", true, 12)).toBe(false);
+    expect(nextHasMore("append", true, 50)).toBe(true);
+    expect(nextHasMore("append", true, 3)).toBe(false);
+  });
+
+  it("refresh 只升不降:满页可以把 false 抬成 true", () => {
+    // 回归:断线期间新增 >PAGE_SIZE 条事件,重连后第 0 页满页 —— 此时列表中间有空洞,
+    // 必须把「查看更早」放出来,否则用户永远补不回那段。
+    expect(nextHasMore("refresh", false, 50)).toBe(true);
+  });
+
+  it("refresh 短页不得把 true 打成 false(第 0 页答不了'下面还有没有')", () => {
+    // 回归:用户翻到第 4 页、hasMore=true,一次重连若把它打成 false,
+    // 按钮消失 + 地平线失效 → 动作墙回归。
+    expect(nextHasMore("refresh", true, 12)).toBe(true);
+    expect(nextHasMore("refresh", true, 0)).toBe(true);
+  });
+
+  it("refresh 在已到底的列表上拿到短页仍维持到底", () => {
+    expect(nextHasMore("refresh", false, 12)).toBe(false);
+  });
+});
+
+describe("nextOffset — 只进不退", () => {
+  it("append 正常前进", () => {
+    expect(nextOffset(50, 50, 50)).toBe(100);
+  });
+
+  it("refresh 拉第 0 页不得让已翻到的深度回退", () => {
+    // 回归:翻到 200 条后重连,pageOffset+len = 50,直接写会让下次翻页重拉已有页。
+    expect(nextOffset(200, 0, 50)).toBe(200);
+  });
+
+  it("首次 append 从 0 起算", () => {
+    expect(nextOffset(0, 0, 37)).toBe(37);
   });
 });

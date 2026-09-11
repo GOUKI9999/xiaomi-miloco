@@ -78,12 +78,67 @@ export type FeedRow =
   | { kind: "event"; ts: number; event: ActivityEvent }
   | { kind: "action"; ts: number; action: BackendActionRow };
 
+/** 单流的时间下界 —— 两个下界取**较晚**的那个。纯函数,导出供 tests 与截断提示复用。
+ *
+ *  两个下界各管一件事,谁都不能替代谁:
+ *  - `sinceMs`:用户显式筛的起点。权威硬界,即使一条事件都没有也生效
+ *    (修过的老 bug:事件为空时动作曾无下界、混入范围外历史动作)。
+ *  - **事件地平线** = 最旧一条**已加载**事件的 ts。事件按 PAGE_SIZE 分页、动作一次
+ *    拉 ACTIONS_LIMIT 条,两条流取数深度差着数量级;地平线以下服务端还有事件没拉,
+ *    此时若把动作放出来,列表尾部就成了一整段"只有动作、没有事件"的墙。
+ *
+ *  取 max 而不是 `??` 是这里的关键。老代码写的是 `sinceMs ?? 地平线`,而默认视图的
+ *  since 恒为今天 00:00 —— 永远有值,`??` 永远短路,地平线那支是死代码,于是第 50 条
+ *  事件以下全是动作。见 tests「sinceMs 已定义时地平线仍生效」。
+ *
+ *  `hasMoreEvents=false`(该窗口的事件已全部加载)时不设地平线:底下没有未加载的事件,
+ *  动作可以一直铺到 sinceMs。默认 true 是保守侧——不知道有没有更多时,宁可裁。
+ */
+export function feedLowerBound(
+  events: ActivityEvent[],
+  showEvents: boolean,
+  sinceMs?: number,
+  hasMoreEvents = true,
+): number {
+  const horizon =
+    showEvents && hasMoreEvents && events.length > 0
+      ? Math.min(...events.map((e) => e.timestamp))
+      : -Infinity;
+  return Math.max(sinceMs ?? -Infinity, horizon);
+}
+
+/** 一次事件取数的三种语义。见 fetchPage。 */
+export type FetchMode = "replace" | "append" | "refresh";
+
+/** 取数成功后 `hasMore` 怎么变。抽成纯函数是因为这个标记现在**身兼两职**——
+ *  既决定「查看更早」按钮显不显,也决定 feedLowerBound 要不要压事件地平线——
+ *  写错一次就会把动作地平线整个关掉,退回本 PR 要修的那堵动作墙。
+ *
+ *  - `replace` / `append`:满页即可能还有更早,短页即到底。分页的权威答案。
+ *  - `refresh`(SSE 重连补漏):**只升不降**。第 0 页满页证明"上面至少还有一页",
+ *    但完全不能回答"我手里这批的下面还有没有";若让它把 hasMore 打成 false,
+ *    一次重连就能让「查看更早」永久消失、地平线失效,而列表中间还留着空洞。
+ */
+export function nextHasMore(
+  mode: FetchMode,
+  prevHasMore: boolean,
+  freshCount: number,
+): boolean {
+  const full = freshCount === PAGE_SIZE;
+  return mode === "refresh" ? prevHasMore || full : full;
+}
+
+/** 取数成功后 `offset` 怎么变 —— 只进不退。
+ *  refresh 拉的永远是第 0 页,若直接写 pageOffset+len,已翻到第 4 页的用户会被打回
+ *  offset=50,下次「查看更早」重拉已有页。 */
+export function nextOffset(prevOffset: number, pageOffset: number, freshCount: number): number {
+  return Math.max(prevOffset, pageOffset + freshCount);
+}
+
 /** 事件流 + 动作流合并成单条时间倒序流。纯函数,导出供 tests 守 window + 交错顺序。
  *
- *  窗口规则(spec):动作一次拉全(limit=500),但只交错**落在当前展示事件时间窗内**的
- *  动作,外加**比最新展示事件更新**的动作。合起来即:保留所有 ts >= 最旧展示事件 ts 的
- *  动作(既覆盖"窗内",也覆盖"比最新更新"——后者 ts 天然 >= 最旧)。展示事件为空时
- *  (events 关 / 事件列表空)动作不设下界,全部展示。
+ *  窗口规则:动作只保留 `[feedLowerBound, beforeMs]` 内的行——即同时受用户筛选段和
+ *  事件地平线约束(见 feedLowerBound)。展示事件为空 / 事件 checkbox 关时不设地平线。
  *
  *  同 ts 时事件排在动作前(事件是"发生了什么"、动作是"因此做了什么",因果上事件在先)。
  */
@@ -94,20 +149,14 @@ export function mergeFeedRows(
   showActions: boolean,
   sinceMs?: number,
   beforeMs?: number,
+  hasMoreEvents = true,
 ): FeedRow[] {
   const rows: FeedRow[] = [];
   if (showEvents) {
     for (const e of events) rows.push({ kind: "event", ts: e.timestamp, event: e });
   }
   if (showActions) {
-    // 动作的时间窗与事件同段:显式筛选段(sinceMs/beforeMs)优先——它是权威下/上界,
-    // 即使没有事件也生效(修:事件为空时动作曾无下界、混入范围外历史动作)。未设筛选段时
-    // (全量视图)回落"最旧展示事件 ts"的分页启发式,裁掉尚未翻到的更早动作。
-    const lower =
-      sinceMs ??
-      (showEvents && events.length > 0
-        ? Math.min(...events.map((e) => e.timestamp))
-        : -Infinity);
+    const lower = feedLowerBound(events, showEvents, sinceMs, hasMoreEvents);
     const upper = beforeMs ?? Infinity;
     for (const a of actions) {
       if (a.timestamp >= lower && a.timestamp <= upper) {
@@ -260,12 +309,22 @@ export function ActivityFeed({
     return () => clearTimeout(t);
   }, [since, before]);
 
-  /** 统一拉取(filter / 翻页 / SSE 重连 reload 共用),fetchGen 守 stale overwrite. */
+  /** 统一拉取(filter / 翻页 / SSE 重连 reload 共用),fetchGen 守 stale overwrite.
+   *
+   *  三种模式必须分开,不能只靠一个 append 布尔:
+   *  - `replace` 筛选段 / 切家变了,旧列表整体作废 → 硬替换。
+   *  - `append`  「查看更早」翻页 → merge 进已有列表,offset 前进。
+   *  - `refresh` SSE 重连补漏 → **也必须 merge**。老代码这里走的是 replace 分支,
+   *    于是用户翻了四页攒到 200 条事件,网络抖一下 / 笔记本睡醒 / 后端重启,
+   *    列表就被 setEvents(fresh) 打回 50 条;而 500 条动作走的是另一条取数路径、
+   *    毫发无损 —— 字面意义上的"刚才还在的事件不见了",且不报错不留痕。
+   */
   const fetchPage = (opts: {
-    append?: boolean;
+    mode?: FetchMode;
     pageOffset?: number;
   }) => {
     const gen = ++fetchGenRef.current;
+    const mode = opts.mode ?? "replace";
     const pageOffset = opts.pageOffset ?? 0;
     setLoading(true);
     return listActivity(homeId, {
@@ -276,22 +335,27 @@ export function ActivityFeed({
     })
       .then((fresh) => {
         if (gen !== fetchGenRef.current) return; // N1: stale,丢弃
-        if (opts.append) {
+        if (mode === "replace") {
+          setEvents(fresh);
+          setOffset(fresh.length);
+        } else {
           // append 期间 SSE 可能已经 prepend 新事件,简单 [...prev, ...fresh]
           // 会让"更早的 fresh"夹在"SSE 推的更晚事件"中间 → 视觉乱序.
           // mergeAndSort 按 id dedup + 按 timestamp DESC 重排兜底,得到稳定顺序.
           setEvents((prev) => mergeAndSort(prev, fresh));
-          setOffset(pageOffset + fresh.length);
-        } else {
-          setEvents(fresh);
-          setOffset(fresh.length);
+          setOffset((prev) => nextOffset(prev, pageOffset, fresh.length));
         }
-        setHasMore(fresh.length === PAGE_SIZE);
+        setHasMore((prev) => nextHasMore(mode, prev, fresh.length));
       })
       .catch(() => {
         if (gen !== fetchGenRef.current) return;
-        if (!opts.append) setEvents([]);
-        setHasMore(false);
+        // **不动 hasMore**。请求失败不回答"还有没有更早"这个问题,而 hasMore 同时
+        // 是动作地平线的闸:把它打成 false,一次失败的「查看更早」就会把地平线关掉,
+        // 底下重新涌出那堵只有动作的墙,而且按钮同时消失、无法重试。保持原值 →
+        // 按钮还在、地平线还在,用户可以再点一次。
+        if (mode === "replace") setEvents([]);
+        // append 失败要出声:静默失败的点击会被读成"没有更早的了"。
+        if (mode === "append") toast(t("activity.loadMoreFailed"), "warn");
       })
       .finally(() => {
         if (gen !== fetchGenRef.current) return;
@@ -319,7 +383,7 @@ export function ActivityFeed({
   // filter 变化时主动拉取(homeId 也走这里)
   useEffect(() => {
     if (!filterActive) return; // 未筛选时由 prop sync useEffect 接管
-    fetchPage({ pageOffset: 0 });
+    fetchPage({ mode: "replace", pageOffset: 0 });
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [appliedSince, appliedBefore, homeId]);
 
@@ -336,10 +400,11 @@ export function ActivityFeed({
     };
 
     // 重连成功 / 首次 open 时拉一次,补回断开期间错过的事件(spec B13).
-    // 走 fetchPage 享 gen 保护;不会 overwrite SSE prepend 的更新事件 — fetchPage 拉到
-    // 的列表会和 SSE merge 的 in-memory 版本一致(后端是 SoT).
+    // 走 fetchPage 享 gen 保护;mode=refresh 保证是 merge 而非替换,已翻的页不会被
+    // 一次重连抹掉。残留缺口:若断线期间新增事件多于 PAGE_SIZE,第 0 页补不全中间段,
+    // 由后续 SSE 推送 + 用户翻页自愈。
     const reload = () => {
-      fetchPage({ pageOffset: 0 });
+      fetchPage({ mode: "refresh", pageOffset: 0 });
     };
 
     const start = () => {
@@ -404,10 +469,11 @@ export function ActivityFeed({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [appliedSince, appliedBefore, homeId, debouncedReloadActions]);
 
-  /** 触发翻页:offset += PAGE_SIZE,append 模式 */
+  /** 触发翻页:offset += PAGE_SIZE,append 模式。
+   *  翻页同时把事件地平线往下推,合流里被地平线裁掉的那段动作随之显出来。 */
   const loadMore = () => {
     if (loading || !hasMore) return;
-    fetchPage({ append: true, pageOffset: offset });
+    fetchPage({ mode: "append", pageOffset: offset });
   };
 
   // 事件 + 动作合并成单条时间倒序流(见 mergeFeedRows 的窗口规则);带上当前应用的时间窗,
@@ -415,14 +481,45 @@ export function ActivityFeed({
   const feedRows = useMemo(
     () =>
       mergeFeedRows(
-        events, actions, showEvents, showActions, appliedSince, appliedBefore,
+        events, actions, showEvents, showActions, appliedSince, appliedBefore, hasMore,
       ),
-    [events, actions, showEvents, showActions, appliedSince, appliedBefore],
+    [events, actions, showEvents, showActions, appliedSince, appliedBefore, hasMore],
   );
 
   const noneChecked = !showEvents && !showActions;
   // "查看更早" 仅在展示事件时有意义(动作已一次拉全 500,无分页)。
   const showLoadMore = showEvents && hasMore && events.length > 0;
+
+  // 计数按流拆开。老代码用合并后的 feedRows.length 显"已加载 312 条+",那个 + 挂在
+  // 谁身上完全看不出来——恰恰是被截断的事件流被描述成完整的。
+  const shownEvents = useMemo(
+    () => feedRows.reduce((n, r) => n + (r.kind === "event" ? 1 : 0), 0),
+    [feedRows],
+  );
+  const shownActions = feedRows.length - shownEvents;
+
+  // 动作为什么可能不全,有两个互相独立的原因,提示语不能混为一谈:
+  //  - clippedByHorizon:已取回但被事件地平线压在下面,翻页就能显出来。
+  //  - truncatedByLimit:500 上限确实卡住了——仅当最旧一条已取动作仍**高于**展示
+  //    下界时才成立;地平线卡在 500 之上时上限并不生效,此时提示"仅显示最近 500 条"
+  //    会把用户引到错误的原因上。
+  const { actionsClipped, actionsTruncated } = useMemo(() => {
+    if (!showActions) return { actionsClipped: false, actionsTruncated: false };
+    const lower = feedLowerBound(events, showEvents, appliedSince, hasMore);
+    const clipped = actions.some((a) => a.timestamp < lower);
+    const truncated =
+      actions.length >= ACTIONS_LIMIT &&
+      Math.min(...actions.map((a) => a.timestamp)) > lower;
+    return { actionsClipped: clipped || truncated, actionsTruncated: truncated };
+  }, [actions, showActions, events, showEvents, appliedSince, hasMore]);
+
+  // 两条流各自带自己的 "+",不再用合并总数糊弄过去。
+  const loadedDetail = [
+    showEvents && t("activity.countEvents", { n: shownEvents, more: showLoadMore ? "+" : "" }),
+    showActions && t("activity.countActions", { n: shownActions, more: actionsClipped ? "+" : "" }),
+  ]
+    .filter(Boolean)
+    .join(" · ");
 
   return (
     <section
@@ -437,7 +534,9 @@ export function ActivityFeed({
           {t("activity.title")}
           <span className="text-caption-mono text-text-tertiary font-normal">
             {activeTab === "events"
-              ? t("activity.loadedCount", { n: feedRows.length, more: showLoadMore ? "+" : "" })
+              ? /* 两个 checkbox 都关时 loadedDetail 为空,整段不渲染——否则标题旁
+                   会挂一个没有宾语的"已加载"。 */
+                loadedDetail && t("activity.loaded", { detail: loadedDetail })
               : t("activity.odLoaded", { n: odCount, more: odHasMore ? "+" : "" })}
           </span>
         </h2>
@@ -541,8 +640,8 @@ export function ActivityFeed({
               <ActionRow key={`a:${r.action.id}`} row={r.action} t={t} />
             ),
           )}
-          {/* 动作拉取达上限(500):最旧的动作被截断,底部给条弱提示告知只显最近 500 条。 */}
-          {showActions && actions.length === ACTIONS_LIMIT && (
+          {/* 动作拉取达上限(500)**且该上限确实卡住了展示**时才提示 —— 见 actionsTruncated。 */}
+          {actionsTruncated && (
             <li className="px-5 py-2 text-caption text-text-tertiary text-center">
               {t("actions.limitHint")}
             </li>
@@ -551,7 +650,12 @@ export function ActivityFeed({
       )}
 
       {showLoadMore && (
-        <div className="px-5 py-3 border-t border-border flex justify-center">
+        <div className="px-5 py-3 border-t border-border flex flex-col items-center gap-1">
+          {/* 列表到这里为止是**地平线**,不是"没有了"。老 UI 只为动作流写了截断提示、
+              事件流截断却一声不吭,用户读到的就是"事件消失了"。 */}
+          <span className="text-caption text-text-tertiary">
+            {t("activity.horizonHint")}
+          </span>
           <button
             type="button"
             onClick={loadMore}
