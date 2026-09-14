@@ -274,6 +274,11 @@ class CameraSettings(BaseModel):
     """摄像头采集参数。"""
 
     frame_interval: int = Field(default=1000, description="帧采集间隔（毫秒）")
+    decoded_frame_interval: int = Field(
+        default=0,
+        ge=0,
+        description="感知 BGR 帧回调最小间隔（毫秒）；0 保持每个解码帧均回调。",
+    )
     max_cache_images: int = Field(default=6, description="最大缓存图像数量")
 
 

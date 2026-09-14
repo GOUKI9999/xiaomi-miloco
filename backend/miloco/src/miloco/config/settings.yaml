@@ -62,6 +62,7 @@ notify:
 # 摄像头采集参数
 camera:
   frame_interval: 1000   # 帧采集间隔（毫秒）
+  decoded_frame_interval: 0  # 感知 BGR 回调间隔；0=不限流（向后兼容）
   max_cache_images: 6    # 最大缓存图像数量
 
 # 规则引擎相关配置
