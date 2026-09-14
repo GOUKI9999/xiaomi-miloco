@@ -133,6 +133,7 @@ class MIoTCameraInstance:
         enable_hw_accel: bool,
         camera_info: MIoTCameraInfo,
         main_loop: Optional[asyncio.AbstractEventLoop] = None,
+        decoded_frame_interval: int = 0,
     ):
         self._manager = manager
         self._main_loop = main_loop or asyncio.get_running_loop()
@@ -140,6 +141,7 @@ class MIoTCameraInstance:
         self._camera_info = camera_info
         self._did = camera_info.did
         self._frame_interval = frame_interval
+        self._decoded_frame_interval = max(0, decoded_frame_interval)
         self._enable_hw_accel = enable_hw_accel
         self._callback_refs = {}
 
@@ -225,6 +227,7 @@ class MIoTCameraInstance:
         for _ in range(channel_count):
             decoder = MIoTMediaDecoder(
                 frame_interval=self._frame_interval,
+                decoded_frame_interval=self._decoded_frame_interval,
                 video_callback=self.__on_video_decode_callback,
                 audio_callback=self.__on_audio_decode_callback,
                 video_frame_callback=self.__on_video_frame_decode_callback,
@@ -1017,6 +1020,7 @@ class MIoTCamera:
         self,
         camera_info: MIoTCameraInfo | Dict,
         frame_interval: Optional[int] = None,
+        decoded_frame_interval: int = 0,
         enable_hw_accel: Optional[bool] = None,
     ) -> MIoTCameraInstance:
         """Create camera."""
@@ -1033,6 +1037,7 @@ class MIoTCamera:
             manager=self,
             frame_interval=frame_interval or self._frame_interval,
             enable_hw_accel=enable_hw_accel or self._enable_hw_accel,
+            decoded_frame_interval=decoded_frame_interval,
             camera_info=camera,
             main_loop=self._main_loop,
         )
