@@ -91,6 +91,11 @@ _SCHEMA_PATHS: dict[str, tuple[type, Any, str]] = {
         "是否由 miloco 自动管理内置定时任务（感知摘要 / 家庭巡检 / Dreaming / 习惯洞察）；"
         "关闭后 agent 网关启动时会清除这些自动任务且不再重建",
     ),
+    "camera.decoded_frame_interval": (
+        int,
+        0,
+        "感知 BGR 帧回调最小间隔（毫秒）；0=不限流，重启生效",
+    ),
     "perception.engine.input.video_short_edge": (
         int,
         512,
