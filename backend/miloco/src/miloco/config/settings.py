@@ -301,6 +301,10 @@ class PerceptionCollectSettings(BaseModel):
     """感知采集模块窗口参数。"""
 
     window_size: int = Field(default=4, description="时间窗口大小（秒）")
+    stagger_devices: bool = Field(
+        default=False,
+        description="多摄像头按 1/N 周期均匀错开感知窗口（默认关闭）",
+    )
     max_windows: int = Field(default=3, description="最大待处理窗口数")
     settle_ms: int = Field(default=500, description="等待慢轨道的宽限期（毫秒）")
     full_action: str = Field(
