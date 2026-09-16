@@ -144,6 +144,11 @@ _SCHEMA_PATHS: dict[str, tuple[type, Any, str]] = {
         4,
         "感知窗口时长（秒），重启生效",
     ),
+    "perception.collect.stagger_devices": (
+        bool,
+        False,
+        "多摄像头按 1/N 周期均匀错开感知窗口，减少同时进入 Omni/LLM 的峰值；重启生效",
+    ),
     # 实验性功能开关（与 backend FeaturesSettings 对齐；住户在 web 显式开启，也可用本命令）
     "features.pet_recognition": (
         bool,
