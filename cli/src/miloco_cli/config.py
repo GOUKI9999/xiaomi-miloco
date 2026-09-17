@@ -94,7 +94,7 @@ _SCHEMA_PATHS: dict[str, tuple[type, Any, str]] = {
     "camera.decoded_frame_interval": (
         int,
         0,
-        "感知 BGR 帧回调最小间隔（毫秒）；0=不限流，重启生效",
+        "无人直播/录像时的感知 BGR 回调间隔（毫秒，0-10000）；实时订阅自动全速；0=不限流，重启生效",
     ),
     "perception.engine.input.video_short_edge": (
         int,
