@@ -71,6 +71,14 @@ def test_phase_change_clears_old_alignment_only_when_value_changes():
     assert buf.window_count == 1
 
 
+def test_phase_change_reports_discarded_windows():
+    buf = MultiTrackSyncBuffer(["video"], window_ms=100)
+    buf.put("video", b"partial", 10, 10)
+
+    assert buf.set_phase_offset_ms(25) is True
+    assert buf.consume_drop_stats() == (1, 0, 0, "phase_realign")
+
+
 def test_four_camera_offsets_are_sorted_and_evenly_spaced():
     offsets = _window_phase_offsets(
         ["cam-d", "cam-b", "cam-a", "cam-c"],

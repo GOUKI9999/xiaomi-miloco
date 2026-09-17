@@ -95,3 +95,19 @@ def test_zero_interval_preserves_every_decoded_callback(monkeypatch) -> None:
     assert codec.decode_calls == 3
     assert frame.ndarray_calls == 3
     assert len(loop.scheduled) == 3
+
+
+def test_switching_to_full_rate_emits_the_next_frame_immediately(monkeypatch) -> None:
+    decoder, loop, frame, codec = _make_decoder(interval_ms=500)
+    ticks = iter((1000, 1100, 1101))
+    monkeypatch.setattr(decoder_module, "Packet", lambda data: data)
+    monkeypatch.setattr(decoder_module, "_monotonic_ms", lambda: next(ticks))
+
+    decoder._on_video_callback(_frame_data(1))
+    decoder._on_video_callback(_frame_data(2))
+    decoder.set_decoded_frame_interval(0)
+    decoder._on_video_callback(_frame_data(3))
+
+    assert codec.decode_calls == 3
+    assert frame.ndarray_calls == 2
+    assert len(loop.scheduled) == 2
