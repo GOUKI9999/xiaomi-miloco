@@ -757,12 +757,16 @@ class MiotProxy:
         camera_id: str,
         channel: int,
         callback: Callable[[str, VideoFrame, int, int], Coroutine],
+        *,
+        full_rate: bool = False,
     ) -> int:
         if camera_id not in self._camera_img_managers:
             logger.warning("Camera %s not found in managers", camera_id)
             return -1
         instance = self._camera_img_managers[camera_id]
-        reg_id = await instance.register_decode_video_frame_stream(callback, channel)
+        reg_id = await instance.register_decode_video_frame_stream(
+            callback, channel, full_rate=full_rate
+        )
         logger.info(
             "Started decode video frame stream, camera_id: %s, channel: %s, reg_id: %d",
             camera_id,

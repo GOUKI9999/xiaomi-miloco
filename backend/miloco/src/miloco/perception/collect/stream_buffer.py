@@ -433,16 +433,16 @@ class MultiTrackSyncBuffer:
             if phase_offset_ms == self._phase_offset_ms:
                 return False
             self._phase_offset_ms = phase_offset_ms
+            discarded = len(self._windows)
             self._windows.clear()
             self._ready_queue.clear()
             self._ready_keys.clear()
             self._drained.clear()
             self._first_window_keys = {t: None for t in self._track_names}
             self._tracks_initialized.clear()
-            self._dropped_since_drain = 0
-            self._overflow_count_since_drain = 0
-            self._max_depth_since_drain = 0
-            self._last_overflow_action = None
+            if discarded:
+                self._dropped_since_drain += discarded
+                self._last_overflow_action = "phase_realign"
             return True
 
     def clear(self) -> None:

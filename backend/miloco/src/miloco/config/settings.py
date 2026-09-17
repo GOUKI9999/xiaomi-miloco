@@ -277,7 +277,11 @@ class CameraSettings(BaseModel):
     decoded_frame_interval: int = Field(
         default=0,
         ge=0,
-        description="感知 BGR 帧回调最小间隔（毫秒）；0 保持每个解码帧均回调。",
+        le=10_000,
+        description=(
+            "无人直播/录像时的感知 BGR 帧回调最小间隔（毫秒）；"
+            "实时订阅期间自动恢复全帧率，0 始终不限流。"
+        ),
     )
     max_cache_images: int = Field(default=6, description="最大缓存图像数量")
 

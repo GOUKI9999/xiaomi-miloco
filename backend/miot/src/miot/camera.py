@@ -120,6 +120,7 @@ class MIoTCameraInstance:
     _enable_record: bool
     _callbacks: Dict[str, Dict[str, Callable[..., Coroutine]]]
     _next_reg_id: int
+    _full_rate_video_reg_ids: Dict[int, set[str]]
 
     _reconnect_timer: Optional[asyncio.TimerHandle]
     _reconnect_timeout: int
@@ -153,6 +154,7 @@ class MIoTCameraInstance:
 
         self._callbacks = {}
         self._next_reg_id = 1
+        self._full_rate_video_reg_ids = {}
         self._reconnect_timer = None
         self._reconnect_timeout = CAMERA_RECONNECT_TIME_MIN
         self._decoders = []
@@ -195,6 +197,7 @@ class MIoTCameraInstance:
         self._lib_miot_camera.miot_camera_free(self._c_instance)
         self._callback_refs.clear()
         self._callbacks.clear()
+        self._full_rate_video_reg_ids.clear()
 
     async def start_async(
         self,
@@ -451,6 +454,7 @@ class MIoTCameraInstance:
         callback: Callable[[str, VideoFrame, int, int, int, int], Coroutine],
         channel: int = 0,
         multi_reg: bool = False,
+        full_rate: bool = False,
     ) -> int:
         """Register camera decode video frame callback.
         async def on_decode_video_frame_async(
@@ -463,6 +467,12 @@ class MIoTCameraInstance:
         self._callbacks.setdefault(reg_key, {})
         reg_id: int = self._alloc_reg_id(multi_reg)
         self._callbacks[reg_key][str(reg_id)] = callback
+        if full_rate:
+            registrations = self._full_rate_video_reg_ids.setdefault(channel, set())
+            enable_full_rate = not registrations
+            registrations.add(str(reg_id))
+            if enable_full_rate and channel < len(self._decoders):
+                self._decoders[channel].set_decoded_frame_interval(0)
         return reg_id
 
     async def unregister_decode_video_frame_async(
@@ -476,6 +486,15 @@ class MIoTCameraInstance:
         if reg_key not in self._callbacks:
             return
         self._callbacks[reg_key].pop(str(reg_id), None)
+        registrations = self._full_rate_video_reg_ids.get(channel)
+        if registrations is not None:
+            registrations.discard(str(reg_id))
+            if not registrations:
+                self._full_rate_video_reg_ids.pop(channel, None)
+                if channel < len(self._decoders):
+                    self._decoders[channel].set_decoded_frame_interval(
+                        self._decoded_frame_interval
+                    )
 
     async def register_decode_audio_frame_async(
         self,
@@ -1272,6 +1291,7 @@ class MIoTCamera:
         callback: Callable[[str, VideoFrame, int, int, int, int], Coroutine],
         channel: int = 0,
         multi_reg: bool = False,
+        full_rate: bool = False,
     ) -> int:
         """Register decode video frame.
         async def on_decode_video_frame_async(
@@ -1284,7 +1304,10 @@ class MIoTCamera:
         if channel < 0 or channel >= self._camera_map[did].camera_info.channel_count:
             raise MIoTCameraError(f"invalid channel, {did}, {channel}")
         return await self._camera_map[did].register_decode_video_frame_async(
-            callback=callback, channel=channel, multi_reg=multi_reg
+            callback=callback,
+            channel=channel,
+            multi_reg=multi_reg,
+            full_rate=full_rate,
         )
 
     async def unregister_decode_video_frame_async(

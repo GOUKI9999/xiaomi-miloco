@@ -275,6 +275,14 @@ class MIoTMediaDecoder(threading.Thread):
     def push_audio_frame(self, frame_data: MIoTCameraFrameData) -> None:
         self._queue.put_audio(frame_data)
 
+    def set_decoded_frame_interval(self, interval_ms: int) -> None:
+        """Update BGR callback sampling without restarting the decoder.
+
+        Setting the interval to zero makes the very next decoded frame due,
+        which lets an interactive viewer enter full-rate mode immediately.
+        """
+        self._decoded_frame_interval = max(0, interval_ms)
+
     def detect_hwaccel(self):
         try:
             result = subprocess.run(
