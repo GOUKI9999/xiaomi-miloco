@@ -14,7 +14,6 @@
     "emptyDefault": "今天还没什么事 · 它在替你看着",
     "loadMore": "查看更早",
     "loadMoreFailed": "加载更早的事件失败，请重试",
-    "eventsLoadFailed": "加载事件失败，请重试或调整时间范围",
     "collapse": "收起",
     "triggerFired": "已触发",
     "triggerStillIn": "持续中",

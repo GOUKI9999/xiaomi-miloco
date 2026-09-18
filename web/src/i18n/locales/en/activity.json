@@ -14,7 +14,6 @@
     "emptyDefault": "Nothing yet today · It's watching over things for you",
     "loadMore": "View earlier",
     "loadMoreFailed": "Failed to load earlier events — please retry",
-    "eventsLoadFailed": "Failed to load events — retry or adjust the time range",
     "collapse": "Collapse",
     "triggerFired": "Fired",
     "triggerStillIn": "Ongoing",

@@ -20,6 +20,7 @@ import {
 } from "@/components/ActionsFeed";
 import {
   feedLowerBound,
+  hasGapAbove,
   mergeFeedRows,
   nextEvents,
   nextHasMore,
@@ -327,10 +328,17 @@ describe("nextHasMore — 取数后的分页标记", () => {
     expect(nextHasMore("append", true, 3)).toBe(false);
   });
 
-  it("refresh 只升不降:满页可以把 false 抬成 true", () => {
-    // 回归:断线期间新增 >PAGE_SIZE 条事件,重连后第 0 页满页 —— 此时列表中间有空洞,
-    // 必须把「查看更早」放出来,否则用户永远补不回那段。
-    expect(nextHasMore("refresh", false, 50)).toBe(true);
+  it("refresh 满页 + 第 0 页与手里数据接不上(中间有空洞)→ 抬成 true", () => {
+    // 回归:断线期间新增 >PAGE_SIZE 条事件,重连后第 0 页满页且与旧数据接不上 ——
+    // 列表中间空出一段。此时不能标成"已到底":那是句关于完整性的断言,而它不成立。
+    expect(nextHasMore("refresh", false, 50, true)).toBe(true);
+  });
+
+  it("refresh 满页但接得上 → 不得推翻短页给出的'已到底'", () => {
+    // 回归:窗口已全部加载(hasMore=false),一次与数据无关的重连拿回满页第 0 页,
+    // 且第 0 页与手里数据重叠、没有空洞。若把 hasMore 抬成 true,地平线会重新压上,
+    // 窗内更早的动作被裁掉,提示语还说"更早的事件与动作尚未加载" —— 事件其实一条不缺。
+    expect(nextHasMore("refresh", false, 50, false)).toBe(false);
   });
 
   it("refresh 短页不得把 true 打成 false(第 0 页答不了'下面还有没有')", () => {
@@ -342,6 +350,34 @@ describe("nextHasMore — 取数后的分页标记", () => {
 
   it("refresh 在已到底的列表上拿到短页仍维持到底", () => {
     expect(nextHasMore("refresh", false, 12)).toBe(false);
+  });
+});
+
+/**
+ * hasGapAbove 是 refresh 抬升 hasMore 的唯一理由:第 0 页与手里最新的事件之间
+ * 有没有空出一段。判松了 = 与数据无关的重连也会压上地平线(上面那条回归);
+ * 判紧了 = 真有空洞却标成"已到底"。时间戳 DESC,故比较的是
+ * "fresh 里最旧的" 与 "prev 里最新的"。
+ */
+describe("hasGapAbove — 重连第 0 页与手里数据接不接得上", () => {
+  it("第 0 页整体比手里最新那条还新 → 有空洞", () => {
+    // 手里最新 500,回来的第 0 页是 900 / 1000:800 前后那段没拿到。
+    expect(hasGapAbove([ev("have", 500)], [ev("f-old", 900), ev("f-new", 1000)])).toBe(true);
+  });
+
+  it("第 0 页与手里数据有重叠 → 接得上,不算空洞", () => {
+    // 回来的第 0 页含 500(与手里那条同一时间戳的另一条),说明这段没漏。
+    expect(hasGapAbove([ev("have", 500)], [ev("f-old", 500), ev("f-new", 1000)])).toBe(false);
+    expect(hasGapAbove([ev("have", 500)], [ev("f-old", 400), ev("f-new", 1000)])).toBe(false);
+  });
+
+  it("边界:第 0 页最旧一条恰好等于手里最新一条 → 接得上", () => {
+    expect(hasGapAbove([ev("have", 900)], [ev("f", 900)])).toBe(false);
+  });
+
+  it("空页无空洞;手里为空当有空洞(保守:底下还有没有仍是未知)", () => {
+    expect(hasGapAbove([ev("have", 900)], [])).toBe(false);
+    expect(hasGapAbove([], [ev("f", 900)])).toBe(true);
   });
 });
 

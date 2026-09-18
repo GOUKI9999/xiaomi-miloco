@@ -110,22 +110,38 @@ export function feedLowerBound(
 /** 一次事件取数的三种语义。见 fetchPage。 */
 export type FetchMode = "replace" | "append" | "refresh";
 
-/** 取数成功后 `hasMore` 怎么变。抽成纯函数是因为这个标记现在**身兼两职**——
+/** `refresh` 专用:第 0 页与手里最新的事件**接不接得上**。
+ *
+ *  接不上(`fresh` 的最旧一条仍比 `prev` 的最新一条更新)= 断线期间新增超过一页、
+ *  中间空出一段。接得上则第 0 页与已有数据重叠,说明这段断开没漏掉东西。
+ *
+ *  `prev` 为空(手里没有可比对的)时当接不上——保守侧:底下有没有更早的仍是未知。 */
+export function hasGapAbove(prev: ActivityEvent[], fresh: ActivityEvent[]): boolean {
+  if (fresh.length === 0) return false;
+  if (prev.length === 0) return true;
+  return Math.min(...fresh.map((e) => e.timestamp)) > Math.max(...prev.map((e) => e.timestamp));
+}
+
+/** 取数成功后 `hasMore` 怎么变。抽成纯函数是因为这个标记**身兼两职**——
  *  既决定「查看更早」按钮显不显,也决定 feedLowerBound 要不要压事件地平线——
- *  写错一次就会把动作地平线整个关掉,退回本 PR 要修的那堵动作墙。
+ *  写错一次就会把动作地平线整个关掉,退回那堵只有动作的墙。
  *
  *  - `replace` / `append`:满页即可能还有更早,短页即到底。分页的权威答案。
- *  - `refresh`(SSE 重连补漏):**只升不降**。第 0 页满页证明"上面至少还有一页",
- *    但完全不能回答"我手里这批的下面还有没有";若让它把 hasMore 打成 false,
- *    一次重连就能让「查看更早」永久消失、地平线失效,而列表中间还留着空洞。
- */
+ *  - `refresh`(SSE 重连补漏):**只升不降,且抬升要求真的接不上**。两个方向都会出事:
+ *    让它把短页给出的"已到底"打成 false,一次重连就能让「查看更早」永久消失、
+ *    地平线失效,而列表中间还留着空洞;反过来让满页无条件抬成 true,一次与数据无关
+ *    的重连就能把"已到底"推翻,让已经加载完整的窗口重新压上地平线——窗内更早的动作
+ *    被裁掉,还挂着"更早的事件与动作尚未加载",而事件其实一条不缺。
+ *    第 0 页满页只说明"上面至少还有一页",答不了"我手里这批的下面还有没有";
+ *    它能抬升的唯一理由是第 0 页与手里数据之间空了段(hasGapAbove)。 */
 export function nextHasMore(
   mode: FetchMode,
   prevHasMore: boolean,
   freshCount: number,
+  gapAbove = false,
 ): boolean {
   const full = freshCount === PAGE_SIZE;
-  return mode === "refresh" ? prevHasMore || full : full;
+  return mode === "refresh" ? prevHasMore || (full && gapAbove) : full;
 }
 
 /** 取数成功后 `offset` 怎么变 —— 只进不退。
@@ -255,8 +271,17 @@ export function ActivityFeed({
   const [offset, setOffset] = useState(0);
   /** 后端最近一次 GET 是否还满 PAGE_SIZE(可能还有更早) */
   const [hasMore, setHasMore] = useState(false);
+  /** 组件内取数失败(带筛选的那条请求)的消息。App 层的 eventsError 覆盖不到这里:
+   *  它反映的是**不带筛选**的那次请求。失败后列表会被清空,只有瞬时 toast 的话,
+   *  失败后的画面(事件 0 条 + 动作照旧)与"这个时间段没数据"肉眼难分,故留成 state
+   *  由 banner 常驻,并自带重试入口。null = 本次取数没有失败。 */
+  const [fetchError, setFetchError] = useState<string | null>(null);
   /** Promise generation token — stale fetch resolve 时丢弃(N1) */
   const fetchGenRef = useRef(0);
+  /** `events` 的最新值,fetch resolve 时读。闭包里的 `events` 是**发请求那一刻**的快照,
+   *  resolve 时可能已被 SSE prepend 过;判"第 0 页与手里数据接不接得上"必须用最新值——
+   *  拿旧快照比,会把其实重叠的两段误判成空洞,反过来把地平线误开。 */
+  const eventsRef = useRef<ActivityEvent[]>([]);
   /** 全屏播放器(点开看大):null 关闭.kind 决定用 <video> 还是 <img>(参考帧是 JPEG);
    *  crop 由参考帧卡透上来(它已经拉过坐标),放大后继续画框、不重复请求. */
   const [lightbox, setLightbox] = useState<{
@@ -333,9 +358,9 @@ export function ActivityFeed({
    *    列表就被 setEvents(fresh) 打回 50 条;而 500 条动作走的是另一条取数路径、
    *    毫发无损 —— 字面意义上的"刚才还在的事件不见了",且不报错不留痕。
    *
-   *  失败路径同样按模式分,不是统一一句"失败了":`replace` 列表与分页深度一起作废
-   *  并出声,`append` 保留列表与按钮、只出声,`refresh` 静默(重连补漏失败不动任何
-   *  状态,等下一次推送或下一次重连)。
+   *  失败路径同样按模式分,不是统一一句"失败了":`replace` 列表与分页深度一起作废、
+   *  并留下常驻 banner(可重试),`append` 保留列表与按钮、只出声,`refresh` 静默(重连
+   *  补漏失败不动任何状态,等下一次推送或下一次重连)。
    */
   const fetchPage = (opts: {
     mode?: FetchMode;
@@ -345,6 +370,9 @@ export function ActivityFeed({
     const mode = opts.mode ?? "replace";
     const pageOffset = opts.pageOffset ?? 0;
     setLoading(true);
+    // 只有 replace 在开跑时清掉上次的失败:它是"当前视图从头再来一遍",旧失败已不代表现在;
+    // append / refresh 是后台动作,清掉会让一次静默失败的 refresh 抹掉用户还没看的报错。
+    if (mode === "replace") setFetchError(null);
     return listActivity(homeId, {
       since: appliedSince,
       before: appliedBefore,
@@ -357,11 +385,14 @@ export function ActivityFeed({
         // 简单 [...prev, ...fresh] 会让"更早的 fresh"夹在"SSE 推的更晚事件"中间 →
         // 视觉乱序。mergeAndSort 按 id dedup + 按 timestamp DESC 重排兜底,得到稳定顺序。
         setEvents((prev) => nextEvents(mode, prev, fresh));
+        setFetchError(null);
         if (mode === "replace") setOffset(fresh.length);
         else setOffset((prev) => nextOffset(prev, pageOffset, fresh.length));
-        setHasMore((prev) => nextHasMore(mode, prev, fresh.length));
+        // 判据要读**最新**列表(eventsRef),不是这次渲染闭包里的快照 —— 理由见 eventsRef 声明处。
+        const gapAbove = hasGapAbove(eventsRef.current, fresh);
+        setHasMore((prev) => nextHasMore(mode, prev, fresh.length, gapAbove));
       })
-      .catch(() => {
+      .catch((e: unknown) => {
         if (gen !== fetchGenRef.current) return;
         // **不动 hasMore**。请求失败不回答"还有没有更早"这个问题,而 hasMore 同时
         // 是动作地平线的闸:把它打成 false,一次失败的「查看更早」就会把地平线关掉,
@@ -374,9 +405,10 @@ export function ActivityFeed({
           // —— 又一种"事件悄悄不见"。清空与归零必须成对出现。
           setEvents([]);
           setOffset(0);
-          // 出声:失败后的画面(事件 0 条 + 动作仍在)与"事件被动作墙盖住"肉眼难分,
-          // 静默会让用户把一次网络失败读成"这段时间没数据"。
-          toast(t("activity.eventsLoadFailed"), "warn");
+          // 失败要留下比 toast 活得久的痕迹:失败后的画面(事件 0 条 + 动作仍在)与
+          // "这段时间没数据"肉眼难分,而 toast 3.5s 就散,用户回头再看已无从分辨,
+          // 也没有重试入口。改挂常驻 banner(自带重试),与 App 层取数失败同一处显示。
+          setFetchError(e instanceof Error ? e.message : String(e));
         }
         // append 失败要出声:静默失败的点击会被读成"没有更早的了"。
         if (mode === "append") toast(t("activity.loadMoreFailed"), "warn");
@@ -386,6 +418,11 @@ export function ActivityFeed({
         setLoading(false);
       });
   };
+
+  // eventsRef 恒指向最新列表(见其声明处:refresh 判空洞不能拿闭包快照比)。
+  useEffect(() => {
+    eventsRef.current = events;
+  }, [events]);
 
   // M5/N2: prop 变(homeId 切换 / 父组件 reload)时同步 — 仅当 filter 未激活。
   // 直接 setEvents(initial) 立即给出全量视图。注意:这会 clobber 快照→resolve 之间
@@ -400,6 +437,8 @@ export function ActivityFeed({
       setEvents(initial);
       setOffset(initial.length);
       setHasMore(initial.length === PAGE_SIZE);
+      // 清掉筛选视图留下的失败:这一屏的数据来自 App 层的 initial,与那条失败的请求无关。
+      setFetchError(null);
     }
     // filterActive 时 ignore initial 变化 — 由 filter useEffect 主导
   }, [initial, homeId, filterActive]);
@@ -423,12 +462,24 @@ export function ActivityFeed({
       return true;
     };
 
-    // 重连成功 / 首次 open 时拉一次,补回断开期间错过的事件(spec B13).
-    // 走 fetchPage 享 gen 保护;mode=refresh 保证是 merge 而非替换,已翻的页不会被
-    // 一次重连抹掉。残留缺口:断线期间新增多于 PAGE_SIZE 条时,第 0 页与旧数据之间会
-    // 空出一段,且没有路径能回填它 —— refresh 只拉第 0 页、SSE 只推重连之后的新事件、
-    // 翻页 offset 只进不退(不再覆盖走过的区间),故 offset 越过缺口后,缺口里 offset
-    // 以下那段永久缺失且无任何指示,要到筛选变化 replace 才重置。
+    // 真·断线重连时拉一次,补回断开期间错过的事件(spec B13)。走 fetchPage 享 gen 保护;
+    // mode=refresh 保证是 merge 而非替换,已翻的页不会被一次重连抹掉。
+    //
+    // **只有同一个 EventSource 实例自己断线重连才走到这里**,不是字面意义上的"首次 open
+    // 也拉一次":realSubscribeEvents 吞掉每个实例的首次 open(firstOpenSeen,S3——避免与
+    // 挂载时的首次拉取重复),而挂载 / 切筛选 / 切家都会新建实例,首次 open 一律被吞。
+    // 切后台再切回来同样不触发:onVisibility 的 stop()/start() 是**新建** EventSource,
+    // 它的首次 open 也被吞 —— 于是页面隐藏期间产生的事件既没有推送、回来也不回填
+    // (缺口大小与 PAGE_SIZE 无关),只有筛选变化 / 切家触发的 replace 从头重列才可能覆盖到。
+    //
+    // 残留缺口(与上面那条不同):断线期间新增多于 PAGE_SIZE 条时,第 0 页与手里旧数据
+    // 之间会空出一段 —— hasGapAbove 认出来并把 hasMore 抬为 true,不把有洞的列表标成
+    // "已到底"。按 offset 语义,这段洞只有落在当前 offset **以下**的部分能靠「查看更早」
+    // 补回来(append 从 offset 往下拉,offset 落在洞里的话接下来几轮就补上它);落在
+    // offset **以上**的那段没有任何路径取得到(refresh 只拉第 0 页、SSE 只推重连之后的
+    // 新事件、offset 只进不退、不再覆盖走过的区间),要等筛选变化 / 切家触发的 replace
+    // 从头重列才可能覆盖到。
+    // 补不回的那段在界面上也无从表达:列表照 ts 排序、两个片段直接相邻,看不出中间缺了东西。
     const reload = () => {
       fetchPage({ mode: "refresh", pageOffset: 0 });
     };
@@ -515,6 +566,13 @@ export function ActivityFeed({
   const noneChecked = !showEvents && !showActions;
   // "查看更早" 仅在展示事件时有意义(动作已一次拉全 500,无分页)。
   const showLoadMore = showEvents && hasMore && events.length > 0;
+
+  /** 事件 banner 的重试入口。组件内取数失败(fetchError)优先:它才是当前视图取不到数据的
+   *  原因;App 层传下来的 onRetryEvents 重试的是**不带筛选**的那次请求(App.tsx 的
+   *  `listActivity(homeId)`),修不了筛选视图的失败。 */
+  const bannerRetry = fetchError
+    ? () => fetchPage({ mode: "replace", pageOffset: 0 })
+    : onRetryEvents;
 
   // 计数按流拆开。老代码用合并后的 feedRows.length 显"已加载 312 条+",那个 + 挂在
   // 谁身上完全看不出来——恰恰是被截断的事件流被描述成完整的。
@@ -613,18 +671,24 @@ export function ActivityFeed({
       {/* Events panel */}
       <div id="panel-events" role="tabpanel" aria-labelledby="tab-events" hidden={activeTab !== "events"}>
 
-      {/* 事件初始页加载中 / 失败:内联提示,不阻断下方合流(动作已独立加载)。 */}
-      {(eventsError || eventsLoading) && (
+      {/* 事件加载中 / 失败:内联提示,不阻断下方合流(动作已独立加载)。
+          失败有两个来源:App 层那次不带筛选的请求(eventsError),与本组件带筛选的取数
+          (fetchError)。后者原先只有一条 3.5s 的 toast,失败后的画面(事件 0 条 + 动作照旧)
+          与"这段时间没数据"肉眼难分,回头再看已无从分辨、也没有重试入口 —— 统一走这条常驻
+          banner,并各自带上能真正重试该请求的按钮。 */}
+      {(eventsError || fetchError || eventsLoading) && (
         <div className="mx-5 mb-2 px-3 py-2 rounded-lg bg-bg-primary border border-border text-caption text-text-secondary flex items-center justify-between gap-2">
           <span>
             {eventsError
               ? t("activity.eventsBannerFailed", { msg: eventsError.message })
-              : t("activity.eventsBannerLoading")}
+              : fetchError
+                ? t("activity.eventsBannerFailed", { msg: fetchError })
+                : t("activity.eventsBannerLoading")}
           </span>
-          {eventsError && onRetryEvents && (
+          {bannerRetry && (
             <button
               type="button"
-              onClick={onRetryEvents}
+              onClick={bannerRetry}
               className="shrink-0 px-2 py-0.5 rounded border border-border text-text-primary hover:border-border-strong"
             >
               {t("activity.retry")}
