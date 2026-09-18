@@ -332,6 +332,10 @@ export function ActivityFeed({
    *    于是用户翻了四页攒到 200 条事件,网络抖一下 / 笔记本睡醒 / 后端重启,
    *    列表就被 setEvents(fresh) 打回 50 条;而 500 条动作走的是另一条取数路径、
    *    毫发无损 —— 字面意义上的"刚才还在的事件不见了",且不报错不留痕。
+   *
+   *  失败路径同样按模式分,不是统一一句"失败了":`replace` 列表与分页深度一起作废
+   *  并出声,`append` 保留列表与按钮、只出声,`refresh` 静默(重连补漏失败不动任何
+   *  状态,等下一次推送或下一次重连)。
    */
   const fetchPage = (opts: {
     mode?: FetchMode;
@@ -363,7 +367,17 @@ export function ActivityFeed({
         // 是动作地平线的闸:把它打成 false,一次失败的「查看更早」就会把地平线关掉,
         // 底下重新涌出那堵只有动作的墙,而且按钮同时消失、无法重试。保持原值 →
         // 按钮还在、地平线还在,用户可以再点一次。
-        if (mode === "replace") setEvents([]);
+        if (mode === "replace") {
+          // 列表整体作废,分页深度必须跟着作废:offset 的契约是"已 loaded 历史段长",
+          // 列表清空后旧深度就是谎报。不清零的话下一次重连的 refresh 会把旧深度钉死
+          // (nextOffset 只进不退),再点「查看更早」就从旧深度起拉,中间那段被静默跳过
+          // —— 又一种"事件悄悄不见"。清空与归零必须成对出现。
+          setEvents([]);
+          setOffset(0);
+          // 出声:失败后的画面(事件 0 条 + 动作仍在)与"事件被动作墙盖住"肉眼难分,
+          // 静默会让用户把一次网络失败读成"这段时间没数据"。
+          toast(t("activity.eventsLoadFailed"), "warn");
+        }
         // append 失败要出声:静默失败的点击会被读成"没有更早的了"。
         if (mode === "append") toast(t("activity.loadMoreFailed"), "warn");
       })
@@ -664,9 +678,10 @@ export function ActivityFeed({
       {showLoadMore && (
         <div className="px-5 py-3 border-t border-border flex flex-col items-center gap-1">
           {/* 列表到这里为止是**地平线**,不是"没有了"。老 UI 只为动作流写了截断提示、
-              事件流截断却一声不吭,用户读到的就是"事件消失了"。 */}
+              事件流截断却一声不吭,用户读到的就是"事件消失了"。动作关掉时不能提动作
+              —— 那是在解释一条用户亲手隐藏的流。 */}
           <span className="text-caption text-text-tertiary">
-            {t("activity.horizonHint")}
+            {showActions ? t("activity.horizonHint") : t("activity.horizonHintEventsOnly")}
           </span>
           <button
             type="button"
