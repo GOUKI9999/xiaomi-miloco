@@ -2,12 +2,11 @@
  * 动作流数据层 + 单流合并测试。
  *
  * node 环境无 jsdom,沿用 real.test.ts 的做法:覆写 globalThis.fetch,直接测
- * 导出的逻辑函数,不渲 DOM。
+ * 导出的逻辑函数,不渲 DOM —— 故本文件全绿推不出组件行为正确,组件内的
+ * state 转移接线不在覆盖范围内。
  *
- * 覆盖:
- * - fetchActions 解析 backend BARE 数组 + query 参数(limit / failed_only)
- * - actionTypeKey 纯映射
- * - mergeFeedRows:事件 + 动作交错顺序、checkbox 筛选、窗口裁剪规则
+ * 覆盖对象:后端取数契约、动作类型映射,以及合流 / 分页 / 地平线几组导出纯函数;
+ * 逐条断言以各 describe 标题为准,不在此列举(列举会随改动腐烂)。
  *
  * (动作行时间列已改用与事件行同一 TimeLabel/smartTimeParts 渲染——专属
  * formatActionTime 及其测试随之删除;smartTimeParts 由 relativeTime.test.ts 覆盖。)
@@ -22,6 +21,7 @@ import {
 import {
   feedLowerBound,
   mergeFeedRows,
+  nextEvents,
   nextHasMore,
   nextOffset,
 } from "@/components/ActivityFeed";
@@ -357,5 +357,46 @@ describe("nextOffset — 只进不退", () => {
 
   it("首次 append 从 0 起算", () => {
     expect(nextOffset(0, 0, 37)).toBe(37);
+  });
+});
+
+/**
+ * 三种取数模式对事件列表的更新规则。merge 本身的不变量(dedup / 排序)由
+ * ActivityFeed-merge.test.ts 守,这里只钉"哪种模式走哪条分支"——replace 与 merge
+ * 写反正是本 PR 要修的那个 bug。
+ *
+ * 边界:覆盖的是分派语义。组件内 reload → mode="refresh" 的接线测不到
+ * (测试环境是 node,无 DOM,渲染不了组件),那部分仍靠 code review。
+ */
+describe("nextEvents — replace 替换 / append・refresh 合并", () => {
+  const prev = [ev("old", 100), ev("mid", 200)];
+  const fresh = [ev("new", 300)];
+
+  it("replace 硬替换:筛选段 / 切家变化,旧列表整体作废", () => {
+    expect(nextEvents("replace", prev, fresh).map((e) => e.id)).toEqual(["new"]);
+  });
+
+  it("refresh 合并不替换:重连不丢已翻页事件(核心回归)", () => {
+    expect(nextEvents("refresh", prev, fresh).map((e) => e.id)).toEqual([
+      "new",
+      "mid",
+      "old",
+    ]);
+  });
+
+  it("append 合并不替换:翻页接在已加载列表上,按 ts 重排", () => {
+    expect(nextEvents("append", prev, fresh).map((e) => e.id)).toEqual([
+      "new",
+      "mid",
+      "old",
+    ]);
+  });
+
+  it("同 id 重叠时后到的赢(翻页窗口与已在列表的重叠)", () => {
+    const overlap = nextEvents("append", [ev("dup", 100, { text: "旧" })], [
+      ev("dup", 100, { text: "新" }),
+    ]);
+    expect(overlap).toHaveLength(1);
+    expect(overlap[0].text).toBe("新");
   });
 });

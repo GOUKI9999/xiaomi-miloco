@@ -135,6 +135,20 @@ export function nextOffset(prevOffset: number, pageOffset: number, freshCount: n
   return Math.max(prevOffset, pageOffset + freshCount);
 }
 
+/** 取数成功后 `events` 怎么变 —— `replace` 硬替换,`append` / `refresh` 都 merge
+ *  (按 id 去重 + 按 ts 重排)。
+ *
+ *  `refresh` 走 merge 是本 PR 的病灶本身:老代码这里走的是 replace 分支,一次重连
+ *  就把用户翻了几页的事件打回第 0 页。抽成纯函数是为了让这条分派有红灯 ——
+ *  写反时测试变红,而不是像老代码那样带着绿灯上线。 */
+export function nextEvents(
+  mode: FetchMode,
+  prev: ActivityEvent[],
+  fresh: ActivityEvent[],
+): ActivityEvent[] {
+  return mode === "replace" ? fresh : mergeAndSort(prev, fresh);
+}
+
 /** 事件流 + 动作流合并成单条时间倒序流。纯函数,导出供 tests 守 window + 交错顺序。
  *
  *  窗口规则:动作只保留 `[feedLowerBound, beforeMs]` 内的行——即同时受用户筛选段和
@@ -335,16 +349,12 @@ export function ActivityFeed({
     })
       .then((fresh) => {
         if (gen !== fetchGenRef.current) return; // N1: stale,丢弃
-        if (mode === "replace") {
-          setEvents(fresh);
-          setOffset(fresh.length);
-        } else {
-          // append 期间 SSE 可能已经 prepend 新事件,简单 [...prev, ...fresh]
-          // 会让"更早的 fresh"夹在"SSE 推的更晚事件"中间 → 视觉乱序.
-          // mergeAndSort 按 id dedup + 按 timestamp DESC 重排兜底,得到稳定顺序.
-          setEvents((prev) => mergeAndSort(prev, fresh));
-          setOffset((prev) => nextOffset(prev, pageOffset, fresh.length));
-        }
+        // merge 的两种模式(append / refresh)其期间 SSE 都可能已经 prepend 新事件,
+        // 简单 [...prev, ...fresh] 会让"更早的 fresh"夹在"SSE 推的更晚事件"中间 →
+        // 视觉乱序。mergeAndSort 按 id dedup + 按 timestamp DESC 重排兜底,得到稳定顺序。
+        setEvents((prev) => nextEvents(mode, prev, fresh));
+        if (mode === "replace") setOffset(fresh.length);
+        else setOffset((prev) => nextOffset(prev, pageOffset, fresh.length));
         setHasMore((prev) => nextHasMore(mode, prev, fresh.length));
       })
       .catch(() => {
@@ -401,8 +411,10 @@ export function ActivityFeed({
 
     // 重连成功 / 首次 open 时拉一次,补回断开期间错过的事件(spec B13).
     // 走 fetchPage 享 gen 保护;mode=refresh 保证是 merge 而非替换,已翻的页不会被
-    // 一次重连抹掉。残留缺口:若断线期间新增事件多于 PAGE_SIZE,第 0 页补不全中间段,
-    // 由后续 SSE 推送 + 用户翻页自愈。
+    // 一次重连抹掉。残留缺口:断线期间新增多于 PAGE_SIZE 条时,第 0 页与旧数据之间会
+    // 空出一段,且没有路径能回填它 —— refresh 只拉第 0 页、SSE 只推重连之后的新事件、
+    // 翻页 offset 只进不退(不再覆盖走过的区间),故 offset 越过缺口后,缺口里 offset
+    // 以下那段永久缺失且无任何指示,要到筛选变化 replace 才重置。
     const reload = () => {
       fetchPage({ mode: "refresh", pageOffset: 0 });
     };
