@@ -567,9 +567,14 @@ export function ActivityFeed({
   // "查看更早" 仅在展示事件时有意义(动作已一次拉全 500,无分页)。
   const showLoadMore = showEvents && hasMore && events.length > 0;
 
-  /** 事件 banner 的重试入口。组件内取数失败(fetchError)优先:它才是当前视图取不到数据的
-   *  原因;App 层传下来的 onRetryEvents 重试的是**不带筛选**的那次请求(App.tsx 的
-   *  `listActivity(homeId)`),修不了筛选视图的失败。 */
+  /** banner 的失败态:**两条失败来源取同一条**(组件内带筛选的优先),文案与重试按钮都跟着
+   *  它走。两处置顶顺序一旦相反(文字跟 App 层、按钮重发组件内的),双失败时点「重试」会像
+   *  没反应 —— 第一次点只清掉 fetchError,文案纹丝不动,得再点一次。 */
+  const bannerError = fetchError ?? eventsError?.message ?? null;
+  /** 事件 banner 的重试入口,与 bannerError 同源:fetchError → 重发带筛选的那次请求
+   *  (App.tsx 的 `listActivity(homeId)` 不带筛选,修不了筛选视图的失败);否则用 App 层
+   *  传下来的。**按钮的门槛是 `bannerError &&`** —— 加载态 bannerError 为空,于是不会出现
+   *  "正在加载"旁边挂一个「重试」(App 恒传 onRetryEvents,只判函数在不在等于没判)。 */
   const bannerRetry = fetchError
     ? () => fetchPage({ mode: "replace", pageOffset: 0 })
     : onRetryEvents;
@@ -672,20 +677,19 @@ export function ActivityFeed({
       <div id="panel-events" role="tabpanel" aria-labelledby="tab-events" hidden={activeTab !== "events"}>
 
       {/* 事件加载中 / 失败:内联提示,不阻断下方合流(动作已独立加载)。
-          失败有两个来源:App 层那次不带筛选的请求(eventsError),与本组件带筛选的取数
-          (fetchError)。后者原先只有一条 3.5s 的 toast,失败后的画面(事件 0 条 + 动作照旧)
-          与"这段时间没数据"肉眼难分,回头再看已无从分辨、也没有重试入口 —— 统一走这条常驻
-          banner,并各自带上能真正重试该请求的按钮。 */}
-      {(eventsError || fetchError || eventsLoading) && (
+          三种出现原因——App 层不带筛选的请求失败(eventsError)、本组件带筛选的取数失败
+          (fetchError)、App 层请求进行中(eventsLoading)。失败压过加载:后者原先只有一条
+          3.5s 的 toast,失败后的画面(事件 0 条 + 动作照旧)与"这段时间没数据"肉眼难分,
+          回头再看已无从分辨,也没有重试入口 —— 故统一走这条常驻 banner。
+          文案与按钮都由 bannerError 决定(见其声明处),不含第二个判据。 */}
+      {(bannerError || eventsLoading) && (
         <div className="mx-5 mb-2 px-3 py-2 rounded-lg bg-bg-primary border border-border text-caption text-text-secondary flex items-center justify-between gap-2">
           <span>
-            {eventsError
-              ? t("activity.eventsBannerFailed", { msg: eventsError.message })
-              : fetchError
-                ? t("activity.eventsBannerFailed", { msg: fetchError })
-                : t("activity.eventsBannerLoading")}
+            {bannerError
+              ? t("activity.eventsBannerFailed", { msg: bannerError })
+              : t("activity.eventsBannerLoading")}
           </span>
-          {bannerRetry && (
+          {bannerError && bannerRetry && (
             <button
               type="button"
               onClick={bannerRetry}
