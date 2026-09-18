@@ -278,6 +278,8 @@ export function ActivityFeed({
   const [fetchError, setFetchError] = useState<string | null>(null);
   /** Promise generation token — stale fetch resolve 时丢弃(N1) */
   const fetchGenRef = useRef(0);
+  /** 是否有取数在途。refresh(重连补漏)凭此决定跳过 —— 理由见 fetchPage 入口守卫。 */
+  const fetchInFlightRef = useRef(false);
   /** `events` 的最新值,fetch resolve 时读。闭包里的 `events` 是**发请求那一刻**的快照,
    *  resolve 时可能已被 SSE prepend 过;判"第 0 页与手里数据接不接得上"必须用最新值——
    *  拿旧快照比,会把其实重叠的两段误判成空洞,反过来把地平线误开。 */
@@ -361,13 +363,27 @@ export function ActivityFeed({
    *  失败路径同样按模式分,不是统一一句"失败了":`replace` 列表与分页深度一起作废、
    *  并留下常驻 banner(可重试),`append` 保留列表与按钮、只出声,`refresh` 静默(重连
    *  补漏失败不动任何状态,等下一次推送或下一次重连)。
-   */
+   *
+   *  refresh 还有一条独有规则:任何取数在途时它**直接跳过**,不抢占代际令牌(理由见入口守卫)。 */
   const fetchPage = (opts: {
     mode?: FetchMode;
     pageOffset?: number;
   }) => {
-    const gen = ++fetchGenRef.current;
     const mode = opts.mode ?? "replace";
+    // refresh 是尽力而为的后台补漏,不参与代际令牌竞争:任何取数在途时直接跳过。
+    // 否则它的 `++fetchGenRef.current` 会把**代表用户意图的那次取数**判成陈旧丢掉——
+    // 丢的不只是结果:replace 的列表替换与失败上报一起作废(新筛选的取数没落地、
+    // 该有的报错也没出现,用户只看到一次毫无反馈的切换),append 的翻页结果被吞掉;
+    // 而 refresh 自己照常 merge,把**新**筛选的第 0 页倒进**旧**筛选的列表里
+    // (事件在合流处不做窗口二次过滤),offset 还停在旧视图的深度上,之后翻页静默跳过一段。
+    // 跳过不丢数据:replace 本来就拉同一窗口的第 0 页,与 refresh 想拿的是同一份;
+    // 与 append 撞上时丢的只是一次补漏,后续推送或下一次重连会补上。
+    // (已知代价:listActivity 没有超时,请求若悬挂不 settle,旗子会一直立着、补漏不触发,
+    //  直到后面某次取数落地才收旗;不过那时 loading 同样一直转着(banner 停在"加载中"),
+    //  症状肉眼可见,属既有毛病,不在本次范围。)
+    if (mode === "refresh" && fetchInFlightRef.current) return Promise.resolve();
+    const gen = ++fetchGenRef.current;
+    fetchInFlightRef.current = true;
     const pageOffset = opts.pageOffset ?? 0;
     setLoading(true);
     // 只有 replace 在开跑时清掉上次的失败:它是"当前视图从头再来一遍",旧失败已不代表现在;
@@ -415,6 +431,9 @@ export function ActivityFeed({
       })
       .finally(() => {
         if (gen !== fetchGenRef.current) return;
+        // 只由**最新**那次取数收旗:被取代的那次在这里提前返回,旗子归最新那次管
+        // (它在自己的 finally 里收),否则一次过期请求的落地就会让补漏重新挤进在途窗口。
+        fetchInFlightRef.current = false;
         setLoading(false);
       });
   };
