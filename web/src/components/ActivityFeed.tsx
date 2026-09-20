@@ -362,7 +362,7 @@ export function ActivityFeed({
    *
    *  失败路径同样按模式分,不是统一一句"失败了":`replace` 列表与分页深度一起作废、
    *  并留下常驻 banner(可重试),`append` 保留列表与按钮、只出声,`refresh` 静默(重连
-   *  补漏失败不动任何状态,等下一次推送或下一次重连)。
+   *  补漏失败不动任何状态,等下一次重连的补漏 —— SSE 无重放,推送不会替它补)。
    *
    *  refresh 还有一条独有规则:任何取数在途时它**直接跳过**,不抢占代际令牌(理由见入口守卫)。 */
   const fetchPage = (opts: {
@@ -377,10 +377,16 @@ export function ActivityFeed({
     // 而 refresh 自己照常 merge,把**新**筛选的第 0 页倒进**旧**筛选的列表里
     // (事件在合流处不做窗口二次过滤),offset 还停在旧视图的深度上,之后翻页静默跳过一段。
     // 跳过不丢数据:replace 本来就拉同一窗口的第 0 页,与 refresh 想拿的是同一份;
-    // 与 append 撞上时丢的只是一次补漏,后续推送或下一次重连会补上。
+    // 与 append 撞上时丢的是一次补漏 —— 且这段**不会自己回来**:SSE 是纯直播流、不重放
+    // (后端 events_router 的 subscribe_sse 收的是订阅之后的广播,没有 Last-Event-ID / 补发),
+    // 断线窗口内的事件不会被"后续推送"补发;能补回的只有下一次重连的补漏(且那些事件
+    // 仍落在第 0 页 50 条以内)或下一次 replace(时间范围变化 / 切家)。
     // (已知代价:listActivity 没有超时,请求若悬挂不 settle,旗子会一直立着、补漏不触发,
-    //  直到后面某次取数落地才收旗;不过那时 loading 同样一直转着(banner 停在"加载中"),
-    //  症状肉眼可见,属既有毛病,不在本次范围。)
+    //  直到用户下一次亲手触发 replace / append 落地才收旗。悬挂期间症状**不一定可见**:
+    //  组件内 loading 的渲染出口只有两处(空列表居中的"加载中"、以及需 showLoadMore
+    //  成立的「查看更早」按钮),banner 的加载文案由 App 层 eventsLoading 驱动、与组件内
+    //  悬挂无关 —— 窗口 hasMore=false 且列表非空时画面看不出异常,唯一后果是补漏停摆。
+    //  属既有毛病(取数无超时),不在本次范围。)
     if (mode === "refresh" && fetchInFlightRef.current) return Promise.resolve();
     const gen = ++fetchGenRef.current;
     fetchInFlightRef.current = true;
@@ -446,12 +452,17 @@ export function ActivityFeed({
   // M5/N2: prop 变(homeId 切换 / 父组件 reload)时同步 — 仅当 filter 未激活。
   // 直接 setEvents(initial) 立即给出全量视图。注意:这会 clobber 快照→resolve 之间
   // SSE 刚推的事件;清 filter 那次过渡有 SSE 重订阅补偿,但已处于 !filterActive 时的
-  // 同 home retry 不触发重订阅——此窗口极窄且 SSE 后续推送会自愈(pre-existing)。
-  // 先 ++fetchGenRef 作废在途 filtered fetch,并手动 setLoading(false)
-  // (被作废的 fetch 其 finally 的 gen 守卫会 no-op,不会替我们收 loading)。
+  // 同 home retry 不触发重订阅——此窗口极窄,但被 clobber 的那几条不会自己回来
+  // (SSE 无重放,后续推送送的是**新**事件),要等下一次 replace / 重连补漏才可能覆盖(pre-existing)。
+  // 先 ++fetchGenRef 作废在途 filtered fetch,并手动 setLoading(false) / 降在途旗
+  // (被作废的 fetch 其 finally 的 gen 守卫会 no-op,既不会替我们收 loading,也不会替我们收旗)。
+  // 这一代**没有对应的 fetch**,没人替它收尾 —— 漏了降旗,旗子就永久卡 true,
+  // 之后每次 SSE 重连的补漏都被在途守卫静默跳过(而跳过路径不碰旗),本 PR 要修的
+  // "事件悄悄不见"又回来了,且全量视图不翻页时没有任何自愈路径。
   useEffect(() => {
     if (!filterActive) {
       ++fetchGenRef.current; // 作废可能仍在途的 filtered fetch
+      fetchInFlightRef.current = false; // 被作废那代不会替我们收旗(同上)
       setLoading(false);
       setEvents(initial);
       setOffset(initial.length);
