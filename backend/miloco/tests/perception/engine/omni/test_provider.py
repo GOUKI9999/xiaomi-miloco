@@ -3,6 +3,7 @@
 from miloco.perception.engine.omni import provider
 from miloco.perception.engine.omni.provider import (
     GeminiAdapter,
+    KimiAdapter,
     LocalMediaInfo,
     MiMoAdapter,
     OpenAICompatAdapter,
@@ -45,6 +46,9 @@ class TestGetAdapter:
 
     def test_gemini_case_insensitive(self):
         assert isinstance(get_adapter("Gemini-3-Pro"), GeminiAdapter)
+
+    def test_kimi(self):
+        assert isinstance(get_adapter("kimi-k2.6"), KimiAdapter)
 
     def test_openai_compat_family(self):
         # MiMo / Qwen 都归 OpenAI 兼容族；Gemini 不是。
@@ -90,6 +94,19 @@ class TestMiMoAdapter:
         assert body["stream"] is True
         assert body["stream_options"] == {"include_usage": True}
         assert body["thinking"] == {"type": "disabled"}
+
+
+class TestKimiAdapter:
+    adapter = KimiAdapter()
+
+    def test_kimi_k2_6_forces_supported_sampling_parameters(self):
+        body = self.adapter.build_request_body(
+            _MESSAGES, model="kimi-k2.6",
+            max_tokens=512, temperature=0.1, top_p=1.0, stream=False,
+        )
+        assert body["temperature"] == 1.0
+        assert body["top_p"] == 0.95
+        assert "thinking" not in body
 
 
 class TestQwenOmniAdapter:
