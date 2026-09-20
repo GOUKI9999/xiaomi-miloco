@@ -1044,6 +1044,7 @@ def _full_omni_payload() -> dict:
             "health": health,
         },
         "profiles": profiles,
+        "fallback_labels": list(m.omni_fallbacks),
     }
 
 
@@ -1074,12 +1075,44 @@ class OmniSelectBody(BaseModel):
     label: str
 
 
+class OmniFallbacksBody(BaseModel):
+    """有序 fallback 档案名。"""
+
+    labels: list[str] = Field(default_factory=list)
+
+
 @router.get(
     "/omni-config",
     summary="读取 omni 配置(当前生效 active + 已存档案 profiles，api_key 打码)",
     response_model=NormalResponse,
 )
 def get_omni_config(current_user: str = Depends(verify_token)):
+    return NormalResponse(code=0, message="ok", data=_full_omni_payload())
+
+
+@router.put(
+    "/omni-config/fallbacks",
+    summary="保存有序 omni fallback 档案",
+    response_model=NormalResponse,
+)
+async def put_omni_fallbacks(
+    body: OmniFallbacksBody, current_user: str = Depends(verify_token)
+):
+    profiles = {p.label: p for p in get_settings().model.omni_profiles}
+    labels: list[str] = []
+    for raw_label in body.labels:
+        label = raw_label.strip()
+        if not label or label in labels:
+            continue
+        profile = profiles.get(label)
+        if profile is None:
+            raise HTTPException(status_code=404, detail=f"档案「{label}」不存在")
+        if not profile.api_key:
+            raise HTTPException(status_code=400, detail=f"档案「{label}」未配置 API Key")
+        if _label_is_active(label):
+            raise HTTPException(status_code=400, detail="当前生效模型不能同时作为 fallback")
+        labels.append(label)
+    update_shared_config(model={"omni_fallbacks": labels})
     return NormalResponse(code=0, message="ok", data=_full_omni_payload())
 
 
@@ -1138,7 +1171,13 @@ async def put_omni_config(
         profiles[profiles.index(target)] = entry
     else:
         profiles.append(entry)
-    update: dict = {"omni_profiles": profiles}
+    fallbacks = list(get_settings().model.omni_fallbacks)
+    if orig and orig != label:
+        fallbacks = [label if item == orig else item for item in fallbacks]
+    if will_activate:
+        fallbacks = [item for item in fallbacks if item != label]
+    fallbacks = list(dict.fromkeys(fallbacks))
+    update: dict = {"omni_profiles": profiles, "omni_fallbacks": fallbacks}
     if will_activate:
         update["omni"] = entry
     update_shared_config(model=update)
@@ -1181,7 +1220,12 @@ async def activate_omni_config(
                         "model": p.model,
                         "base_url": p.base_url,
                         "api_key": p.api_key,
-                    }
+                    },
+                    "omni_fallbacks": [
+                        item
+                        for item in get_settings().model.omni_fallbacks
+                        if item != p.label
+                    ],
                 }
             )
             # 同 upsert 路径:preflight 通过后主动清熔断状态,避免 OPEN_CONFIG 卡死。
@@ -1231,7 +1275,12 @@ async def delete_omni_config(
     label = body.label.strip()
     was_active = _label_is_active(label)
     profiles = [p for p in _profiles_as_dicts() if p["label"] != label]
-    update: dict = {"omni_profiles": profiles}
+    update: dict = {
+        "omni_profiles": profiles,
+        "omni_fallbacks": [
+            item for item in get_settings().model.omni_fallbacks if item != label
+        ],
+    }
     if was_active:
         # 删当前生效模型 → 当前生效配置重置为出厂未配态(MiMo 默认 + 空 key)。
         update["omni"] = OmniModelSettings().model_dump()

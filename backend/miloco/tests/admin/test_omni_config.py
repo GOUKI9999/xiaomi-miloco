@@ -1100,3 +1100,77 @@ def test_test_connection_failure_does_not_touch_breaker(client, monkeypatch, rea
 
     # 熔断仍是 error
     assert get_omni_circuit_breaker().snapshot().state == "error"
+
+
+# ─── 有序 fallback 档案 ─────────────────────────────────────────────────────
+
+
+def _save_profile(client, label: str, *, activate: bool):
+    return client.put(
+        "/api/admin/omni-config",
+        json={
+            "label": label,
+            "model": f"model-{label}",
+            "base_url": f"https://{label}.example/v1",
+            "api_key": f"sk-{label}-123456789",
+            "activate": activate,
+        },
+    )
+
+
+def test_fallback_profiles_are_ordered_and_maintained(client):
+    _save_profile(client, "主", activate=True)
+    _save_profile(client, "备二", activate=False)
+    _save_profile(client, "备一", activate=False)
+
+    response = client.put(
+        "/api/admin/omni-config/fallbacks",
+        json={"labels": ["备一", "备二", "备一"]},
+    )
+    assert response.status_code == 200
+    assert response.json()["data"]["fallback_labels"] == ["备一", "备二"]
+
+    renamed = client.put(
+        "/api/admin/omni-config",
+        json={
+            "label": "备用一",
+            "original_label": "备一",
+            "model": "model-备一",
+            "base_url": "https://备一.example/v1",
+            "activate": False,
+        },
+    ).json()["data"]
+    assert renamed["fallback_labels"] == ["备用一", "备二"]
+
+    deleted = client.post(
+        "/api/admin/omni-config/delete", json={"label": "备二"}
+    ).json()["data"]
+    assert deleted["fallback_labels"] == ["备用一"]
+
+    activated = client.post(
+        "/api/admin/omni-config/activate", json={"label": "备用一"}
+    ).json()["data"]
+    assert activated["fallback_labels"] == []
+
+
+def test_fallback_rejects_active_missing_and_keyless_profiles(client):
+    _save_profile(client, "主", activate=True)
+    assert client.put(
+        "/api/admin/omni-config/fallbacks", json={"labels": ["主"]}
+    ).status_code == 400
+    assert client.put(
+        "/api/admin/omni-config/fallbacks", json={"labels": ["不存在"]}
+    ).status_code == 404
+
+    client.put(
+        "/api/admin/omni-config",
+        json={
+            "label": "无密钥",
+            "model": "m",
+            "base_url": "https://keyless.example/v1",
+            "activate": False,
+        },
+    )
+    assert client.put(
+        "/api/admin/omni-config/fallbacks", json={"labels": ["无密钥"]}
+    ).status_code == 400

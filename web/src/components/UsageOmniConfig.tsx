@@ -17,6 +17,7 @@ import {
   OMNI_CONFIG_STALE_EVENT,
   getOmniConfig,
   updateOmniConfig,
+  updateOmniFallbacks,
   activateOmniConfig,
   deactivateOmniConfig,
   deleteOmniConfig,
@@ -179,6 +180,7 @@ export function UsageOmniConfig() {
   // 新增 / 编辑表单(共用):editing 非空表示在编辑该 label 对应的已有配置
   const [adding, setAdding] = useState(false);
   const [editing, setEditing] = useState<string | null>(null);
+  const [label, setLabel] = useState("");
   const [baseUrl, setBaseUrl] = useState("");
   const [apiKey, setApiKey] = useState("");
   const [showKey, setShowKey] = useState(false); // API Key 明文/密文切换(末端眼睛图标)
@@ -201,6 +203,7 @@ export function UsageOmniConfig() {
   // 删除确认弹窗(web 风格,代替 window.confirm):待删项 + 删除中
   const [deleteTarget, setDeleteTarget] = useState<OmniProfile | null>(null);
   const [deleting, setDeleting] = useState(false);
+  const [fallbackSaving, setFallbackSaving] = useState(false);
 
   useEffect(() => {
     void load();
@@ -223,14 +226,10 @@ export function UsageOmniConfig() {
   const profiles = state?.profiles ?? [];
   const active = state?.active;
   const hasKey = active?.has_key ?? false;
-  // 新增表单里同 (model, base_url) 是否已存(→ 改为更新该条)
-  const existing = profiles.find(
-    (p) => p.base_url === baseUrl.trim() && p.model === model.trim(),
-  );
-
   function startAdd() {
     setAdding(true);
     setEditing(null);
+    setLabel("");
     setBaseUrl("");
     setApiKey("");
     setShowKey(false);
@@ -246,6 +245,7 @@ export function UsageOmniConfig() {
   function startEdit(p: OmniProfile) {
     setAdding(true);
     setEditing(p.label);
+    setLabel(p.label);
     setBaseUrl(p.base_url);
     setApiKey("");
     setShowKey(false);
@@ -293,15 +293,14 @@ export function UsageOmniConfig() {
   }
 
   async function onSave() {
+    const name = label.trim();
     const bu = baseUrl.trim();
     const m = model.trim();
-    if (!bu || !m) {
-      toast(t("usage.baseUrlModelRequired"), "warn");
+    if (!name || !bu || !m) {
+      toast(t("usage.profileNameRequired"), "warn");
       return;
     }
-    // 目标条目:编辑态用被编辑的 label;否则按 (model, base_url) 命中已有(隐式 upsert)。
-    // 用 ||(非 ??)让空串落空 → 当作新增并生成 label,绝不把空 original_label 发给后端。
-    const target = editing || existing?.label || undefined;
+    const target = editing || undefined;
     if (!apiKey.trim() && !editTarget(target)?.has_key) {
       toast(t("usage.apiKeyRequired"), "warn");
       return;
@@ -309,7 +308,7 @@ export function UsageOmniConfig() {
     setSaving(true);
     try {
       const s = await updateOmniConfig({
-        label: target ?? `${m} @ ${bu}`,
+        label: name,
         model: m,
         base_url: bu,
         api_key: apiKey.trim() || undefined,
@@ -346,7 +345,7 @@ export function UsageOmniConfig() {
       toast(t("usage.baseUrlModelRequired"), "warn");
       return;
     }
-    const target = editing || existing?.label || undefined;
+    const target = editing || undefined;
     if (!apiKey.trim() && !editTarget(target)?.has_key) {
       toast(t("usage.apiKeyRequiredBeforeTest"), "warn");
       return;
@@ -448,6 +447,34 @@ export function UsageOmniConfig() {
     }
   }
 
+  async function saveFallbackLabels(next: string[]) {
+    if (!state || fallbackSaving) return;
+    setFallbackSaving(true);
+    try {
+      setState(await updateOmniFallbacks(next));
+    } catch (e) {
+      toast(e instanceof Error ? e.message : t("usage.fallbackSaveFailed"), "danger");
+    } finally {
+      setFallbackSaving(false);
+    }
+  }
+
+  function toggleFallback(name: string) {
+    const current = state?.fallback_labels ?? [];
+    void saveFallbackLabels(
+      current.includes(name) ? current.filter((item) => item !== name) : [...current, name],
+    );
+  }
+
+  function moveFallback(name: string, direction: -1 | 1) {
+    const current = [...(state?.fallback_labels ?? [])];
+    const from = current.indexOf(name);
+    const to = from + direction;
+    if (from < 0 || to < 0 || to >= current.length) return;
+    [current[from], current[to]] = [current[to], current[from]];
+    void saveFallbackLabels(current);
+  }
+
   // 连接状态列被截断时的悬浮全文:锚定元素底部的 fixed 浮层(避开表格 overflow 裁剪、无原生 title 延迟)。
   function showTip(e: React.MouseEvent<HTMLElement>) {
     const el = e.currentTarget;
@@ -473,7 +500,7 @@ export function UsageOmniConfig() {
   }
 
   // 表单内拉模型/测试错误的就近显示:解析当前编辑/命中条目 + 错误归属字段。
-  const keyProfile = editTarget(editing) ?? existing;
+  const keyProfile = editTarget(editing);
   const errField = modelsErr ? errFieldOf(modelsErrCode) : null;
   const urlErrHere = errField === "url";
   const keyErrHere = errField === "key";
@@ -497,7 +524,7 @@ export function UsageOmniConfig() {
           {collapsed && active && (
             <span className="text-caption text-text-secondary num">
               {t("usage.currentPrefix")}
-              {hasKey ? `${active.model} · ${hostOf(active.base_url)}` : t("usage.noApiKeyConfigured")}
+              {hasKey ? `${active.label || active.model} · ${hostOf(active.base_url)}` : t("usage.noApiKeyConfigured")}
             </span>
           )}
         </span>
@@ -532,7 +559,8 @@ export function UsageOmniConfig() {
                 <table className="w-full text-caption whitespace-nowrap">
                   <thead>
                     <tr className="text-text-secondary border-b border-border">
-                      <th className="text-left px-5 md:px-6 py-2">{t("usage.colModel")}</th>
+                      <th className="text-left px-5 md:px-6 py-2">{t("usage.colName")}</th>
+                      <th className="text-left px-3 py-2">{t("usage.colModel")}</th>
                       <th className="text-left px-3 py-2">{t("usage.baseUrlLabel")}</th>
                       <th className="text-left px-3 py-2">{t("usage.colApiKey")}</th>
                       <th className="text-left px-3 py-2 w-44">{t("usage.colStatus")}</th>
@@ -543,7 +571,7 @@ export function UsageOmniConfig() {
                     {profiles.length === 0 ? (
                       <tr>
                         <td
-                          colSpan={5}
+                          colSpan={6}
                           className="px-5 md:px-6 py-5 text-center text-text-tertiary"
                         >
                           {t("usage.emptyProfiles")}
@@ -557,14 +585,15 @@ export function UsageOmniConfig() {
                             p.active ? "bg-brand-soft" : ""
                           }`}
                         >
-                          <td className="px-5 md:px-6 py-2.5 num text-text-primary">
-                            {p.model}
+                          <td className="px-5 md:px-6 py-2.5 text-text-primary">
+                            {p.label}
                             {p.active && (
                               <span className="ml-2 align-middle inline-block rounded px-1.5 py-0.5 bg-brand-primary text-white text-caption">
                                 {t("usage.activeTag")}
                               </span>
                             )}
                           </td>
+                          <td className="px-3 py-2.5 num text-text-primary">{p.model}</td>
                           <td className="px-3 py-2.5 num text-text-tertiary">{p.base_url}</td>
                           <td className="px-3 py-2.5 num text-text-tertiary">
                             {p.has_key ? p.api_key_masked : t("usage.notConfigured")}
@@ -659,6 +688,68 @@ export function UsageOmniConfig() {
                 </table>
               </div>
 
+              <div className="mt-4 rounded-lg border border-border p-4">
+                <div className="text-body font-medium text-text-primary">
+                  {t("usage.fallbackTitle")}
+                </div>
+                <p className="text-caption text-text-tertiary mt-1">
+                  {t("usage.fallbackHint")}
+                </p>
+                <div className="mt-3 space-y-2">
+                  {profiles.filter((p) => !p.active && p.has_key).length === 0 ? (
+                    <div className="text-caption text-text-tertiary">
+                      {t("usage.fallbackEmpty")}
+                    </div>
+                  ) : (
+                    profiles
+                      .filter((p) => !p.active && p.has_key)
+                      .map((p) => {
+                        const order = state.fallback_labels.indexOf(p.label);
+                        return (
+                          <div key={p.label} className="flex items-center gap-3 text-caption">
+                            <input
+                              type="checkbox"
+                              checked={order >= 0}
+                              disabled={fallbackSaving}
+                              onChange={() => toggleFallback(p.label)}
+                            />
+                            <span className="min-w-0 flex-1 text-text-primary">
+                              {p.label} <span className="num text-text-tertiary">· {p.model}</span>
+                            </span>
+                            {order >= 0 && (
+                              <>
+                                <span className="text-text-tertiary">
+                                  {t("usage.fallbackOrder", { n: order + 1 })}
+                                </span>
+                                <button
+                                  type="button"
+                                  disabled={fallbackSaving || order === 0}
+                                  onClick={() => moveFallback(p.label, -1)}
+                                  aria-label={t("usage.fallbackMoveUp", { name: p.label })}
+                                  className="disabled:opacity-30 text-text-secondary hover:text-brand-primary"
+                                >
+                                  <IconChevronUp width={16} height={16} />
+                                </button>
+                                <button
+                                  type="button"
+                                  disabled={
+                                    fallbackSaving || order === state.fallback_labels.length - 1
+                                  }
+                                  onClick={() => moveFallback(p.label, 1)}
+                                  aria-label={t("usage.fallbackMoveDown", { name: p.label })}
+                                  className="disabled:opacity-30 text-text-secondary hover:text-brand-primary"
+                                >
+                                  <IconChevronDown width={16} height={16} />
+                                </button>
+                              </>
+                            )}
+                          </div>
+                        );
+                      })
+                  )}
+                </div>
+              </div>
+
               {/* 新增按钮放列表下方(新增即追加到列表末尾) */}
               {!adding && (
                 <button
@@ -676,6 +767,14 @@ export function UsageOmniConfig() {
                   <div className="md:col-span-2 text-caption text-text-secondary">
                     {editing ? t("usage.editFormHint") : t("usage.addFormHint")}
                   </div>
+                  <Field label={t("usage.profileNameLabel")} className="md:col-span-2">
+                    <input
+                      value={label}
+                      onChange={(e) => setLabel(e.target.value)}
+                      placeholder={t("usage.profileNamePlaceholder")}
+                      className={INPUT_CLS}
+                    />
+                  </Field>
                   <Field label={t("usage.baseUrlLabel")} className="md:col-span-2">
                     <input
                       value={baseUrl}

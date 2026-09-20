@@ -178,6 +178,11 @@ class ModelSettings(BaseModel):
             "当前生效的那套即 omni（按 label 匹配）。"
         ),
     )
+    omni_fallbacks: list[str] = Field(
+        default_factory=list,
+        description="按顺序保存的 omni fallback 档案 label；仅在可恢复调用错误时依次尝试",
+    )
+
 
 
 class DatabaseSettings(BaseModel):

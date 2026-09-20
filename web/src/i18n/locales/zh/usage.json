@@ -56,7 +56,7 @@
     "test": "测试",
     "delete": "删除",
     "addModel": "新增模型",
-    "addFormHint": "新增模型配置(同 模型 + Base URL 已存在则更新其 Key)",
+    "addFormHint": "新增一套具名模型配置，保存后可在列表中启用或设为 fallback。",
     "editFormHint": "编辑模型配置(API Key 留空则沿用原 Key)",
     "baseUrlLabel": "Base URL",
     "baseUrlPlaceholder": "如:https://api.xiaomimimo.com/v1",
@@ -147,6 +147,17 @@
     "refreshSecUnit": "秒",
     "refreshSecAria": "自动刷新周期（秒，{{min}} 到 {{max}}）",
     "refreshAtMin": "已是最低 {{min}} 秒",
-    "refreshAtMax": "已是最高 {{max}} 秒"
+    "refreshAtMax": "已是最高 {{max}} 秒",
+    "colName": "名称",
+    "profileNameLabel": "自定义名称",
+    "profileNamePlaceholder": "例如：Kimi 官方、公司代理",
+    "profileNameRequired": "自定义名称、Base URL 和模型不能为空",
+    "fallbackTitle": "故障接替模型",
+    "fallbackHint": "主模型遇到网络错误、超时、429 或 5xx 时，按此顺序接替；鉴权或配置错误不会自动切换。",
+    "fallbackEmpty": "暂无可用的备用档案，请先添加另一个已配置 Key 的模型。",
+    "fallbackOrder": "第 {{n}} 顺位",
+    "fallbackMoveUp": "上移 {{name}}",
+    "fallbackMoveDown": "下移 {{name}}",
+    "fallbackSaveFailed": "保存 fallback 失败"
   }
 }
