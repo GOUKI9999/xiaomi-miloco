@@ -2,13 +2,15 @@
  * 「模型」页顶部的 omni 模型配置卡(可折叠,默认展开)。
  *
  * 两块:
- * - 上:**当前模型** —— 当前生效配置(model / Base URL / 打码 key);未配 key 给警告。
- * - 下:**模型列表** —— 每行 模型 | Base URL | API Key(打码),可「启用」/「删除」;
- *   「＋ 新增」展开表单(Base URL → API Key → 模型组合框 + 测试连接 + 保存)。
+ * - 上:**当前模型** —— 当前生效配置(名称 / model / Base URL / 打码 key);未配 key 给警告。
+ * - 下:**模型列表** —— 每行 名称 | 模型 | Base URL | API Key(打码) | 连接状态 | 调用顺位 | 操作,
+ *   行序即实际调用链:当前生效 → fallback(按顺位) → 其余档案(派生排序,不动存储顺序);
+ *   「＋ 新增」展开表单(自定义名称 → Base URL → API Key → 模型组合框 + 测试连接 + 保存)。
  *
- * 档案名对用户隐藏:内部用 `model @ base_url` 作为后端 label(唯一 id)。重复添加同
- * (model, base_url) = 更新该配置的 key(等价编辑)。后端按 label activate/delete/upsert。
- * 保存写 config.json,感知下个推理周期热生效(免重启);api_key 打码、留空=沿用原 key。
+ * 档案名(label)=用户自定义唯一 id。新增必填、编辑可改名,重名由后端返回 409。
+ * 相同 (model, base_url) 可保存多套具名档案,互不覆盖;调用顺位列维护有序 fallback。
+ * 保存写 config.json,感知下个推理周期热生效(免重启);api_key 打码、留空仅在 Base URL
+ * 不变时沿用原 key。
  */
 
 import { useEffect, useRef, useState } from "react";
@@ -573,6 +575,9 @@ export function UsageOmniConfig() {
               )}
 
               {/* ── 模型列表 ── */}
+              <div className="text-caption text-text-tertiary mb-2">
+                {t("usage.fallbackHint")}
+              </div>
               <div className="overflow-x-auto -mx-5 md:-mx-6">
                 <table className="w-full text-caption whitespace-nowrap">
                   <thead>

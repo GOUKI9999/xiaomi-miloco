@@ -38,6 +38,15 @@ _ENV_KEY = "MILOCO_MODEL__OMNI__API_KEY"
 _RESET_TASKS: set[asyncio.Task] = set()
 
 
+class MalformedBodyError(Exception):
+    """Omni returned valid JSON whose top level is not an object."""
+
+    code = "bad_response"
+
+    def __init__(self, raw_cls: str) -> None:
+        super().__init__(f"omni response is not a dict (got {raw_cls})")
+
+
 class OmniError(Exception):
     """omni API 调用失败的统一异常包装。
 
@@ -76,6 +85,9 @@ class OmniError(Exception):
                 return f"{name}:{self.original.response.status_code}"
             except Exception:
                 return name
+        explicit_code = getattr(self.original, "code", None)
+        if explicit_code:
+            return str(explicit_code)
         return name
 
 
@@ -85,12 +97,21 @@ def _is_fallback_eligible(error: OmniError) -> bool:
     if isinstance(original, (httpx.TimeoutException, httpx.NetworkError)):
         return True
     if isinstance(original, httpx.HTTPStatusError):
-        return original.response.status_code == 429 or original.response.status_code >= 500
-    if isinstance(original, (json.JSONDecodeError, CircuitOpenError)):
-        if isinstance(original, json.JSONDecodeError):
-            return True
+        return (
+            original.response.status_code == 429 or original.response.status_code >= 500
+        )
+    if isinstance(original, (json.JSONDecodeError, MalformedBodyError)):
+        return True
+    if isinstance(original, CircuitOpenError):
         code = str(original.code or "").split(":")[-1]
-        return code in {"rate_limited", "timeout", "unreachable", "http_error", "bad_response"}
+        # Keep this list aligned with the recoverable direct-request failures above.
+        return code in {
+            "rate_limited",
+            "timeout",
+            "unreachable",
+            "http_error",
+            "bad_response",
+        }
     return False
 
 
@@ -327,13 +348,14 @@ async def _call_omni_once(
                 raw_cls = raw.__class__.__name__
                 if use_circuit_breaker:
                     await cb.record_failure(
-                    ClassifiedError(
-                        "bad_response",
-                        f"non-dict body ({raw_cls})",
-                        ErrorCategory.RECOVERABLE,
+                        ClassifiedError(
+                            "bad_response",
+                            f"non-dict body ({raw_cls})",
+                            ErrorCategory.RECOVERABLE,
+                        )
                     )
-                )
-                raise OmniError(f"omni response is not a dict (got {raw_cls})")
+                malformed = MalformedBodyError(raw_cls)
+                raise OmniError(str(malformed), original=malformed)
             if use_circuit_breaker:
                 await cb.record_success()
             fire_record(config.model, config.base_url, raw.get("usage") or {}, type)
@@ -427,7 +449,10 @@ async def _collect_stream_response(
     content_parts: list[str] = []
     usage: dict[str, Any] = {}
     async with client.stream(
-        "POST", url, headers=headers, json=body,
+        "POST",
+        url,
+        headers=headers,
+        json=body,
     ) as resp:
         if resp.status_code != 200:
             await resp.aread()
@@ -436,6 +461,7 @@ async def _collect_stream_response(
                 from miloco.perception.engine.omni.omni import (
                     _summarize_multimodal_payload,
                 )
+
                 logger.error(
                     "[omni] stream 400 payload 摘要 | %s",
                     _summarize_multimodal_payload(body.get("messages", [])),

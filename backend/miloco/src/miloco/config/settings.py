@@ -184,7 +184,6 @@ class ModelSettings(BaseModel):
     )
 
 
-
 class DatabaseSettings(BaseModel):
     """SQLite 数据库连接参数。"""
 
@@ -611,7 +610,7 @@ class MilocoSettings(BaseSettings):
         description=(
             "部署时区 (IANA 名,如 Asia/Shanghai / America/Los_Angeles);"
             "null = 跟随系统 /etc/timezone。影响业务侧"
-            "\"今天 / 本周 / rollover\"等部署概念,以及 API 出口 ISO 偏移后缀"
+            '"今天 / 本周 / rollover"等部署概念,以及 API 出口 ISO 偏移后缀'
             "(如 +08:00);DB 存储始终 INTEGER ms (UTC 绝对时刻)。"
         ),
     )

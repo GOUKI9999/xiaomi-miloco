@@ -26,6 +26,7 @@ from miloco.perception.engine.omni.error_classifier import (
     classify_response,
 )
 from miloco.perception.engine.omni.omni_client import (
+    MalformedBodyError,
     OmniError,
     _collect_stream_response,
     _is_fallback_eligible,
@@ -401,13 +402,14 @@ async def _call_omni_messages(
             logger.error("[omni-fused] unexpected response shape | %s", detail)
             if use_circuit_breaker:
                 await cb.record_failure(
-                ClassifiedError(
-                    "bad_response",
-                    f"non-dict body ({raw_cls})",
-                    ErrorCategory.RECOVERABLE,
+                    ClassifiedError(
+                        "bad_response",
+                        f"non-dict body ({raw_cls})",
+                        ErrorCategory.RECOVERABLE,
+                    )
                 )
-            )
-            raise OmniError(f"omni response is not a dict (got {raw_cls})")
+            malformed = MalformedBodyError(raw_cls)
+            raise OmniError(str(malformed), original=malformed)
         if use_circuit_breaker:
             await cb.record_success()
         fire_record(config.model, config.base_url, raw.get("usage") or {}, type)
