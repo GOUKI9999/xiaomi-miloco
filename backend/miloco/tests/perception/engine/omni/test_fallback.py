@@ -2,10 +2,8 @@ from types import SimpleNamespace
 
 import httpx
 import pytest
-
-from miloco.perception.engine.omni import omni_client
-
 from miloco.perception.engine.config import OmniConfig
+from miloco.perception.engine.omni import omni_client
 from miloco.perception.engine.omni.circuit_breaker import CircuitOpenError
 from miloco.perception.engine.omni.omni_client import (
     OmniError,

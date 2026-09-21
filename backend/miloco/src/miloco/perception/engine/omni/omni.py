@@ -27,8 +27,8 @@ from miloco.perception.engine.omni.error_classifier import (
 )
 from miloco.perception.engine.omni.omni_client import (
     OmniError,
-    _is_fallback_eligible,
     _collect_stream_response,
+    _is_fallback_eligible,
     call_omni,
     call_omni_stream,
     extract_usage,
