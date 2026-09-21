@@ -4,6 +4,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { realCreateCameraTask } from "@/api/real";
 import { TaskCreateDialog } from "@/components/TaskCreateDialog";
 import "@/i18n";
+import type { ScopeCamera } from "@/lib/types";
 
 const originalFetch = globalThis.fetch;
 
@@ -78,5 +79,38 @@ describe("task creation review regressions", () => {
   it("keeps the existing empty message for a loaded empty list", () => {
     const html = renderCameraState({ kind: "ready" });
     expect(html).toContain("当前没有正在使用的摄像头");
+  });
+
+  it("uses the shared moving and fixed lens labels", () => {
+    const base: Omit<ScopeCamera, "channel"> = {
+      did: "camera-1",
+      name: "阳台摄像头",
+      channelCount: 2,
+      roomName: "阳台",
+      cloudOnline: true,
+      lanReachable: true,
+      awake: true,
+      inUse: true,
+      voiceInUse: true,
+      perceptionPrompt: "",
+      connected: true,
+    };
+    const html = renderToStaticMarkup(
+      <TaskCreateDialog
+        cameras={[
+          { ...base, channel: 0 },
+          { ...base, channel: 1 },
+        ]}
+        camerasState={{ kind: "ready" }}
+        onCamerasRetry={() => undefined}
+        onClose={() => undefined}
+        onCreated={() => undefined}
+      />,
+    );
+
+    expect(html).toContain("移动画面");
+    expect(html).toContain("固定画面");
+    expect(html).not.toContain("镜头 1");
+    expect(html).not.toContain("镜头 2");
   });
 });

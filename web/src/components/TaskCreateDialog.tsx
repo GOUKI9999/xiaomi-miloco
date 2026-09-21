@@ -3,7 +3,7 @@ import { useTranslation } from "react-i18next";
 
 import { createCameraTask } from "@/api";
 import { useEscClose } from "@/hooks/useEscClose";
-import { feedDid } from "@/lib/cameraChannel";
+import { feedDid, lensLabelKey } from "@/lib/cameraChannel";
 import { IconX } from "@/lib/icons";
 import type { ScopeCamera } from "@/lib/types";
 import { toast } from "./Toast";
@@ -205,9 +205,16 @@ export function TaskCreateDialog({
               <div className="rounded-lg border border-border bg-bg-primary divide-y divide-border">
                 {selectableCameras.map((camera) => {
                   const key = cameraKey(camera);
+                  const lensKey = lensLabelKey(camera.channel);
                   const suffix =
                     camera.channelCount > 1
-                      ? ` · ${t("tasks.cameraChannel", { channel: camera.channel + 1 })}`
+                      ? ` · ${
+                          lensKey
+                            ? t(lensKey)
+                            : t("tasks.cameraChannel", {
+                                channel: camera.channel + 1,
+                              })
+                        }`
                       : "";
                   return (
                     <label
