@@ -226,6 +226,24 @@ export function UsageOmniConfig() {
   const profiles = state?.profiles ?? [];
   const active = state?.active;
   const hasKey = active?.has_key ?? false;
+  const fallbackLabels = state?.fallback_labels ?? [];
+  // 列表顺序即实际调用链：主模型 → 已配置的 fallback → 其余档案。
+  // 只改变派生展示顺序，不改 omni_profiles 的存储顺序。
+  const orderedProfiles = profiles
+    .map((profile, savedOrder) => ({
+      profile,
+      savedOrder,
+      fallbackOrder: fallbackLabels.indexOf(profile.label),
+    }))
+    .sort((a, b) => {
+      if (a.profile.active !== b.profile.active) return a.profile.active ? -1 : 1;
+      const aFallback = a.fallbackOrder >= 0;
+      const bFallback = b.fallbackOrder >= 0;
+      if (aFallback !== bFallback) return aFallback ? -1 : 1;
+      if (aFallback && bFallback) return a.fallbackOrder - b.fallbackOrder;
+      return a.savedOrder - b.savedOrder;
+    })
+    .map(({ profile }) => profile);
   function startAdd() {
     setAdding(true);
     setEditing(null);
@@ -564,6 +582,7 @@ export function UsageOmniConfig() {
                       <th className="text-left px-3 py-2">{t("usage.baseUrlLabel")}</th>
                       <th className="text-left px-3 py-2">{t("usage.colApiKey")}</th>
                       <th className="text-left px-3 py-2 w-44">{t("usage.colStatus")}</th>
+                      <th className="text-left px-3 py-2">{t("usage.fallbackColumn")}</th>
                       <th className="text-left px-5 md:px-6 py-2">{t("usage.colAction")}</th>
                     </tr>
                   </thead>
@@ -571,14 +590,16 @@ export function UsageOmniConfig() {
                     {profiles.length === 0 ? (
                       <tr>
                         <td
-                          colSpan={6}
+                          colSpan={7}
                           className="px-5 md:px-6 py-5 text-center text-text-tertiary"
                         >
                           {t("usage.emptyProfiles")}
                         </td>
                       </tr>
                     ) : (
-                      profiles.map((p) => (
+                      orderedProfiles.map((p) => {
+                        const fallbackOrder = fallbackLabels.indexOf(p.label);
+                        return (
                         <tr
                           key={p.label}
                           className={`border-b border-border last:border-b-0 ${
@@ -636,6 +657,54 @@ export function UsageOmniConfig() {
                               <span className="block w-44 truncate text-text-tertiary">{t("usage.statusUntested")}</span>
                             )}
                           </td>
+                          <td className="px-3 py-2.5">
+                            {p.active ? (
+                              <span className="text-brand-primary">{t("usage.activeTag")}</span>
+                            ) : !p.has_key ? (
+                              <span className="text-text-tertiary">{t("usage.notConfigured")}</span>
+                            ) : (
+                              <div className="inline-flex items-center gap-2">
+                                <label className="inline-flex items-center gap-2 text-text-primary">
+                                  <input
+                                    type="checkbox"
+                                    checked={fallbackOrder >= 0}
+                                    disabled={fallbackSaving}
+                                    onChange={() => toggleFallback(p.label)}
+                                  />
+                                  <span>
+                                    {fallbackOrder >= 0
+                                      ? t("usage.fallbackOrder", { n: fallbackOrder + 1 })
+                                      : t("usage.fallbackUse")}
+                                  </span>
+                                </label>
+                                {fallbackOrder >= 0 && (
+                                  <>
+                                    <button
+                                      type="button"
+                                      disabled={fallbackSaving || fallbackOrder === 0}
+                                      onClick={() => moveFallback(p.label, -1)}
+                                      aria-label={t("usage.fallbackMoveUp", { name: p.label })}
+                                      className="disabled:opacity-30 text-text-secondary hover:text-brand-primary"
+                                    >
+                                      <IconChevronUp width={16} height={16} />
+                                    </button>
+                                    <button
+                                      type="button"
+                                      disabled={
+                                        fallbackSaving ||
+                                        fallbackOrder === fallbackLabels.length - 1
+                                      }
+                                      onClick={() => moveFallback(p.label, 1)}
+                                      aria-label={t("usage.fallbackMoveDown", { name: p.label })}
+                                      className="disabled:opacity-30 text-text-secondary hover:text-brand-primary"
+                                    >
+                                      <IconChevronDown width={16} height={16} />
+                                    </button>
+                                  </>
+                                )}
+                              </div>
+                            )}
+                          </td>
                           <td className="px-5 md:px-6 py-2.5 text-left whitespace-nowrap">
                             <div className="inline-flex items-center gap-3 align-middle">
                               {p.active ? (
@@ -682,72 +751,11 @@ export function UsageOmniConfig() {
                             </div>
                           </td>
                         </tr>
-                      ))
+                        );
+                      })
                     )}
                   </tbody>
                 </table>
-              </div>
-
-              <div className="mt-4 rounded-lg border border-border p-4">
-                <div className="text-body font-medium text-text-primary">
-                  {t("usage.fallbackTitle")}
-                </div>
-                <p className="text-caption text-text-tertiary mt-1">
-                  {t("usage.fallbackHint")}
-                </p>
-                <div className="mt-3 space-y-2">
-                  {profiles.filter((p) => !p.active && p.has_key).length === 0 ? (
-                    <div className="text-caption text-text-tertiary">
-                      {t("usage.fallbackEmpty")}
-                    </div>
-                  ) : (
-                    profiles
-                      .filter((p) => !p.active && p.has_key)
-                      .map((p) => {
-                        const order = state.fallback_labels.indexOf(p.label);
-                        return (
-                          <div key={p.label} className="flex items-center gap-3 text-caption">
-                            <input
-                              type="checkbox"
-                              checked={order >= 0}
-                              disabled={fallbackSaving}
-                              onChange={() => toggleFallback(p.label)}
-                            />
-                            <span className="min-w-0 flex-1 text-text-primary">
-                              {p.label} <span className="num text-text-tertiary">· {p.model}</span>
-                            </span>
-                            {order >= 0 && (
-                              <>
-                                <span className="text-text-tertiary">
-                                  {t("usage.fallbackOrder", { n: order + 1 })}
-                                </span>
-                                <button
-                                  type="button"
-                                  disabled={fallbackSaving || order === 0}
-                                  onClick={() => moveFallback(p.label, -1)}
-                                  aria-label={t("usage.fallbackMoveUp", { name: p.label })}
-                                  className="disabled:opacity-30 text-text-secondary hover:text-brand-primary"
-                                >
-                                  <IconChevronUp width={16} height={16} />
-                                </button>
-                                <button
-                                  type="button"
-                                  disabled={
-                                    fallbackSaving || order === state.fallback_labels.length - 1
-                                  }
-                                  onClick={() => moveFallback(p.label, 1)}
-                                  aria-label={t("usage.fallbackMoveDown", { name: p.label })}
-                                  className="disabled:opacity-30 text-text-secondary hover:text-brand-primary"
-                                >
-                                  <IconChevronDown width={16} height={16} />
-                                </button>
-                              </>
-                            )}
-                          </div>
-                        );
-                      })
-                  )}
-                </div>
               </div>
 
               {/* 新增按钮放列表下方(新增即追加到列表末尾) */}

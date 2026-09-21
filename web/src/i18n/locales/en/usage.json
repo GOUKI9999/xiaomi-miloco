@@ -152,6 +152,8 @@
     "profileNameLabel": "Custom name",
     "profileNamePlaceholder": "e.g. Official Kimi or Company proxy",
     "profileNameRequired": "Custom name, Base URL, and model are required",
+    "fallbackColumn": "Call order",
+    "fallbackUse": "Use as fallback",
     "fallbackTitle": "Fallback models",
     "fallbackHint": "On network errors, timeouts, 429, or 5xx, try these in order. Authentication and configuration errors do not trigger fallback.",
     "fallbackEmpty": "No eligible backup profile. Add another model with an API key first.",

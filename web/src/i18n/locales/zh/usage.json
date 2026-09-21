@@ -152,6 +152,8 @@
     "profileNameLabel": "自定义名称",
     "profileNamePlaceholder": "例如：Kimi 官方、公司代理",
     "profileNameRequired": "自定义名称、Base URL 和模型不能为空",
+    "fallbackColumn": "调用顺位",
+    "fallbackUse": "设为备用",
     "fallbackTitle": "故障接替模型",
     "fallbackHint": "主模型遇到网络错误、超时、429 或 5xx 时，按此顺序接替；鉴权或配置错误不会自动切换。",
     "fallbackEmpty": "暂无可用的备用档案，请先添加另一个已配置 Key 的模型。",
