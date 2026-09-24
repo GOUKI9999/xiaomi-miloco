@@ -5,7 +5,7 @@
  * - 上:**当前模型** —— 当前生效配置摘要;未配 key 给警告。
  * - 下:**模型列表** —— 每行 名称 | 模型 | 调用顺位 | 操作 | 连接状态,
  *   行序即实际调用链:当前生效 → fallback(按顺位) → 其余档案(派生排序,不动存储顺序);
- *   Base URL 与 API Key 只在新增/编辑表单中展示,避免列表直接暴露低频敏感信息;
+ *   模型列表不展示 Base URL 与 API Key;连接信息仅在必要的摘要、确认或编辑场景展示;
  *   「＋ 新增」展开表单(自定义名称 → Base URL → API Key → 模型组合框 + 测试连接 + 保存)。
  *
  * 档案名(label)=用户自定义唯一 id。新增必填、编辑可改名,重名由后端返回 409。
@@ -947,6 +947,7 @@ export function UsageOmniConfig() {
             </div>
             <p className="text-body text-text-secondary">
               {t("usage.deleteConfirm", {
+                name: deleteTarget.label,
                 model: deleteTarget.model,
                 host: hostOf(deleteTarget.base_url),
               })}

@@ -409,6 +409,7 @@ async def _call_omni_messages(
                     )
                 )
             malformed = MalformedBodyError(raw_cls)
+            error = {"code": malformed.code, "msg": str(malformed)[:512]}
             raise OmniError(str(malformed), original=malformed)
         if use_circuit_breaker:
             await cb.record_success()

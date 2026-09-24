@@ -23,6 +23,12 @@ def _http_error(status: int) -> OmniError:
 
 def test_fallback_eligible_only_for_recoverable_failures():
     assert _is_fallback_eligible(OmniError("timeout", original=httpx.ReadTimeout("x")))
+    assert _is_fallback_eligible(
+        OmniError(
+            "server disconnected",
+            original=httpx.RemoteProtocolError("Server disconnected without response"),
+        )
+    )
     assert _is_fallback_eligible(_http_error(429))
     assert _is_fallback_eligible(_http_error(503))
     malformed = OmniError("bad", original=MalformedBodyError("list"))

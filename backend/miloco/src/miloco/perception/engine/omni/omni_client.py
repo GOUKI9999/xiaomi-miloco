@@ -94,17 +94,10 @@ class OmniError(Exception):
 def _is_fallback_eligible(error: OmniError) -> bool:
     """Return whether a failed request may safely move to the next provider."""
     original = error.original
-    if isinstance(original, (httpx.TimeoutException, httpx.NetworkError)):
-        return True
-    if isinstance(original, httpx.HTTPStatusError):
-        return (
-            original.response.status_code == 429 or original.response.status_code >= 500
-        )
-    if isinstance(original, (json.JSONDecodeError, MalformedBodyError)):
-        return True
+    if original is None:
+        return False
     if isinstance(original, CircuitOpenError):
         code = str(original.code or "").split(":")[-1]
-        # Keep this list aligned with the recoverable direct-request failures above.
         return code in {
             "rate_limited",
             "timeout",
@@ -112,7 +105,12 @@ def _is_fallback_eligible(error: OmniError) -> bool:
             "http_error",
             "bad_response",
         }
-    return False
+    classified = (
+        classify_response(original.response)
+        if isinstance(original, httpx.HTTPStatusError)
+        else classify_exception(original)
+    )
+    return classified is not None and classified.category is ErrorCategory.RECOVERABLE
 
 
 @dataclass(frozen=True)
@@ -355,6 +353,7 @@ async def _call_omni_once(
                         )
                     )
                 malformed = MalformedBodyError(raw_cls)
+                error = {"code": malformed.code, "msg": str(malformed)[:512]}
                 raise OmniError(str(malformed), original=malformed)
             if use_circuit_breaker:
                 await cb.record_success()
