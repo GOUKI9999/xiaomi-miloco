@@ -2,9 +2,10 @@
  * 「模型」页顶部的 omni 模型配置卡(可折叠,默认展开)。
  *
  * 两块:
- * - 上:**当前模型** —— 当前生效配置(名称 / model / Base URL / 打码 key);未配 key 给警告。
- * - 下:**模型列表** —— 每行 名称 | 模型 | Base URL | API Key(打码) | 连接状态 | 调用顺位 | 操作,
+ * - 上:**当前模型** —— 当前生效配置摘要;未配 key 给警告。
+ * - 下:**模型列表** —— 每行 名称 | 模型 | 调用顺位 | 操作 | 连接状态,
  *   行序即实际调用链:当前生效 → fallback(按顺位) → 其余档案(派生排序,不动存储顺序);
+ *   Base URL 与 API Key 只在新增/编辑表单中展示,避免列表直接暴露低频敏感信息;
  *   「＋ 新增」展开表单(自定义名称 → Base URL → API Key → 模型组合框 + 测试连接 + 保存)。
  *
  * 档案名(label)=用户自定义唯一 id。新增必填、编辑可改名,重名由后端返回 409。
@@ -584,18 +585,16 @@ export function UsageOmniConfig() {
                     <tr className="text-text-secondary border-b border-border">
                       <th className="text-left px-5 md:px-6 py-2">{t("usage.colName")}</th>
                       <th className="text-left px-3 py-2">{t("usage.colModel")}</th>
-                      <th className="text-left px-3 py-2">{t("usage.baseUrlLabel")}</th>
-                      <th className="text-left px-3 py-2">{t("usage.colApiKey")}</th>
-                      <th className="text-left px-3 py-2 w-44">{t("usage.colStatus")}</th>
                       <th className="text-left px-3 py-2">{t("usage.fallbackColumn")}</th>
-                      <th className="text-left px-5 md:px-6 py-2">{t("usage.colAction")}</th>
+                      <th className="text-left px-3 py-2">{t("usage.colAction")}</th>
+                      <th className="text-left px-5 md:px-6 py-2 w-44">{t("usage.colStatus")}</th>
                     </tr>
                   </thead>
                   <tbody>
                     {profiles.length === 0 ? (
                       <tr>
                         <td
-                          colSpan={7}
+                          colSpan={5}
                           className="px-5 md:px-6 py-5 text-center text-text-tertiary"
                         >
                           {t("usage.emptyProfiles")}
@@ -620,48 +619,6 @@ export function UsageOmniConfig() {
                             )}
                           </td>
                           <td className="px-3 py-2.5 num text-text-primary">{p.model}</td>
-                          <td className="px-3 py-2.5 num text-text-tertiary">{p.base_url}</td>
-                          <td className="px-3 py-2.5 num text-text-tertiary">
-                            {p.has_key ? p.api_key_masked : t("usage.notConfigured")}
-                          </td>
-                          {/* 连接状态列:默认「未测试」;点行内「测试」就地刷新;定宽截断,溢出 hover 看全文 */}
-                          {/* 固定宽 w-44 单行截断(列宽恒定不横向挤压);文字被截断时鼠标悬浮即时弹出
-                              锚定元素底部的 fixed 浮层显示全文(避开表格 overflow 裁剪、无原生 title 延迟) */}
-                          <td className="px-3 py-2.5">
-                            {/* active 行且 health 非 ok:优先显实时熔断状态,覆盖手动测试结果
-                                (health 是真实运行时反映,手动测试是快照)。 */}
-                            {p.active && state.active.health && state.active.health.state !== "ok" ? (
-                              <span
-                                className={`block w-44 truncate ${SEV_CLASS[state.active.health.state === "error" ? "error" : "warn"]}`}
-                                onMouseEnter={showTip}
-                                onMouseLeave={hideTip}
-                              >
-                                {SEV_GLYPH[state.active.health.state === "error" ? "error" : "warn"]}{" "}
-                                {/* backend message 硬编码中文,英文界面走 codes i18n;
-                                    http_error 带动态状态码不走 codes,直接显 message。 */}
-                                {state.active.health.code && state.active.health.code !== "http_error"
-                                  ? t(`omniHealth.codes.${state.active.health.code}`, {
-                                      defaultValue: state.active.health.message,
-                                    })
-                                  : state.active.health.message}
-                                {state.active.health.consecutive_failures > 0 && (
-                                  <> · {t("omniHealth.failuresCount", { n: state.active.health.consecutive_failures })}</>
-                                )}
-                              </span>
-                            ) : rowTesting === p.label ? (
-                              <span className="block w-44 truncate text-text-tertiary">{t("usage.testing")}</span>
-                            ) : rowTestResults[p.label] ? (
-                              <span
-                                className={`block w-44 truncate ${SEV_CLASS[severityOf(rowTestResults[p.label])]}`}
-                                onMouseEnter={showTip}
-                                onMouseLeave={hideTip}
-                              >
-                                {testResultText(rowTestResults[p.label])}
-                              </span>
-                            ) : (
-                              <span className="block w-44 truncate text-text-tertiary">{t("usage.statusUntested")}</span>
-                            )}
-                          </td>
                           <td className="px-3 py-2.5">
                             {p.active ? (
                               <span className="text-brand-primary">{t("usage.activeTag")}</span>
@@ -710,7 +667,7 @@ export function UsageOmniConfig() {
                               </div>
                             )}
                           </td>
-                          <td className="px-5 md:px-6 py-2.5 text-left whitespace-nowrap">
+                          <td className="px-3 py-2.5 text-left whitespace-nowrap">
                             <div className="inline-flex items-center gap-3 align-middle">
                               {p.active ? (
                                 <button
@@ -754,6 +711,44 @@ export function UsageOmniConfig() {
                                 {t("usage.delete")}
                               </button>
                             </div>
+                          </td>
+                          {/* 连接状态列:默认「未测试」;点行内「测试」就地刷新;定宽截断,溢出 hover 看全文 */}
+                          {/* 固定宽 w-44 单行截断(列宽恒定不横向挤压);文字被截断时鼠标悬浮即时弹出
+                              锚定元素底部的 fixed 浮层显示全文(避开表格 overflow 裁剪、无原生 title 延迟) */}
+                          <td className="px-5 md:px-6 py-2.5">
+                            {/* active 行且 health 非 ok:优先显实时熔断状态,覆盖手动测试结果
+                                (health 是真实运行时反映,手动测试是快照)。 */}
+                            {p.active && state.active.health && state.active.health.state !== "ok" ? (
+                              <span
+                                className={`block w-44 truncate ${SEV_CLASS[state.active.health.state === "error" ? "error" : "warn"]}`}
+                                onMouseEnter={showTip}
+                                onMouseLeave={hideTip}
+                              >
+                                {SEV_GLYPH[state.active.health.state === "error" ? "error" : "warn"]}{" "}
+                                {/* backend message 硬编码中文,英文界面走 codes i18n;
+                                    http_error 带动态状态码不走 codes,直接显 message。 */}
+                                {state.active.health.code && state.active.health.code !== "http_error"
+                                  ? t(`omniHealth.codes.${state.active.health.code}`, {
+                                      defaultValue: state.active.health.message,
+                                    })
+                                  : state.active.health.message}
+                                {state.active.health.consecutive_failures > 0 && (
+                                  <> · {t("omniHealth.failuresCount", { n: state.active.health.consecutive_failures })}</>
+                                )}
+                              </span>
+                            ) : rowTesting === p.label ? (
+                              <span className="block w-44 truncate text-text-tertiary">{t("usage.testing")}</span>
+                            ) : rowTestResults[p.label] ? (
+                              <span
+                                className={`block w-44 truncate ${SEV_CLASS[severityOf(rowTestResults[p.label])]}`}
+                                onMouseEnter={showTip}
+                                onMouseLeave={hideTip}
+                              >
+                                {testResultText(rowTestResults[p.label])}
+                              </span>
+                            ) : (
+                              <span className="block w-44 truncate text-text-tertiary">{t("usage.statusUntested")}</span>
+                            )}
                           </td>
                         </tr>
                         );
