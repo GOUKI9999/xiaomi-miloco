@@ -25,6 +25,19 @@ function cameraKey(camera: ScopeCamera): string {
   return `${camera.did}:${camera.channel}`;
 }
 
+/**
+ * 真正会被提交的摄像头 = 可选列表 ∩ 勾选集合。
+ *
+ * 导出供单测直接断言: 勾选集合可能因为摄像头被占用 / 下线后的重渲染而留下
+ * 旧 key,此时两者会发散,启用条件必须跟这份交集比对,否则按钮可点但提交空转。
+ */
+export function submittedCameras(
+  selectableCameras: ScopeCamera[],
+  selected: Set<string>,
+): ScopeCamera[] {
+  return selectableCameras.filter((camera) => selected.has(cameraKey(camera)));
+}
+
 export function TaskCreateDialog({
   cameras,
   camerasState,
@@ -47,11 +60,18 @@ export function TaskCreateDialog({
 
   useEscClose(!busy, onClose);
 
+  // 勾选集合可能包含已被移出可选列表的旧 key(摄像头被占用/ 下线后重渲染),
+  // 提交用的是两者的交集,启用条件必须跟同一份交集比对,否则按钮可点但提交空转。
+  const selectedCameras = useMemo(
+    () => submittedCameras(selectableCameras, selected),
+    [selectableCameras, selected],
+  );
+
   const ready =
     description.trim().length > 0 &&
     query.trim().length > 0 &&
     actionDescription.trim().length > 0 &&
-    selected.size > 0;
+    selectedCameras.length > 0;
 
   const toggleCamera = (key: string) => {
     setSelected((current) => {
@@ -64,11 +84,9 @@ export function TaskCreateDialog({
 
   const submit = async () => {
     if (!ready || busy) return;
-    const perceiveDeviceIds = selectableCameras
-      .filter((camera) => selected.has(cameraKey(camera)))
-      .map((camera) =>
-        feedDid(camera.did, camera.channel, camera.channelCount > 1),
-      );
+    const perceiveDeviceIds = selectedCameras.map((camera) =>
+      feedDid(camera.did, camera.channel, camera.channelCount > 1),
+    );
     if (perceiveDeviceIds.length === 0) return;
 
     setBusy(true);
@@ -237,7 +255,7 @@ export function TaskCreateDialog({
                 })}
               </div>
             )}
-            {selected.size === 0 && selectableCameras.length > 0 && (
+            {selectedCameras.length === 0 && selectableCameras.length > 0 && (
               <span className="block text-caption text-text-tertiary mt-1">
                 {t("tasks.cameraRequired")}
               </span>

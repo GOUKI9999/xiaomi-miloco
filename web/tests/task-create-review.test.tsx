@@ -2,7 +2,10 @@ import { renderToStaticMarkup } from "react-dom/server";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { realCreateCameraTask } from "@/api/real";
-import { TaskCreateDialog } from "@/components/TaskCreateDialog";
+import {
+  submittedCameras,
+  TaskCreateDialog,
+} from "@/components/TaskCreateDialog";
 import "@/i18n";
 import type { ScopeCamera } from "@/lib/types";
 
@@ -36,6 +39,38 @@ function renderCameraState(
     />,
   );
 }
+
+describe("task creation gate", () => {
+  const base: Omit<ScopeCamera, "channel" | "inUse"> = {
+    did: "camera-1",
+    name: "阳台摄像头",
+    channelCount: 1,
+    roomName: "阳台",
+    cloudOnline: true,
+    lanReachable: true,
+    awake: true,
+    voiceInUse: true,
+    perceptionPrompt: "",
+    connected: true,
+  };
+
+  it("keeps only the intersection of selectable cameras and selection", () => {
+    const selectable = [{ ...base, channel: 0, inUse: true }];
+    expect(submittedCameras(selectable, new Set(["camera-1:0"]))).toHaveLength(
+      1,
+    );
+    expect(submittedCameras(selectable, new Set())).toHaveLength(0);
+  });
+
+  it("treats a selection disjoint from the selectable list as empty", () => {
+    // 勾选后摄像头被占用 / 下线，重渲染后的可选列表已不含该 key：
+// 勾选集合非空但交集为空，创建按钮必须视为不可提交，而不是点击后静默空转。
+    const selectable = [{ ...base, channel: 0, inUse: true }];
+    const stale = new Set(["camera-9:0"]);
+    expect(stale.size).toBeGreaterThan(0);
+    expect(submittedCameras(selectable, stale)).toHaveLength(0);
+  });
+});
 
 describe("task creation review regressions", () => {
   it("uses the task id to keep rule names unique", async () => {
