@@ -134,6 +134,7 @@ def test_adapter_rebalances_connected_devices_from_live_settings(monkeypatch):
     assert adapter._rebalance_window_phases() == 0
 
     adapter._devices.pop("cam-d")
+    assert adapter._rebalance_window_phases() == 0
     assert adapter._rebalance_window_phases() == 2
     assert {
         did: state.sync_buffer.phase_offset_ms
@@ -142,4 +143,137 @@ def test_adapter_rebalances_connected_devices_from_live_settings(monkeypatch):
         "cam-a": 0,
         "cam-b": 3_333,
         "cam-c": 6_666,
+    }
+
+
+def test_adapter_defers_rephase_until_addition_is_confirmed(monkeypatch):
+    collect = SimpleNamespace(window_size=10, stagger_devices=True)
+    monkeypatch.setattr(
+        "miloco.perception.collect.camera_adapter.get_settings",
+        lambda: SimpleNamespace(perception=SimpleNamespace(collect=collect)),
+    )
+    adapter = CameraDeviceAdapter(miot_proxy=object())  # type: ignore[arg-type]
+    adapter._devices = {
+        "cam-a": _state("cam-a"),
+        "cam-b": _state("cam-b"),
+        "cam-c": _state("cam-c"),
+    }
+    assert adapter._rebalance_window_phases() == 2
+    stable = {
+        did: state.sync_buffer.phase_offset_ms
+        for did, state in adapter._devices.items()
+    }
+    assert stable == {"cam-a": 0, "cam-b": 3_333, "cam-c": 6_666}
+
+    adapter._devices["cam-d"] = _state("cam-d")
+    assert adapter._rebalance_window_phases() == 0
+    assert {
+        did: state.sync_buffer.phase_offset_ms
+        for did, state in adapter._devices.items()
+    } == {
+        "cam-a": 0,
+        "cam-b": 3_333,
+        "cam-c": 6_666,
+        "cam-d": 0,
+    }
+
+    assert adapter._rebalance_window_phases() == 3
+    assert {
+        did: state.sync_buffer.phase_offset_ms
+        for did, state in adapter._devices.items()
+    } == {
+        "cam-a": 0,
+        "cam-b": 2_500,
+        "cam-c": 5_000,
+        "cam-d": 7_500,
+    }
+
+
+def test_adapter_rearms_hysteresis_after_membership_reverts(monkeypatch):
+    collect = SimpleNamespace(window_size=10, stagger_devices=True)
+    monkeypatch.setattr(
+        "miloco.perception.collect.camera_adapter.get_settings",
+        lambda: SimpleNamespace(perception=SimpleNamespace(collect=collect)),
+    )
+    adapter = CameraDeviceAdapter(miot_proxy=object())  # type: ignore[arg-type]
+    adapter._devices = {
+        "cam-a": _state("cam-a"),
+        "cam-b": _state("cam-b"),
+        "cam-c": _state("cam-c"),
+    }
+    assert adapter._rebalance_window_phases() == 2
+
+    removed = adapter._devices.pop("cam-c")
+    assert adapter._rebalance_window_phases() == 0
+    adapter._devices["cam-c"] = removed
+    assert adapter._rebalance_window_phases() == 0
+
+    assert adapter._rebalance_window_phases() == 0
+    adapter._devices.pop("cam-b")
+    assert adapter._rebalance_window_phases() == 0
+    assert adapter._rebalance_window_phases() == 1
+    assert {
+        did: state.sync_buffer.phase_offset_ms
+        for did, state in adapter._devices.items()
+    } == {
+        "cam-a": 0,
+        "cam-c": 5_000,
+    }
+
+
+def test_adapter_resets_hysteresis_when_stagger_disabled(monkeypatch):
+    collect = SimpleNamespace(window_size=10, stagger_devices=False)
+    monkeypatch.setattr(
+        "miloco.perception.collect.camera_adapter.get_settings",
+        lambda: SimpleNamespace(perception=SimpleNamespace(collect=collect)),
+    )
+    adapter = CameraDeviceAdapter(miot_proxy=object())  # type: ignore[arg-type]
+    adapter._devices = {"cam-a": _state("cam-a"), "cam-b": _state("cam-b")}
+
+    assert adapter._rebalance_window_phases() == 0
+    assert adapter._phase_members is None
+    assert adapter._pending_phase_members is None
+    assert adapter._pending_phase_rounds == 0
+    assert {
+        did: state.sync_buffer.phase_offset_ms
+        for did, state in adapter._devices.items()
+    } == {"cam-a": 0, "cam-b": 0}
+
+    collect.stagger_devices = True
+    assert adapter._rebalance_window_phases() == 1
+    assert adapter._phase_members == ("cam-a", "cam-b")
+    assert {
+        did: state.sync_buffer.phase_offset_ms
+        for did, state in adapter._devices.items()
+    } == {"cam-a": 0, "cam-b": 5_000}
+
+
+def test_adapter_ignores_single_round_membership_flap(monkeypatch):
+    collect = SimpleNamespace(window_size=10, stagger_devices=True)
+    monkeypatch.setattr(
+        "miloco.perception.collect.camera_adapter.get_settings",
+        lambda: SimpleNamespace(perception=SimpleNamespace(collect=collect)),
+    )
+    adapter = CameraDeviceAdapter(miot_proxy=object())  # type: ignore[arg-type]
+    adapter._devices = {
+        "cam-a": _state("cam-a"),
+        "cam-b": _state("cam-b"),
+        "cam-c": _state("cam-c"),
+        "cam-d": _state("cam-d"),
+    }
+    assert adapter._rebalance_window_phases() == 3
+
+    removed = adapter._devices.pop("cam-d")
+    assert adapter._rebalance_window_phases() == 0
+    adapter._devices["cam-d"] = removed
+    assert adapter._rebalance_window_phases() == 0
+
+    assert {
+        did: state.sync_buffer.phase_offset_ms
+        for did, state in adapter._devices.items()
+    } == {
+        "cam-a": 0,
+        "cam-b": 2_500,
+        "cam-c": 5_000,
+        "cam-d": 7_500,
     }

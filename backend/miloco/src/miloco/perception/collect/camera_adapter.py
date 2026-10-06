@@ -154,15 +154,44 @@ class CameraDeviceAdapter(BaseDeviceAdapter):
         self._last_ondemand_refresh_ms = 0
         # 静默重连防抖标记：did -> 最近一次重连的 monotonic ms。
         self._last_reconnect_ms: dict[str, int] = {}
+        # 已应用及待确认的错峰成员集合。成员变化连续两轮稳定后才重排，
+        # 避免单轮网络抖动清空所有存活相机的窗口。
+        self._phase_members: tuple[str, ...] | None = None
+        self._pending_phase_members: tuple[str, ...] | None = None
+        self._pending_phase_rounds = 0
 
     def _rebalance_window_phases(self) -> int:
         """Evenly stagger connected cameras using stable synthetic-DID order."""
         collect_cfg = get_settings().perception.collect
         window_ms = collect_cfg.window_size * 1000
+        enabled = getattr(collect_cfg, "stagger_devices", False)
+        members = tuple(sorted(self._devices))
+        if not enabled:
+            self._phase_members = None
+            self._pending_phase_members = None
+            self._pending_phase_rounds = 0
+        elif self._phase_members is None:
+            if members:
+                self._phase_members = members
+        elif members != self._phase_members:
+            if members != self._pending_phase_members:
+                self._pending_phase_members = members
+                self._pending_phase_rounds = 1
+                return 0
+            self._pending_phase_rounds += 1
+            if self._pending_phase_rounds < 2:
+                return 0
+            self._phase_members = members
+            self._pending_phase_members = None
+            self._pending_phase_rounds = 0
+        else:
+            self._pending_phase_members = None
+            self._pending_phase_rounds = 0
+
         offsets = _window_phase_offsets(
-            list(self._devices),
+            list(members),
             window_ms=window_ms,
-            enabled=getattr(collect_cfg, "stagger_devices", False),
+            enabled=enabled,
         )
         changed = 0
         for did, phase_ms in offsets.items():
