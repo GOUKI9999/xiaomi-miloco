@@ -146,6 +146,109 @@ class TestKimiAdapter:
         assert "thinking" not in body
 
 
+class TestKimiAdapterWireShape:
+    """感知主链路真实组包（``_build_messages`` → ``build_request_body``）的线格式断言。
+
+    上面的 ``TestKimiAdapter`` 只单测 block 构造，本类补上「block 进到messages 后、
+    最终发给 Moonshot 的那个 body 长什么样」这一段——block 单测过不代表组包后形状正确
+    （例如MiMo 私有fps 被带进 video_url.url、或thinking 漏删）。
+
+    ⚠️ 能力边界：这些断言证明 **本仓组包逻辑** 产出预期形状（含 data URI 承载方式），
+    **不能证明 Moonshot 线上接受该形状**。后者需真实 Moonshot key + 真实视频/音频的
+    非 probe 请求，见 PR #575 描述「未验证项」。仓内无 mock 可替代该证据。
+    """
+
+    adapter = KimiAdapter()
+
+    def _wire_body(self, payload: dict) -> dict:
+        """走生产同款路径组包：payload → messages → request body。"""
+        from miloco.perception.engine.omni.omni_client import _build_messages
+
+        adapter = get_adapter(payload.get("model", "kimi-k2.6"))
+        messages = _build_messages(payload, adapter)
+        return adapter.build_request_body(
+            messages,
+            model=payload.get("model", "kimi-k2.6"),
+            max_tokens=512,
+            temperature=0.1,
+            top_p=1.0,
+            stream=False,
+        )
+
+    def test_fused_video_payload_data_uri_survives_assembly(self):
+        """视频窗口（video_base64 命中，audio 分支不进）——data URI 必须原样进 wire body。"""
+        body = self._wire_body({
+            "system_prompt": "你是助手",
+            "user_content": "看这段视频",
+            "video_base64": "VIDEOB64",
+            "audio_base64": "AUD",
+            "media_info": _VIDEO_MEDIA,
+            "crops": [],
+        })
+        content = body["messages"][1]["content"]
+        assert content[0] == {"type": "text", "text": "看这段视频"}
+        assert content[1] == {
+            "type": "video_url",
+            "video_url": {"url": "data:video/mp4;base64,VIDEOB64"},
+        }
+        # MiMo 私有字段不能顺着 group 漏进 Kimi 请求
+        assert "fps" not in content[1]
+        assert "media_resolution" not in content[1]
+        # audio_base64 与 video_base64 同时在场时走 video 分支（生产 elif 语义）
+        assert len(content) == 2
+        assert content[1]["type"] == "video_url"
+
+    def test_audio_only_payload_data_uri_survives_assembly(self):
+        """纯音频窗口（仅 audio_base64）——input_audio 形状同样要落到 wire body。"""
+        body = self._wire_body({
+            "system_prompt": "你是助手",
+            "user_content": "听这段音频",
+            "audio_base64": "AUD",
+            "media_info": _AUDIO_MEDIA,
+            "crops": [],
+        })
+        content = body["messages"][1]["content"]
+        assert content[1] == {
+            "type": "input_audio",
+            "input_audio": {"data": "data:audio/m4a;base64,AUD"},
+        }
+
+    def test_wire_body_pairs_media_blocks_with_normalized_sampling(self):
+        """多模态与采样归一必须同时成立：媒体块就位 + k2.6 采样合法 + thinking 已删。"""
+        body = self._wire_body({
+            "system_prompt": "你是助手",
+            "user_content": "看这段视频",
+            "video_base64": "VIDEOB64",
+            "media_info": _VIDEO_MEDIA,
+            "crops": [],
+        })
+        assert body["temperature"] == 1.0
+        assert body["top_p"] == 0.95
+        assert "thinking" not in body
+        # 多模态走 OpenAI 兼容族 endpoint，不该被转成 Gemini 原生协议
+        assert "contents" not in body
+        assert body["messages"][1]["content"][1]["type"] == "video_url"
+
+    def test_mimo_media_blocks_absent_from_kimi_wire_body(self):
+        """反向对照：MiMo 私有扩展不得出现在 Kimi body 的任何 content block 里。
+
+        顺序按 ``_build_messages`` 生产语义：text → video/audio → crops（图片）。
+        """
+        body = self._wire_body({
+            "system_prompt": "你是助手",
+            "user_content": "看这段视频",
+            "video_base64": "VIDEOB64",
+            "media_info": _VIDEO_MEDIA,
+            "crops": [{"media_type": "image/png", "data": "IMG"}],
+        })
+        blocks = body["messages"][1]["content"][1:]
+        assert [b["type"] for b in blocks] == ["video_url", "image_url"]
+        for b in blocks:
+            assert "fps" not in b
+            assert "media_resolution" not in b
+        assert blocks[0]["video_url"]["url"].startswith("data:video/mp4;base64,")
+
+
 class TestQwenOmniAdapter:
     adapter = QwenOmniAdapter()
 
