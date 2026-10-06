@@ -83,6 +83,11 @@ async def fetch_models(base_url: str, api_key: str) -> dict[str, Any]:
     is_gemini = (
         (urlparse(base).hostname or "").lower() == "generativelanguage.googleapis.com"
     )
+    # 这里刻意只发鉴权头(Authorization / x-goog-api-key),**不**复用
+    # build_request_headers()、也**不**带 x-opencode-session:GET /models 是选定 model
+    # 之前的预检,没有 adapter 可路由,而 OpenCode Go 的 session 头是运行时
+    # build_request_headers() 按 endpoint 派生的进程级路由 ID。刻意不统一,别"顺手
+    # 收敛"——预检与运行时的差异是设计,不是遗漏。
     headers = (
         {"x-goog-api-key": api_key}
         if is_gemini
@@ -351,6 +356,10 @@ async def probe_omni(model: str, base_url: str, api_key: str) -> dict[str, Any]:
     if not isinstance(get_adapter(model), OpenAICompatAdapter):
         return await probe_chat(model, base, api_key)
     try:
+        # 同 fetch_models:预检刻意只发 Authorization、**不**带 x-opencode-session。
+        # 这里的 model 已经能拿到 adapter,但 GET /models 是「这个 endpoint 认不认我的
+        # key」的前置门,不是一次推理——带 session 头会让预检与运行时
+        # (build_request_headers 的产物)长得不一样,反而看不出真正的分叉。
         async with httpx.AsyncClient(timeout=_TIMEOUT) as client:
             r = await client.get(
                 f"{base}/models", headers={"Authorization": f"Bearer {api_key}"}
