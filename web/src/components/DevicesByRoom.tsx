@@ -52,6 +52,14 @@ interface Props {
   onChanged: () => void;
 }
 
+/** 未记录的房间一律收起；用户操作后按房间读取明确状态。 */
+export function isRoomOpen(
+  expanded: Record<string, boolean>,
+  room: string,
+): boolean {
+  return expanded[room] ?? false;
+}
+
 export function DevicesByRoom({ devices, scenes, onChanged }: Props) {
   const { t } = useTranslation();
   const [expanded, setExpanded] = useState<Record<string, boolean>>({});
@@ -104,7 +112,7 @@ export function DevicesByRoom({ devices, scenes, onChanged }: Props) {
               d.mainSwitch?.current,
           ).length;
           // 初始保持收起，避免多个房间同时占满页面；用户点击后仍逐房间记住状态。
-          const open = expanded[room] ?? false;
+          const open = isRoomOpen(expanded, room);
           return (
             <div
               key={room}

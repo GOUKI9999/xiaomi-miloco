@@ -1,34 +1,39 @@
 /**
  * 用户可见术语与设备分组初始状态的回归约束。
  *
- * 组件测试环境目前不含 DOM renderer，因此设备分组用源码不变量守住：初始状态必须
- * 明确回落到 false，不能再根据房间数或索引自动展开。统计文案直接检查 i18n 资源，
- * 同时确保普通用户标题与开发者精确口径并存。
+ * 组件测试环境目前不含 DOM renderer，因此设备分组把展开判定抽为纯函数测试。
+ * 统计文案直接检查中英文 i18n 资源，确保普通用户标题与开发者精确口径并存。
  */
 import { describe, expect, it } from "vitest";
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { formatRelativeDuration } from "@/components/PerfKpiCards";
+import { isRoomOpen } from "@/components/DevicesByRoom";
 
-const componentPath = fileURLToPath(
-  new URL("../src/components/DevicesByRoom.tsx", import.meta.url),
+const perfInlinePath = fileURLToPath(
+  new URL("../src/components/PerfInline.tsx", import.meta.url),
 );
 const zhPerfPath = fileURLToPath(
   new URL("../src/i18n/locales/zh/perf.json", import.meta.url),
 );
+const enPerfPath = fileURLToPath(
+  new URL("../src/i18n/locales/en/perf.json", import.meta.url),
+);
 
 describe("设备房间分组", () => {
-  const source = readFileSync(componentPath, "utf8");
-
   it("所有房间初始收起，仍允许用户逐个展开", () => {
-    expect(source).toContain("expanded[room] ?? false");
-    expect(source).not.toContain("defaultOpen");
-    expect(source).toContain("setExpanded");
+    expect(isRoomOpen({}, "客厅")).toBe(false);
+    expect(isRoomOpen({ 客厅: true }, "客厅")).toBe(true);
+    expect(isRoomOpen({ 客厅: false }, "客厅")).toBe(false);
   });
 });
 
 describe("性能总览文案", () => {
   const perf = JSON.parse(readFileSync(zhPerfPath, "utf8")).perf as Record<
+    string,
+    string
+  >;
+  const enPerf = JSON.parse(readFileSync(enPerfPath, "utf8")).perf as Record<
     string,
     string
   >;
@@ -60,5 +65,18 @@ describe("性能总览文案", () => {
     expect(formatRelativeDuration(0)).toBe("—");
     expect(formatRelativeDuration(0.03)).toBe("0.03×");
     expect(formatRelativeDuration(1)).toBe("1.00×");
+
+    const inlineSource = readFileSync(perfInlinePath, "utf8");
+    expect(inlineSource).toContain("formatRelativeDuration(omniP95)");
+    expect(inlineSource).not.toContain("omniP95.toFixed");
+  });
+
+  it("英文说明同样保留可核对的技术指标名称", () => {
+    expect(enPerf.kpiGateFilterRateHint).toContain("Gate filter rate");
+    expect(enPerf.kpiDropRateHint).toContain("window drop rate");
+    expect(enPerf.kpiOmniErrorRateHint).toContain("Omni error rate");
+    expect(enPerf.kpiRtfP95Hint).toContain("RTF P95");
+    expect(enPerf.kpiOmniRtfP95Hint).toContain("Omni RTF P95");
+    expect(enPerf.kpiAgentCallHint).toContain("Agent calls");
   });
 });
