@@ -34,7 +34,7 @@ def test_sanitize_pii_preserves_short_numbers():
 
 
 def test_sanitize_pii_preserves_model_version():
-    assert _sanitize_pii("mimo-v2.5.1.0模型") == "mimo-v2.5.1.0模型"
+    assert _sanitize_pii("mimo-v2.6-flash.1.0模型") == "mimo-v2.6-flash.1.0模型"
 
 
 # ─── _ERROR_TYPE_LABELS 映射 ──────────────────────────────────────────

@@ -150,7 +150,7 @@ class OmniModelSettings(BaseModel):
         description="档案显示名（可选，仅供 web 展示）；为空时前端回退为 model · 域名。",
     )
     model: str = Field(
-        default="xiaomi/mimo-v2.5",
+        default="mimo-v2.6-flash",
         description="多模态模型标识（provider/model）",
     )
     base_url: str = Field(

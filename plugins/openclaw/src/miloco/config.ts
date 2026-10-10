@@ -101,7 +101,7 @@ const SHARED_CONFIG_SCHEMA = {
           properties: {
             model: {
               type: "string",
-              default: "xiaomi/mimo-v2.5",
+              default: "mimo-v2.6-flash",
               description: "多模态模型标识（provider/model）",
             },
             base_url: {
