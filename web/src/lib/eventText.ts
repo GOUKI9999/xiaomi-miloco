@@ -93,17 +93,19 @@ export function splitHumanizedSections(humanized: string): HumanizedSection[] {
 
 /**
  * 折叠态的住户摘要：尚未触发的状态只说明“正在观察”，避免把任务名称和
- * 模型给出的触发原因误读成已经发生异常。完整原文仍由展开态显示。
+ * 模型给出的触发原因误读成已经发生异常。持续中表示条件仍满足且进入时
+ * 已经触发过，需要单独说明。完整原文仍由展开态显示。
  */
 export function collapsedSectionText(
   section: HumanizedSection,
   observationText: string,
+  stillInText: string,
 ): string {
-  return section.status === "stillIn" ||
-    section.status === "counting" ||
-    section.status === "notFired"
-    ? observationText
-    : section.text;
+  if (section.status === "stillIn") return stillInText;
+  if (section.status === "counting" || section.status === "notFired") {
+    return observationText;
+  }
+  return section.text;
 }
 
 export function humanizeRulesInText(

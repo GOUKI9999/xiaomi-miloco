@@ -16,6 +16,7 @@
     "loadMoreFailed": "Failed to load earlier events — please retry",
     "collapse": "Collapse",
     "ruleObservationPending": "Rule is being observed; trigger conditions are not met",
+    "ruleObservationStillIn": "Condition still met — it already fired on entry, so no repeat alert",
     "triggerFired": "Fired",
     "triggerStillIn": "Ongoing",
     "triggerCounting": "Timing",

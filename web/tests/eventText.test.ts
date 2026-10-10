@@ -146,24 +146,43 @@ describe("collapsedSectionText（折叠态区分观察与异常）", () => {
         "触发原因：当前画面符合占用条件",
     )[0];
 
-  it.each(["未触发（计时中）", "未触发（持续中）", "未触发"])(
-    "%s 在折叠态只显示中性观察说明",
+  it.each(["未触发（计时中）", "未触发"])(
+    "%s 在折叠态显示尚未达到条件",
     (status) => {
       const parsed = section(status);
-      expect(collapsedSectionText(parsed, "规则正在观察，尚未达到触发条件")).toBe(
-        "规则正在观察，尚未达到触发条件",
-      );
+      expect(
+        collapsedSectionText(
+          parsed,
+          "规则正在观察，尚未达到触发条件",
+          "条件仍在持续；进入时已提醒过，本次不重复提醒",
+        ),
+      ).toBe("规则正在观察，尚未达到触发条件");
       // 原始证据仍留在 section.text，展开态可以完整显示。
       expect(parsed.text).toContain("阳台开放式猫砂盆：连续停留过长");
       expect(parsed.text).toContain("猫刚进入猫砂盆");
     },
   );
 
+  it("持续中说明条件仍满足且不重复提醒", () => {
+    const parsed = section("未触发（持续中）");
+    expect(
+      collapsedSectionText(
+        parsed,
+        "规则正在观察，尚未达到触发条件",
+        "条件仍在持续；进入时已提醒过，本次不重复提醒",
+      ),
+    ).toBe("条件仍在持续；进入时已提醒过，本次不重复提醒");
+  });
+
   it.each(["已触发", "未知"])("%s 仍显示原始正文", (status) => {
     const parsed = section(status);
-    expect(collapsedSectionText(parsed, "规则正在观察，尚未达到触发条件")).toBe(
-      parsed.text,
-    );
+    expect(
+      collapsedSectionText(
+        parsed,
+        "规则正在观察，尚未达到触发条件",
+        "条件仍在持续；进入时已提醒过，本次不重复提醒",
+      ),
+    ).toBe(parsed.text);
   });
 });
 

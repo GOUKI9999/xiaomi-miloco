@@ -1115,7 +1115,11 @@ function ActivityRow({
                 }}
               >
                 {s.status && <TriggerStatusBadge kind={s.status} />}
-                {collapsedSectionText(s, t("activity.ruleObservationPending"))}
+                {collapsedSectionText(
+                  s,
+                  t("activity.ruleObservationPending"),
+                  t("activity.ruleObservationStillIn"),
+                )}
               </span>
             ))
           )}

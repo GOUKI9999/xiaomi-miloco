@@ -16,6 +16,7 @@
     "loadMoreFailed": "加载更早的事件失败，请重试",
     "collapse": "收起",
     "ruleObservationPending": "规则正在观察，尚未达到触发条件",
+    "ruleObservationStillIn": "条件仍在持续；进入时已提醒过，本次不重复提醒",
     "triggerFired": "已触发",
     "triggerStillIn": "持续中",
     "triggerCounting": "计时中",
