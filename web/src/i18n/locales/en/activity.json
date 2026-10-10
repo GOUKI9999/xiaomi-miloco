@@ -15,6 +15,7 @@
     "loadMore": "View earlier",
     "loadMoreFailed": "Failed to load earlier events — please retry",
     "collapse": "Collapse",
+    "ruleObservationPending": "Rule is being observed; trigger conditions are not met",
     "triggerFired": "Fired",
     "triggerStillIn": "Ongoing",
     "triggerCounting": "Timing",
