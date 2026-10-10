@@ -102,7 +102,7 @@ const SHARED_CONFIG_SCHEMA = {
             model: {
               type: "string",
               default: "mimo-v2.6-flash",
-              description: "多模态模型标识（provider/model）",
+              description: "多模态模型标识，如 mimo-v2.6-flash",
             },
             base_url: {
               type: "string",
