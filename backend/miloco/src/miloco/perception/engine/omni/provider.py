@@ -118,7 +118,7 @@ class OpenAICompatAdapter(OmniProviderAdapter):
 
 
 class MiMoAdapter(OpenAICompatAdapter):
-    """MiMo-v2.5 API adapter。
+    """MiMo API adapter。
 
     - video block: ``video_url`` + ``fps`` + ``media_resolution: "max"``
     - audio block: ``input_audio``（m4a AAC）
