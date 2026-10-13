@@ -166,7 +166,7 @@ class CameraDeviceAdapter(BaseDeviceAdapter):
         window_ms = collect_cfg.window_size * 1000
         enabled = getattr(collect_cfg, "stagger_devices", False)
         members = tuple(sorted(self._devices))
-        if not enabled:
+        if not enabled or not members:
             self._phase_members = None
             self._pending_phase_members = None
             self._pending_phase_rounds = 0
