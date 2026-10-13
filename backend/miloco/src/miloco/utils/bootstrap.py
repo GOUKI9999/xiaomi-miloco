@@ -71,9 +71,11 @@ def bootstrap(target: str = "server", debug: bool = False) -> None:
 
     settings = get_settings()
 
-    # Daemon mode (stdout not a tty) → redirect stdio to a per-boot file so
-    # native C stderr (ORT warnings, etc.) is captured alongside Python logger
-    # output. Foreground/dev (tty) leaves stdio on the terminal — no file.
+    # Daemon mode (stdout not a tty) → redirect stdio to
+    # <log_dir>/miloco-backend.log so native C stderr (ORT warnings, etc.) is
+    # captured alongside Python logger output. 固定名 + 按大小轮转(10MB×20,
+    # 见 utils/log_rotation.py); per-boot 时间戳名自 launchd 迁移起不再产生。
+    # Foreground/dev (tty) leaves stdio on the terminal — no file.
     if (
         target == "server"
         and not sys.stdout.isatty()

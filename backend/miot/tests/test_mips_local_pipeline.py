@@ -25,10 +25,20 @@ import logging
 import pytest
 from miot.error import MIoTErrorCode
 from miot.mips_local import MipsLocalClient, _MipsMessage
-from miot.types import MipsConnectionError
+from miot.types import (
+    MipsConnectionError,
+    MipsSubscribeRejectedError,
+    MipsSubscribeTimeoutError,
+)
 from paho.mqtt.enums import MQTTErrorCode
 
+from miot import mips_local as mips_local_mod
+
 _LOGGER = logging.getLogger(__name__)
+
+# 无真实 broker / mTLS / 网络：paho client 由 client_factory 注入 fake。
+pytestmark = pytest.mark.unit
+
 _DID = "1899"
 
 
@@ -56,6 +66,12 @@ class _FakeMqtt:
         self.on_connect = None
         self.on_disconnect = None
         self.on_message = None
+        self.on_subscribe = None
+        # 回包行为:默认照实回一个 Granted QoS 2;可改成拒码或不回(模拟超时)。
+        self.suback_rcs: list[int] = [0x02]
+        self.silent_suback = False
+        self.sub_rc = MQTTErrorCode.MQTT_ERR_SUCCESS
+        self._next_mid = 100
 
     # -- paho API used by mips_local
     def tls_set(self, **kw):
@@ -82,7 +98,21 @@ class _FakeMqtt:
 
     def subscribe(self, topic, qos):
         self.subscribed.append(topic)
-        return MQTTErrorCode.MQTT_ERR_SUCCESS, 1
+        mid = self._next_mid
+        self._next_mid += 1
+        if self.sub_rc == MQTTErrorCode.MQTT_ERR_SUCCESS and not self.silent_suback:
+            # 真 SUBACK 只能晚于 subscribe() 返回(网络往返),所以也排到下一个
+            # loop tick —— 在那之前调用方才刚把在等的 future 登记上。
+            codes = [_FakeReasonCode(c) for c in self.suback_rcs]
+            try:
+                asyncio.get_running_loop().call_soon(self._deliver_suback, mid, codes)
+            except RuntimeError:  # 没有 loop(不该发生):就地回
+                self._deliver_suback(mid, codes)
+        return self.sub_rc, mid
+
+    def _deliver_suback(self, mid, codes):
+        if self.on_subscribe:
+            self.on_subscribe(self, None, mid, codes, None)
 
     def unsubscribe(self, topic):
         self.unsubscribed.append(topic)
@@ -238,7 +268,7 @@ async def test_reconnect_resubscribes_broadcasts():
     client, holder = _make()
     fake = await _connect(client, holder)
     try:
-        client.sub_prop(did="d2", handler=lambda m, c: None)
+        await client.sub_device_props_async("d2", lambda _e: None)
         assert "master/appMsg/notify/iot/d2/property/#" in fake.subscribed
         before = len(fake.subscribed)
         fake.fire_disconnect(rc=1)
@@ -253,25 +283,280 @@ async def test_reconnect_resubscribes_broadcasts():
 async def test_prop_push_dispatched_and_bad_payload_dropped():
     client, holder = _make()
     fake = await _connect(client, holder)
-    got: list[dict] = []
+    got: list = []
     try:
-        client.sub_prop(did="d2", handler=lambda m, c: got.append(m))
+        await client.sub_device_props_async("d2", got.append)
         # valid push on {did}/appMsg/notify/iot/d2/property/2.4
-        good = {"did": "d2", "siid": 2, "piid": 4, "value": False}
         fake.fire_message(
             f"{_DID}/appMsg/notify/iot/d2/property/2.4",
-            _MipsMessage.pack(mid=1, payload=json.dumps(good)),
+            _MipsMessage.pack(
+                mid=1,
+                payload=json.dumps(
+                    {"did": "d2", "siid": 2, "piid": 4, "value": False}
+                ),
+            ),
         )
-        # missing required key → dropped
+        # 缺必填键 → 丢掉（不产事件）
         fake.fire_message(
             f"{_DID}/appMsg/notify/iot/d2/property/2.4",
             _MipsMessage.pack(mid=2, payload=json.dumps({"did": "d2"})),
         )
         for _ in range(10):
             await asyncio.sleep(0)
-        assert got == [good]
+        assert len(got) == 1
+        assert [(c.siid, c.piid, c.value) for c in got[0].changes] == [(2, 4, False)]
     finally:
         await client.deinit_async()
+
+
+@pytest.mark.asyncio
+async def test_sub_device_props_decodes_to_the_canonical_event():
+    """本地推送解码成正典 MIoTDevicePropsEvent —— 与云端那条**同形**。
+
+    两边的形状实打实不同：本地 topic 用点号（``property/2.4``）、载荷是单条
+    ``{did,siid,piid,value}``；云端用斜杠（``properties_changed/2/4``）、
+    ``params`` 可以是数组、一条消息带多条变更。归一到同一个类型之后，
+    ``IotPushWriter`` 不必知道这条推送来自哪条通道。
+    """
+    client, holder = _make()
+    fake = await _connect(client, holder)
+    got: list = []
+    try:
+        await client.sub_device_props_async("d2", got.append)
+        fake.fire_message(
+            f"{_DID}/appMsg/notify/iot/d2/property/2.4",
+            _MipsMessage.pack(
+                mid=1,
+                payload=json.dumps(
+                    {"did": "d2", "siid": 2, "piid": 4, "value": False}
+                ),
+            ),
+        )
+        for _ in range(10):
+            await asyncio.sleep(0)
+    finally:
+        await client.deinit_async()
+
+    assert len(got) == 1
+    event = got[0]
+    assert event.did == "d2"
+    assert [(c.siid, c.piid, c.value) for c in event.changes] == [(2, 4, False)]
+    assert event.timestamp_ms > 0
+    assert event.raw["value"] is False
+
+
+@pytest.mark.asyncio
+async def test_has_props_sub_reflects_this_instances_registration_table():
+    """``has_props_sub`` 要如实回答本实例有没有这条注册 —— 中枢靠它路由退订。
+
+    设备改嫁网关后设备表指向新的那台、注册却还在旧实例上，两者只能靠这个查询分开。
+    报错就会去退一个没有注册的实例：扑空、旧注册永远留着，重连时还被原样重放。
+    """
+    client, holder = _make()
+    await _connect(client, holder)
+    try:
+        assert client.has_props_sub("d2") is False
+
+        await client.sub_device_props_async("d2", lambda _e: None)
+        assert client.has_props_sub("d2") is True
+
+        client.unsub_device_props("d2")
+        assert client.has_props_sub("d2") is False
+
+        await client.sub_device_props_async("d3", lambda _e: None)
+        assert client.has_props_sub("d2") is False, "别的设备的注册不算数"
+        assert client.has_props_sub("d3") is True
+    finally:
+        await client.deinit_async()
+
+
+@pytest.mark.asyncio
+async def test_a_gateway_rejection_is_not_recorded_as_a_subscription():
+    """网关在 SUBACK 里拒绝 → 抛，且注册表里不留痕。
+
+    这是「把 subscribe() 调用当成功」最要命的一种：请求发出去了、rc 也是成功，
+    拒绝只体现在后续 SUBACK 里。若记成订上了，上层会把还在工作的云端订阅退掉，
+    而本地一条都没有 —— 推送静默丢失，幂等早退还让重试进不来。
+    """
+    client, holder = _make()
+    fake = await _connect(client, holder)
+    try:
+        fake.suback_rcs = [0x87]  # Not authorized
+        with pytest.raises(MipsSubscribeRejectedError):
+            await client.sub_device_props_async("d2", lambda _e: None)
+
+        assert client.has_props_sub("d2") is False, "被拒的注册不许留在表里"
+        # 表里没有 → 重试会真的重发，不会被幂等早退挡掉
+        before = len(fake.subscribed)
+        fake.suback_rcs = [0x02]
+        await client.sub_device_props_async("d2", lambda _e: None)
+        assert len(fake.subscribed) > before
+        assert client.has_props_sub("d2") is True
+    finally:
+        await client.deinit_async()
+
+
+@pytest.mark.asyncio
+async def test_a_subscribe_that_never_left_the_host_is_reported_as_failed():
+    """连接恰在 is_connected 检查与 subscribe() 之间断掉 → paho 只返 rc，不抛。
+
+    与 ``__mips_publish`` 同一个坑：不查 rc 就会把「根本没发出去」当成「发出去了」。
+    """
+    client, holder = _make()
+    fake = await _connect(client, holder)
+    try:
+        fake.sub_rc = MQTTErrorCode.MQTT_ERR_NO_CONN
+        with pytest.raises(MipsConnectionError):
+            await client.sub_device_props_async("d2", lambda _e: None)
+        assert client.has_props_sub("d2") is False
+    finally:
+        await client.deinit_async()
+
+
+@pytest.mark.asyncio
+async def test_a_missing_suback_times_out_and_is_not_recorded(monkeypatch):
+    """网关不回 SUBACK → 超时失败、注册摘掉。实测网关是回的，所以这条是活性闸门。"""
+    monkeypatch.setattr(mips_local_mod, "MIPS_LOCAL_SUBSCRIBE_TIMEOUT", 0.05)
+    client, holder = _make()
+    fake = await _connect(client, holder)
+    try:
+        fake.silent_suback = True
+        with pytest.raises(MipsSubscribeTimeoutError):
+            await client.sub_device_props_async("d2", lambda _e: None)
+        assert client.has_props_sub("d2") is False
+        assert not client._pending_subacks, "在等的 future 不许漏在表里"
+    finally:
+        await client.deinit_async()
+
+
+@pytest.mark.asyncio
+async def test_a_disconnect_fails_the_pending_suback_without_waiting_for_the_timeout():
+    """断连时在等的 SUBACK 要立刻失败：回包不会来了，干等满超时等于把「明确失败」
+
+    拖成「疑似超时」，而调用方正等着这个结果决定记不记账。
+    """
+    client, holder = _make()
+    fake = await _connect(client, holder)
+    try:
+        fake.silent_suback = True
+        waiter = asyncio.create_task(
+            client.sub_device_props_async("d2", lambda _e: None)
+        )
+        for _ in range(10):
+            await asyncio.sleep(0)
+        assert not waiter.done(), "还在等 SUBACK"
+
+        fake.fire_disconnect(rc=1)
+        with pytest.raises(MipsConnectionError):
+            await asyncio.wait_for(waiter, timeout=1.0)
+        assert client.has_props_sub("d2") is False
+    finally:
+        await client.deinit_async()
+
+
+@pytest.mark.asyncio
+async def test_a_cancelled_subscription_does_not_leave_a_registration():
+    """在等 SUBACK 时被取消（deinit / 重绑会 cancel 后台任务）也要回滚。
+
+    上层镜像压根没记这次订阅（提交块没跑），留着那条键就是「表说订了、镜像说没订」，
+    而 has_props_sub 拿它回答「注册落在哪台」，会连带影响搬运判定。
+    """
+    client, holder = _make()
+    fake = await _connect(client, holder)
+    try:
+        fake.silent_suback = True
+        task = asyncio.create_task(
+            client.sub_device_props_async("d2", lambda _e: None)
+        )
+        for _ in range(10):
+            await asyncio.sleep(0)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert client.has_props_sub("d2") is False
+        assert not client._pending_subacks
+    finally:
+        await client.deinit_async()
+
+
+@pytest.mark.asyncio
+async def test_a_rejected_replayed_subscribe_does_not_leave_a_lying_key():
+    """重连重放是 fire-and-forget（没人等它的 SUBACK），但网关拒绝时照样要摘键。
+
+    否则「表里只放已确认的注册」这句在重放这条路上就是假的。
+    """
+    client, holder = _make()
+    fake = await _connect(client, holder)
+    try:
+        await client.sub_device_props_async("d2", lambda _e: None)
+        assert client.has_props_sub("d2") is True
+
+        fake.suback_rcs = [0x87]  # 重连后网关改主意了（ACL 撤销等）
+        fake.fire_connect(rc=0)  # _on_connect 原样重放 _broadcasts
+        for _ in range(10):
+            await asyncio.sleep(0)
+
+        assert client.has_props_sub("d2") is False
+    finally:
+        await client.deinit_async()
+
+
+@pytest.mark.asyncio
+async def test_a_concurrent_subscribe_shares_the_first_ones_failure(monkeypatch):
+    """同一台设备被两路并发订阅、首订确认失败 → 后来者**不能**返回成功。
+
+    后来者若乐观返回成功，上层会记下「推送走本地」，而首订失败时把注册回滚掉 ——
+    镜像说订在本地、注册表里一条都没有，推送静默丢失，自愈要等下一次 hub 事件。
+    """
+    monkeypatch.setattr(mips_local_mod, "MIPS_LOCAL_SUBSCRIBE_TIMEOUT", 0.05)
+    client, holder = _make()
+    fake = await _connect(client, holder)
+    try:
+        fake.silent_suback = True  # 首订永远等不到 SUBACK
+        first = asyncio.create_task(
+            client.sub_device_props_async("d2", lambda _e: None)
+        )
+        for _ in range(10):
+            await asyncio.sleep(0)  # 让首订进入等待（键已在表里、未确认）
+
+        with pytest.raises(MipsSubscribeTimeoutError):
+            await client.sub_device_props_async("d2", lambda _e: None)
+
+        with pytest.raises(MipsSubscribeTimeoutError):
+            await first
+        assert client.has_props_sub("d2") is False
+        assert not client._props_confirms
+    finally:
+        await client.deinit_async()
+
+
+@pytest.mark.asyncio
+async def test_a_prop_push_whose_payload_did_differs_is_dropped():
+    """载荷里的 did 与订阅的 did 不一致 → 丢掉。
+
+    topic 已经按 did 精订，载荷里又重复一份，这是白送的交叉校验：不一致意味着
+    网关把一台设备的值发到了另一台的路径上，收下来就是串台。
+    """
+    client, holder = _make()
+    fake = await _connect(client, holder)
+    got: list = []
+    try:
+        await client.sub_device_props_async("d2", got.append)
+        fake.fire_message(
+            f"{_DID}/appMsg/notify/iot/d2/property/2.4",
+            _MipsMessage.pack(
+                mid=1,
+                payload=json.dumps(
+                    {"did": "d9", "siid": 2, "piid": 4, "value": False}
+                ),
+            ),
+        )
+        for _ in range(10):
+            await asyncio.sleep(0)
+    finally:
+        await client.deinit_async()
+
+    assert got == []
 
 
 @pytest.mark.asyncio
@@ -445,6 +730,42 @@ async def test_set_prop_non_object_payload_returns_result_unknown():
         await _reply(client, fake, 5)
         r = await task
         assert r["code"] == MIoTErrorCode.CODE_MIPS_RESULT_UNKNOWN.value
+    finally:
+        await client.deinit_async()
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_action_result_is_canonical_and_keeps_top_level_exe_time():
+    """实测网关回包走一遍 action_async,必须出正典形状。
+
+    下面这份 payload 是 2026-10-12 从真机抓的(人在传感器Pro 的
+    get-tracking-info)。要点:**网关把 ``exe_time`` 放在回包顶层、和 ``result``
+    平级**,而旧代码只做 ``result_obj.get("result")`` —— 顶层字段连同一起被丢掉,
+    所以本地这条通道看起来"没有 exe_time"。实测:50。
+    """
+    tracking = '{"l":182,"p":[[2831,325,163,489,21202159]],"mv":0,"mn":1,"ota":0,"rp":1}'
+    gateway_payload = {
+        "id": 1778597798,
+        "result": {"code": 0, "out": [{"piid": 7, "value": tracking}]},
+        "exe_time": 50,
+    }
+    client, holder = _make()
+    fake = await _connect(client, holder)
+    try:
+        task = asyncio.create_task(client.action_async(_DID, 3, 4, []))
+        await _reply(client, fake, gateway_payload)
+        r = await task
+
+        assert r["code"] == 0
+        assert r["source"] == "local_central"
+        assert (r["did"], r["siid"], r["aiid"]) == (_DID, 3, 4)
+        # 本地形态的 piid 是权威值,原样保留
+        assert r["out"] == [{"piid": 7, "value": tracking}]
+        assert r["exe_time"] == 50
+        # 往返是这里自己量的
+        assert isinstance(r["latency"], int) and r["latency"] >= 0
+        assert r["net_cost"] == r["latency"] - 50
     finally:
         await client.deinit_async()
 

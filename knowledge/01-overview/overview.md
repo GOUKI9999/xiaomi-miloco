@@ -111,6 +111,8 @@ CLI / Agent Skill
 
 > 控制写入优先走局域网本地中枢网关（mTLS MQTT + MIPS RPC），云端 HTTP 为兜底；本地 RPC 超时时**不**做云端重发（指令可能已执行），详见 [device-control](../03-features/device-control.md#控制优先走本地中枢云端兜底)。LAN（OT 协议）发现仅用于设备发现与在线状态维护。
 
+**反方向（设备 → Miloco）**：属性变化经推送写进[设备状态容器](../03-features/device-state-store.md)，规则引擎的 iot 源据此重算相关规则。推送按设备**只挂一条源**（云端 MQTT 或本地中枢，判据用网关报的 `pushAvailable`，与控制的 `specv2Access` 是两套独立标志），见 [device-control](../03-features/device-control.md#属性推送同样选路但按每台设备只有一个源)。
+
 ### 感知→规则→设备完整链路
 
 ```

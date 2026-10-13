@@ -78,6 +78,14 @@ MIPS_LOCAL_RECONNECT_MAX_SEC: float = 60.0
 # (central_hub.py, ``_LOCAL_COOLDOWN_SEC``).
 MIPS_LOCAL_RPC_TIMEOUT: float = 5.0
 
+# 本地中枢订阅的 SUBACK 等待上限。网关正常很快回包，这里给足余量；不回就按失败处理。
+MIPS_LOCAL_SUBSCRIBE_TIMEOUT: float = 5.0
+
+# MQTT v5 SUBACK reason codes that count as success per spec §3.9.3.
+# (Granted QoS 0/1/2 == codes 0x00/0x01/0x02.) 云端与本地两条通道共用同一份:
+# 两边都是 MQTT SUBACK,判据没有理由各写一份。
+SUBACK_SUCCESS_CODES = frozenset({0x00, 0x01, 0x02})
+
 # User certificate is refreshed this many seconds before it actually expires.
 # 3 days, matches the Xiaomi Home integration.
 MIHOME_CERT_EXPIRE_MARGIN: int = 3600 * 24 * 3

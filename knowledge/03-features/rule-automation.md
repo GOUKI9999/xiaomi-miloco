@@ -79,6 +79,10 @@
   达标（TARGET_FIRED）走同一条链，只是 ① 层不是画面而是记账：record 源按"还差多少"
   排一个定时器，到点重新读账、够了就喂真。"今天通知过没有"由条件本身的值承载 ——
   已经是真就产不出新边沿，跨日归零把它翻假，第二天达标才是新的假→真。
+
+另一条入口：设备属性变化（iot 源）。状态容器里 iot/device/*/prop/* 或 status/online
+一变，IotSource（rule/iot_source.py）按 (did, iid) 索引出引用了这条属性的规则，只把那
+几条放进待算集合重新求值 —— 不走感知那条帧级链路，但汇入上面同一个 ①②③④。
 ```
 
 ### 核心模块
@@ -88,10 +92,13 @@
 | `RuleService`        | `rule/service.py`             | 规则 CRUD + 一致性校验：执行路径矩阵、lifecycle、query 措辞、idempotent/cooldown 配对、task 名下规则组合的合法性、task 存在性与规则重名，均在 create/update 流程强制校验；达标规则由它按 task 配置代建与撤销 |
 | `RuleRunner`         | `rule/runner.py`              | ①②③ 层：per-(rule_id, source_did) 布尔聚合 + 抗抖 + duration 滑窗 + 边沿 diff + 方向映射；STATIC 直调 MiotProxy，DYNAMIC 走 dispatch_event                                                                   |
 | `RecordSource`       | `rule/record_source.py`       | 达标这个源：把"当日累计够没够"算成条件项的布尔，自己按剩余量排定时器                                                                                                                                         |
+| `IotSource`          | `rule/iot_source.py`          | 设备属性这个源：把一条 MIoT 属性的当前值判成条件项的布尔。订阅[设备状态容器](device-state-store.md)，按 (did, iid) 索引只重算受影响的规则；重连后按 iid 从云端补拉它关心的那几条属性                         |
 | `TaskStateMachine`   | `task/state_machine.py`       | ④ 层：per-task 的 runtime_state、幂等消费（多条规则进只执行一次）、方向映射的唯一落点 `slot_for_edge`                                                                                                        |
 | `TerminateEvaluator` | `rule/terminate_evaluator.py` | temporary 规则的后台评估服务；其到期删除实际由 Agent 经 `miloco-terminate-task` 完成                                                                                                                         |
 
 规则 schema 定义见 `rule/schema.py`（`Rule` / `RuleAction` / `RuleDirection` / `RuleEvent` / `RuleLifecycle`）。`RuleMode` 是被 `RuleDirection` 取代的旧字段，expand-contract 阶段 A 期间仍在表上，读侧一律走 `Rule.resolved_direction`。
+
+**条件项的来源（`source_type`）有三条**：`omni`（画面，走感知链路）/ `record`（记账达标）/ `iot`（设备属性）。`RuleRunner` 按它分发到不同的源实现；创建时对不认识的取值直接拒，不静默当 omni。
 
 ### 关键设计决策
 

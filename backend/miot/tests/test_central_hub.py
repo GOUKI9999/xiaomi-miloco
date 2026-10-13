@@ -22,13 +22,19 @@ from miot.mdns import MdnsServiceState
 from miot.storage import MIoTStorage
 from miot.types import MIoTHomeInfo, MipsConnectionError
 
+# 无真实 broker / mTLS / mDNS / 网络：http 与本地 client 都是 fake。
+pytestmark = pytest.mark.unit
+
 
 class _FakeLocalClient:
-    def __init__(self, group_id, connected=True, host="10.0.0.9", dev_list=None):
+    def __init__(
+        self, group_id, connected=True, host="10.0.0.9", dev_list=None, props=None
+    ):
         self._group_id = group_id
         self._connected = connected
         self._host = host
         self._dev_list = dev_list or {}
+        self.props = set(props or ())  # 对应真实的 _broadcasts
 
     @property
     def group_id(self):
@@ -45,8 +51,31 @@ class _FakeLocalClient:
     async def get_dev_list_async(self):
         return self._dev_list
 
+    def has_props_sub(self, did):
+        return did in self.props
+
+    async def sub_device_props_async(self, did, handler):
+        self.subscribed_props = getattr(self, "subscribed_props", []) + [did]
+        self.props.add(did)
+
+    def unsub_device_props(self, did):
+        self.unsubscribed_props = getattr(self, "unsubscribed_props", []) + [did]
+        if did not in self.props:
+            return False  # 与真实实现一致：没有这条注册就不是一次成功的退订
+        self.props.discard(did)
+        return True
+
     async def deinit_async(self):
         self._connected = False
+
+
+async def _raises_mips(coro):
+    """「订不上」现在一律抛：返回值只区分成功，失败要靠异常（没有可用网关也抛）。"""
+    try:
+        await coro
+    except MipsConnectionError:
+        return
+    raise AssertionError("expected MipsConnectionError")
 
 
 def _home(home_id, gid):
@@ -155,6 +184,117 @@ async def test_can_push_requires_push_available_and_live_client():
     assert m.can_push("d") is True
     m._dev_table["d"] = {**base, "push_available": False}
     assert m.can_push("d") is False
+
+
+@pytest.mark.asyncio
+async def test_the_two_flags_are_independent():
+    """能推 ≠ 能控。
+
+    选订阅源用 push_available、选控制源用 specv2_access，是两套独立标志：一台
+    设备可以只在其中一边为真。把两个谓词合并（哪怕只是"顺手复用一下"）会让
+    这台设备的推送被无谓地赶去云端、或者反过来把不可控的当可控去发指令。
+    """
+    m = _make()
+    m._clients["g"] = _FakeLocalClient("g", connected=True)
+    m._dev_table["d"] = {
+        "group_id": "g",
+        "online": True,
+        "specv2_access": False,
+        "push_available": True,
+    }
+    assert m.can_push("d") is True
+    assert m.can_control("d") is False
+
+
+@pytest.mark.asyncio
+async def test_props_subscription_is_refused_without_a_live_gateway():
+    """没活着的网关就返回假，不抛 —— 调用方据此把来源留在云端。
+
+    与 __client_for（控制路径）刻意不同：控制是要么发要么明确失败，订阅是
+    「这台先别走本地」，抛异常会把「暂时没有网关」和「真的出错了」混成一种。
+    """
+    m = _make()
+    m._dev_table["d"] = {"group_id": "g", "online": True, "push_available": True}
+    await _raises_mips(m.sub_device_props_async("d", lambda _e: None))
+    assert m.unsub_device_props("d") is False
+
+    dead = _FakeLocalClient("g", connected=False)
+    m._clients["g"] = dead
+    await _raises_mips(m.sub_device_props_async("d", lambda _e: None))
+    assert not getattr(dead, "subscribed_props", [])
+
+
+@pytest.mark.asyncio
+async def test_props_subscription_is_delegated_to_the_gateways_client():
+    m = _make()
+    client = _FakeLocalClient("g", connected=True)
+    m._clients["g"] = client
+    m._dev_table["d"] = {"group_id": "g", "online": True, "push_available": True}
+
+    handler = lambda _e: None  # noqa: E731
+    await m.sub_device_props_async("d", handler)
+    assert m.unsub_device_props("d") is True
+
+    assert client.subscribed_props == ["d"]
+    assert client.unsubscribed_props == ["d"]
+
+
+@pytest.mark.asyncio
+async def test_props_registration_groups_report_where_they_actually_land():
+    """「注册落在哪几台」与「设备表现在指哪台」是两个问题，迁移后不再一致。
+
+    退订只能按前者路由：按设备表找会把旧实例上的注册永远留成僵尸（重连还会重放）。
+    答**全集**而不是第一台命中的 —— 只看一台的话，残留那台恰好排在前面就把
+    「不一致」误判成「一致」，那条僵尸再没人摘。
+    """
+    m = _make()
+    a, b = _FakeLocalClient("gA"), _FakeLocalClient("gB")
+    m._clients.update({"gA": a, "gB": b})
+    m._dev_table["d"] = {"group_id": "gB", "online": True, "push_available": True}
+
+    assert m.props_sub_groups("d") == set()
+    b.props.add("d")
+    assert m.props_sub_groups("d") == {"gB"}  # 设备表也指 gB → 两者一致
+    a.props.add("d")  # 改嫁前的旧注册还在 → 必须看得见
+    assert m.props_sub_groups("d") == {"gA", "gB"}
+
+
+@pytest.mark.asyncio
+async def test_unsub_device_props_without_keep_clears_it_wherever_it_lives():
+    """设备改嫁后设备表指向新网关，注册却在旧实例上 —— 按表退会扑空。
+
+    这就是「A 先从清单里移除、B 后上报」那种次序留下的僵尸：它每次重连都被
+    `_on_connect` 原样重放。无定向退订要逐个实例问、有就摘。
+    """
+    m = _make()
+    a, b = _FakeLocalClient("gA", props={"d"}), _FakeLocalClient("gB")
+    m._clients.update({"gA": a, "gB": b})
+    m._dev_table["d"] = {"group_id": "gB", "online": True, "push_available": True}
+
+    assert m.unsub_device_props("d") is True
+    assert a.props == set(), "旧实例上的注册没摘掉"
+    assert a.unsubscribed_props == ["d"]
+
+
+@pytest.mark.asyncio
+async def test_keep_leaves_the_new_instance_alone_and_clears_the_rest():
+    """换源「先订新、再退旧」要保留刚订上的那台，退掉其余**全部**。
+
+    不给定 keep 就会把新注册一起摘掉（先订后退立刻变成两条都没有）；而只退
+    "旧的那一台"漏掉残渣 —— 同一台设备身上可能同时留着两条更早的注册
+    （改嫁 + 重放各留一条），它们都会在重连时被原样重放。
+    """
+    m = _make()
+    a = _FakeLocalClient("gA", props={"d"})  # 更早的残渣
+    b = _FakeLocalClient("gB", props={"d"})  # 改嫁前的旧注册
+    c = _FakeLocalClient("gC", props={"d"})  # 设备表现在指的这台（刚订上）
+    m._clients.update({"gA": a, "gB": b, "gC": c})
+    m._dev_table["d"] = {"group_id": "gC", "online": True, "push_available": True}
+
+    assert m.unsub_device_props("d", keep="gC") is True
+    assert a.props == set() and b.props == set(), "旧实例与残渣都要摘掉"
+    assert c.props == {"d"}, "刚订上的新注册不许误伤"
+    assert getattr(c, "unsubscribed_props", []) == []
 
 
 # ----------------------------------------------------------------- cooldown
@@ -295,6 +435,75 @@ async def test_refresh_dev_list_add_then_remove_fires_callback():
     await refresh(cli)
     assert set(m._dev_table) == {"d1"}
     assert events[-1][1] == ["d2"]
+
+
+@pytest.mark.asyncio
+async def test_a_capability_flag_flip_also_fires_the_callback():
+    """设备**还在表里**、只有能力标志变了，也必须通知。
+
+    `added`/`removed` 只反映清单成员，而 upsert 对已在表里的设备是就地覆盖 ——
+    所以「设备上线」「push_available 翻转」两条路的 added/removed 都是空。
+    只看这两个列表的话，属性推送的来源永远等不到重判：设备已经能推了却还挂在
+    云端那条上，而这里不会有任何迹象。
+
+    这类通知的 added/removed 就是空的，消费方（MIoTClient）据此区分「清单变了」
+    与「只是能力变了」—— 前者要重拉设备，后者不要。
+    """
+    m = _make()
+    events: list[tuple[list, list]] = []
+
+    async def on_change(added, removed):
+        events.append((added, removed))
+
+    m.on_dev_list_changed = on_change
+    refresh = m._CentralHubManager__refresh_dev_list
+
+    cli = _FakeLocalClient(
+        "g",
+        dev_list={"d1": {"online": True, "specv2_access": True, "push_available": False}},
+    )
+    await refresh(cli)
+    assert len(events) == 1  # 首次是 added
+
+    # 同一台设备、还在表里，只有 push_available 翻转
+    cli._dev_list = {
+        "d1": {"online": True, "specv2_access": True, "push_available": True}
+    }
+    await refresh(cli)
+
+    assert len(events) == 2, "能力标志翻转没有触发回调"
+    assert events[-1] == ([], [])
+    assert m._dev_table["d1"]["push_available"] is True
+
+    # 什么都没变时不该重复通知（每次 devListChange 都会重拉一遍表）
+    await refresh(cli)
+    assert len(events) == 2
+
+
+@pytest.mark.asyncio
+async def test_an_online_flip_also_fires_the_callback():
+    """`can_push` 也要 online，所以 online 翻转同样必须触发重判。"""
+    m = _make()
+    events: list[tuple[list, list]] = []
+
+    async def on_change(added, removed):
+        events.append((added, removed))
+
+    m.on_dev_list_changed = on_change
+    refresh = m._CentralHubManager__refresh_dev_list
+
+    cli = _FakeLocalClient(
+        "g",
+        dev_list={"d1": {"online": False, "specv2_access": True, "push_available": True}},
+    )
+    await refresh(cli)
+    cli._dev_list = {
+        "d1": {"online": True, "specv2_access": True, "push_available": True}
+    }
+    await refresh(cli)
+
+    assert len(events) == 2
+    assert events[-1] == ([], [])
 
 
 # ------------------------------------------------- owned-group / home-scope
@@ -959,3 +1168,104 @@ async def test_deinit_cancels_pending_cert_refresh_task():
 
     assert task.cancelled()
     assert m._refresh_cert_task is None
+
+
+class _NewClientFake:
+    """够 `__ensure_client_locked` 走完一遍的最小 client（构造 + 连接 + 拉清单）。"""
+
+    def __init__(self, **kwargs):
+        self.group_id = kwargs["group_id"]
+        self.host = kwargs["host"]
+        self.is_connected = False
+        self.on_dev_list_changed = None
+        self.deinited = False
+
+    async def init_async(self):
+        self.is_connected = True
+
+    async def deinit_async(self):
+        self.is_connected = False
+        self.deinited = True
+
+    async def get_dev_list_async(self):
+        return {}
+
+
+@pytest.mark.asyncio
+async def test_a_new_client_instance_fires_the_local_transport_reset(monkeypatch):
+    """新实例接管网关时必须单独通知一次「本地传输重置」。
+
+    本地订阅挂在 client 实例的订阅表上，实例一换就全没了；而掉线期间设备表没动，
+    重拉算不出任何差异 —— `on_dev_list_changed` 那条路结构上通知不到这件事。
+    漏了这一句，SDK 的来源镜像会一直停在「已订在本地」而实际一条订阅都没有，
+    那些设备的属性推送静默停掉。
+    """
+    m = _make()
+    m._virtual_did = "virtual-did"
+    fired: list = []
+
+    async def on_reset():
+        fired.append(True)
+
+    m.on_local_transport_reset = on_reset
+
+    async def remaining(**_kw):
+        return 10**9
+
+    monkeypatch.setattr(m._cert, "user_cert_remaining_time_async", remaining)
+    monkeypatch.setattr(ch_mod, "MipsLocalClient", _NewClientFake)
+
+    await m._CentralHubManager__ensure_client_locked("g", "10.0.0.9", 8883)
+
+    assert "g" in m._clients
+    assert fired == [True]
+
+
+@pytest.mark.asyncio
+async def test_a_raising_reset_handler_does_not_break_the_connect(monkeypatch):
+    """重置回调抛异常不该让这次网关连接失败 —— 它是派生的通知，不是连接的前提。"""
+    m = _make()
+    m._virtual_did = "virtual-did"
+
+    async def boom():
+        raise RuntimeError("re-route failed")
+
+    m.on_local_transport_reset = boom
+
+    async def remaining(**_kw):
+        return 10**9
+
+    monkeypatch.setattr(m._cert, "user_cert_remaining_time_async", remaining)
+    monkeypatch.setattr(ch_mod, "MipsLocalClient", _NewClientFake)
+
+    await m._CentralHubManager__ensure_client_locked("g", "10.0.0.9", 8883)
+
+    assert m._clients["g"].is_connected is True
+
+
+@pytest.mark.asyncio
+async def test_unsubscribe_goes_through_while_the_gateway_is_disconnected():
+    """网关**暂时**没连上时退订仍要下发 —— 这与 `sub_device_props` 的判据不同。
+
+    paho 短暂断连（6~60s 退避自动重连）不销毁实例，`_broadcasts` 里的注册还在，
+    重连时 `_on_connect` 会把它原样重放。退订若按 `is_connected` 挡在门外，注册
+    活着而镜像已经抹掉了它 —— 两者永久不一致，且换实例前不自愈（重连后
+    `is_connected` 为真，重连扫描的早退分支让这个实例活到进程退出）。
+    所以退订的判据只该是「实例还在不在」，撤不掉也没关系：表摘掉了就不会重放。
+    """
+    m = _make()
+    client = _FakeLocalClient("g", connected=False, props={"d"})
+    m._clients["g"] = client
+    m._dev_table["d"] = {"group_id": "g", "online": True, "push_available": True}
+
+    assert m.unsub_device_props("d") is True
+    assert client.unsubscribed_props == ["d"]
+
+
+@pytest.mark.asyncio
+async def test_unsubscribe_reports_false_when_the_instance_is_really_gone():
+    """实例真没了（deinit 时订阅表已随它清空）→ 没有可退的，返回假。"""
+    m = _make()
+    m._dev_table["d"] = {"group_id": "g", "online": True, "push_available": True}
+
+    assert m.unsub_device_props("d") is False

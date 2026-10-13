@@ -640,6 +640,12 @@ class MiotProxy:
         self._miot_client.register_subscription_reset_callback(
             self._on_subscription_reset
         )
+        # 中枢设备表增删：SDK 自己先据此搬属性推送的来源（push_available 变了），
+        # 再把通知转到这里。注册不依赖中枢是否已建好——SDK 在触发时才读这个槽位，
+        # 而中枢是在 mips 起来之后才懒建的。见 _on_central_hub_dev_list_changed。
+        self._miot_client.register_dev_list_changed_callback(
+            self._on_central_hub_dev_list_changed
+        )
 
         await self._miot_client.init_async()
 
@@ -1386,11 +1392,6 @@ class MiotProxy:
         async with self._refresh_devices_lock:
             # 代号在打云端之前记：这一趟要往返，回来时可能已经不是当初那个作用域了
             scope = get_manager().current_scope()
-            # Attach the central hub device-list-change hook once it exists
-            # (the coordinator is built lazily during mips setup). Idempotent.
-            ch = getattr(self._miot_client, "central_hub", None)
-            if ch is not None and ch.on_dev_list_changed is None:
-                ch.on_dev_list_changed = self._on_central_hub_dev_list_changed
             try:
                 devices = await self._miot_client.get_devices_async()
                 # 故意不 deepcopy:返回的就是 SDK buffer 本体。refresh_cameras 尾部的
@@ -1476,8 +1477,11 @@ class MiotProxy:
         self, added: list, removed: list
     ) -> None:
         """Central hub reported a device-list change — mirror it into the same
-        refresh path the cloud bind/unbind events use (scope aligned with the
-        existing cloud subscriptions; property telemetry is not consumed here).
+        refresh path the cloud bind/unbind events use.
+
+        属性推送的来源搬运不在这里 —— 它在 SDK 里先跑完（``push_available`` 一变
+        来源就得换，而 did 集合不变，本层按 did 的对账早退、搬不动），这里只管
+        重拉设备清单。
         """
         logger.info(
             "central hub device list changed: +%d -%d; refreshing devices",

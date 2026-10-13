@@ -12,7 +12,8 @@
 
 Handles the full installation flow:
   Phase 1: Environment check
-  Phase 2: Package install + supervisor (web 静态资源由 miloco wheel 自带)
+  Phase 2: Package install + 平台进程管理器 (Linux supervisord / macOS 签名启动器)
+           (web 静态资源由 miloco wheel 自带)
   Phase 3: Initialize service (engine warm-up; 仅临时拉起，退出时自动 stop)
   Phase 4: Mi Home account binding
   Phase 5: Omni model configuration

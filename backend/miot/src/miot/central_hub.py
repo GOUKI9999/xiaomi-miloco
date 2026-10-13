@@ -39,7 +39,7 @@ from .const import MIHOME_CERT_EXPIRE_MARGIN, SUPPORT_CENTRAL_GATEWAY_CTRL
 from .mdns import MdnsService, MdnsServiceState
 from .mips_local import MipsLocalClient
 from .storage import MIoTStorage
-from .types import MipsConnectionError
+from .types import MIoTDevicePropsEvent, MipsConnectionError
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -189,6 +189,11 @@ class CentralHubManager:
         self._owned_retry_at: float = 0.0
 
         self._on_dev_list_changed: Optional[DevListChangedHandler] = None
+        # 一个**新的** MipsLocalClient 实例刚接管某台网关。与
+        # `_on_dev_list_changed` 分开：本地订阅挂在实例的订阅表上，实例一换就全没了，
+        # 而设备表可能一字未变（掉线期间清单没动、重连 sweep 直接换实例）——
+        # 那条回调的三个条件全不成立，根本不发。
+        self._on_local_transport_reset: Optional[Callable[[], Any]] = None
         self._reconnect_task: Optional[asyncio.Task] = None
         # group_ids we've already logged an "Not authorized" hint for, so the
         # 20s reconnect sweep doesn't spam it. Cleared on a successful connect.
@@ -213,6 +218,14 @@ class CentralHubManager:
     @on_dev_list_changed.setter
     def on_dev_list_changed(self, func: Optional[DevListChangedHandler]) -> None:
         self._on_dev_list_changed = func
+
+    @property
+    def on_local_transport_reset(self) -> Optional[Callable[[], Any]]:
+        return self._on_local_transport_reset
+
+    @on_local_transport_reset.setter
+    def on_local_transport_reset(self, func: Optional[Callable[[], Any]]) -> None:
+        self._on_local_transport_reset = func
 
     # --------------------------------------------------------------- lifecycle
 
@@ -450,10 +463,73 @@ class CentralHubManager:
     ) -> dict:
         return await self.__client_for(did).action_async(did, siid, aiid, in_list)
 
-    def __client_for(self, did: str) -> MipsLocalClient:
+    async def sub_device_props_async(
+        self, did: str, handler: Callable[[MIoTDevicePropsEvent], None]
+    ) -> None:
+        """订阅一台设备的**本地**属性推送；订不上就抛。没有可用网关也抛。
+
+        判据与 ``set_prop_async`` 同为「该设备所属那台网关的本地连接活着」，
+        但**不看设备级标志** —— 选订阅源用 ``push_available``、选控制源用
+        ``specv2_access``，是两套相互独立的标志，由调用方（MIoTClient）各自判。
+
+        等网关 SUBACK 确认才算成功（见 ``MipsLocalClient.sub_device_props_async``）：
+        订阅是异步的，「请求发出去了」与「网关开始转发了」之间有一次回包的距离，
+        把前者当成功会让上层退掉还在工作的云端订阅。
+        """
+        client = self.__live_client(did)
+        if client is None:
+            raise MipsConnectionError(
+                f"no live gateway for did={did}; device-props subscribe not issued"
+            )
+        await client.sub_device_props_async(did, handler)
+
+    def unsub_device_props(self, did: str, keep: Optional[str] = None) -> bool:
+        """退订一台设备的本地属性推送。返回假 = 没有任何实例需要退。
+
+        **判据不含 `is_connected`**，这点与 `sub_device_props_async` 不同：paho 短暂断连
+        （6~60s 退避自动重连）不销毁实例，那时 `_broadcasts` 里的注册还在，重连时
+        `_on_connect` 会把它原样重放。用 `__live_client` 会让退订被挡在门外、注册
+        却活着，镜像与实际永久不一致且换实例前不自愈。
+        所以退订要「先摘表、再尽力撤订阅」—— 与云端那条（`mips_cloud._unsubscribe_async`）
+        同口径。撤不掉没关系，表摘掉了重连就不会重放。
+
+        路由按**注册实际落在哪台**，不按设备表：设备改嫁网关后表已指向新的，按表找
+        会扑空、旧实例上的注册清不掉（`props_sub_groups` 就是为这件事而问实例）。
+        ``keep`` 给定则留着那台、退掉其余全部 —— 换源「先订新、再退旧」必须这样：
+        把刚订上的新实例留着，旧实例和任何更早的残渣一起摘掉。
+        """
+        dropped = False
+        for group_id, client in list(self._clients.items()):
+            if group_id == keep:
+                continue
+            if client.unsub_device_props(did):
+                dropped = True
+        return dropped
+
+    def props_sub_groups(self, did: str) -> set[str]:
+        """属性注册**实际**落在哪几台实例上（正常应 ≤1 台，>1 台就是残渣）。
+
+        与 ``local_device`` 的区别：那个答「这台设备现在归谁」，这个答「注册在哪」。
+        设备在两台都活着的网关之间迁移后两者不再一致，而退订只能按后者路由。
+        答**全集**而不是第一台命中的：只看一台的话，残留那台恰好排在前面就把
+        「不一致」误判成「一致」，僵尸注册再没人摘。
+        """
+        return {
+            group_id
+            for group_id, client in list(self._clients.items())
+            if client.has_props_sub(did)
+        }
+
+    def __live_client(self, did: str) -> Optional[MipsLocalClient]:
         info = self._dev_table.get(did)
         client = self._clients.get(info["group_id"]) if info else None
         if client is None or not client.is_connected:
+            return None
+        return client
+
+    def __client_for(self, did: str) -> MipsLocalClient:
+        client = self.__live_client(did)
+        if client is None:
             raise MipsConnectionError(f"no live gateway for did={did}")
         return client
 
@@ -780,6 +856,10 @@ class CentralHubManager:
         self._auth_rejected.discard(group_id)  # recovered → allow a fresh warn
         _LOGGER.info("central hub: gateway %s connected (%s)", group_id, host)
         await self.__refresh_dev_list(client)
+        # 新实例的订阅表是空的，而上面的设备表重拉可能一条差异都没算出来
+        # （掉线期间清单没动 → 三个条件全假）。这里必须单独通知一次。
+        # 排在 __refresh_dev_list 之后：那一步才把设备表填上，can_push 才判得准。
+        await self.__fire_local_transport_reset()
 
         # Static gateways carry only an IP in config (no group_id), so they
         # skipped the mDNS ownership/home-scope filter at connect time. Now that
@@ -952,16 +1032,25 @@ class CentralHubManager:
         group_id = client.group_id
         added: list = []
         removed: list = []
+        # 能力标志（online / specv2_access / push_available）有没有变。**必须单独
+        # 记**：设备还在表里时 upsert 是就地覆盖，added/removed 都是空，而
+        # 「online 翻转」「push_available 翻转」恰恰只走这条路（getDevList 只在
+        # devListChange 推送后重拉，那条推送正是上下线/能力变更的信号）。
+        # 少了这一项，属性推送的来源永远等不到重判 —— 设备上线了却还挂在云端那条。
+        flags_changed = False
         # Upsert everything reported by this gateway.
         for did, info in devices.items():
-            if did not in self._dev_table:
-                added.append(did)
-            self._dev_table[did] = {
+            entry = {
                 "group_id": group_id,
                 "online": info.get("online", False),
                 "specv2_access": info.get("specv2_access", False),
                 "push_available": info.get("push_available", False),
             }
+            if did not in self._dev_table:
+                added.append(did)
+            elif self._dev_table[did] != entry:
+                flags_changed = True
+            self._dev_table[did] = entry
         # Drop dids previously under this gateway but no longer present.
         for did in list(self._dev_table.keys()):
             if self._dev_table[did]["group_id"] == group_id and did not in devices:
@@ -974,8 +1063,19 @@ class CentralHubManager:
             len(removed),
             len(self._dev_table),
         )
-        if (added or removed) and self._on_dev_list_changed:
+        if (added or removed or flags_changed) and self._on_dev_list_changed:
             try:
                 await self._on_dev_list_changed(added, removed)
             except Exception as e:
                 _LOGGER.error("central hub: dev-list-changed handler raised: %s", e)
+
+    async def __fire_local_transport_reset(self) -> None:
+        cb = self._on_local_transport_reset
+        if cb is None:
+            return
+        try:
+            ret = cb()
+            if asyncio.iscoroutine(ret):
+                await ret
+        except Exception as e:
+            _LOGGER.error("central hub: local-transport-reset handler raised: %s", e)

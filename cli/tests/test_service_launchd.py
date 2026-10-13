@@ -946,3 +946,21 @@ def test_launchd_stop_reuses_same_grace_constant_as_cleanup(monkeypatch):
     service._launchd_stop(_cfg(), pretty=False)
 
     assert calls == [(4321, service._MILOCO_STOP_GRACE_S)]
+
+
+def test_install_script_launchd_label_matches_service():
+    """install.py 的卸载路径必须用同一个 label，才能 bootout 掉并删掉 plist。
+
+    install.py 跑在 miloco-cli 装好之前，跨包 import 不现实，这份副本只能靠断言
+    钉住。漂移的后果是卸载后 plist 留着 —— 它 RunAtLoad=true，之后每次登录 launchd
+    都会去 spawn 一个已被删掉的 miloco.app。
+    """
+    import re
+    from pathlib import Path
+
+    install_py = Path(__file__).resolve().parents[2] / "scripts" / "install.py"
+    m = re.search(
+        r'^    LAUNCHD_LABEL = "([^"]+)"', install_py.read_text(encoding="utf-8"), re.M
+    )
+    assert m, "scripts/install.py 里找不到 LAUNCHD_LABEL"
+    assert m.group(1) == service._LAUNCHD_LABEL

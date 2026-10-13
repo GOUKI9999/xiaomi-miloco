@@ -36,6 +36,7 @@ import random
 import ssl
 import struct
 import threading
+import time
 from dataclasses import dataclass
 from enum import Enum
 from typing import Any, Callable, Coroutine, Optional
@@ -48,15 +49,28 @@ from paho.mqtt.client import (
 )
 from paho.mqtt.enums import CallbackAPIVersion, MQTTErrorCode
 
+from .action_result import (
+    SOURCE_LOCAL_CENTRAL,
+    MIoTActionResult,
+    build_action_result,
+)
 from .const import (
     MIHOME_MQTT_KEEPALIVE,
     MIPS_LOCAL_PORT_DEFAULT,
     MIPS_LOCAL_RECONNECT_MAX_SEC,
     MIPS_LOCAL_RECONNECT_MIN_SEC,
     MIPS_LOCAL_RPC_TIMEOUT,
+    MIPS_LOCAL_SUBSCRIBE_TIMEOUT,
+    SUBACK_SUCCESS_CODES,
 )
 from .error import MIoTErrorCode, MIoTMipsError
-from .types import MipsConnectionError
+from .types import (
+    MIoTDevicePropsEvent,
+    MIoTPropChange,
+    MipsConnectionError,
+    MipsSubscribeRejectedError,
+    MipsSubscribeTimeoutError,
+)
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -170,7 +184,35 @@ class _MipsBroadcast:
     handler_ctx: Any = None
 
 
-def _resolve_future(fut: "asyncio.Future", value: str) -> None:
+def _now_ms() -> int:
+    return int(time.time() * 1000)
+
+
+def _decode_prop_push(msg: dict) -> Optional[MIoTDevicePropsEvent]:
+    """网关属性推送的载荷 → 正典 :class:`MIoTDevicePropsEvent`。
+
+    本地载荷（``{"did","siid","piid","value"}``）恒为**单条**，而云端的 ``params``
+    可以是数组 —— 归一后 ``changes`` 类型相同，下游因此不必知道来源。
+
+    ``value`` 缺失的丢掉，与云端解码器同口径：那不是「值为 None」，是一条残缺的
+    推送，当成 None 写进容器会把真实值盖掉。
+    """
+    try:
+        siid = int(msg["siid"])
+        piid = int(msg["piid"])
+    except (KeyError, TypeError, ValueError):
+        return None
+    if "value" not in msg:
+        return None
+    return MIoTDevicePropsEvent(
+        did=str(msg.get("did", "")),
+        changes=[MIoTPropChange(siid=siid, piid=piid, value=msg["value"])],
+        timestamp_ms=_now_ms(),
+        raw=msg,
+    )
+
+
+def _resolve_future(fut: "asyncio.Future", value: Any) -> None:
     """Atomically complete *fut* on the event loop.
 
     Both the check and the set_result must run in the same callback —
@@ -256,9 +298,24 @@ class MipsLocalClient:
         self._request_map: dict[str, _MipsRequest] = {}
         self._request_lock = threading.Lock()
 
-        # matcher pattern -> broadcast registration.
+        # matcher pattern -> broadcast registration. 属性那批只放**已确认或正在确认**
+        # 的注册,确认失败的会立刻摘掉(见 sub_device_props_async):留一条没订上的键,
+        # has_props_sub 就会说谎,上层据此记「走本地」并把还在工作的云端订阅退掉。
+        # 「正在确认」那段的乐观返回由 _props_confirms 兜住,见它的注释。
         self._broadcasts: dict[str, _MipsBroadcast] = {}
         self._broadcasts_lock = threading.Lock()
+
+        # mid -> pending SUBSCRIBE confirmation. paho 线程(on_subscribe)与主循环共用。
+        # 同时记 mid -> topic：连接时重放那批是 fire-and-forget（没人等），但它们的
+        # SUBACK 也得认出来 —— 网关拒绝时表里那条键就是谎，而 has_props_sub 拿它
+        # 回答「注册落在哪台」。
+        self._pending_subacks: dict[int, asyncio.Future] = {}
+        self._sub_topic_by_mid: dict[int, str] = {}
+        # sub_topic -> 在飞的属性订阅确认结局（None=成功，否则异常实例）。并发订同一
+        # 台设备时后来者与首订**共享**同一个结局：首订还没确认就乐观返回成功，它一旦
+        # 失败回滚，上层已经把镜像记成 local，而注册表里一条都没有。
+        self._props_confirms: dict[str, asyncio.Future] = {}
+        self._pending_subacks_lock = threading.Lock()
 
         self._on_dev_list_changed: Optional[
             Callable[["MipsLocalClient", list], Coroutine]
@@ -329,6 +386,7 @@ class MipsLocalClient:
         )
         mqtt.on_connect = self._on_connect
         mqtt.on_disconnect = self._on_disconnect
+        mqtt.on_subscribe = self._on_subscribe
         mqtt.on_message = self._on_message
 
         self._mqtt = mqtt
@@ -440,6 +498,7 @@ class MipsLocalClient:
             self._request_map.clear()
         with self._broadcasts_lock:
             self._broadcasts.clear()
+            self._props_confirms.clear()
 
     # -------------------------------------------------------------- device API
 
@@ -546,8 +605,16 @@ class MipsLocalClient:
         aiid: int,
         in_list: list,
         timeout_ms: Optional[int] = None,
-    ) -> dict:
-        """Call an action via master/proxy/rpcReq (method=action)."""
+    ) -> MIoTActionResult:
+        """Call an action via master/proxy/rpcReq (method=action).
+
+        返回**正典形状**（见 ``action_result``）。本层额外负责两件另一条通道由
+        上游提供的东西：
+
+        - ``latency``：在这里量往返（发出 → 收到），两条通道同源才可比。
+        - ``exe_time``：网关把它放在**回包顶层、``result`` 的兄弟位置**，
+          只读 ``result_obj.get("result")`` 会把它连同一起丢掉。
+        """
         payload_obj: dict = {
             "did": did,
             "rpc": {
@@ -556,71 +623,167 @@ class MipsLocalClient:
                 "params": {"did": did, "siid": siid, "aiid": aiid, "in": in_list},
             },
         }
+        sent_at = time.monotonic()
         result_obj = await self.__request_async(
             topic="proxy/rpcReq", payload=json.dumps(payload_obj), timeout_ms=timeout_ms
         )
+        latency_ms = int((time.monotonic() - sent_at) * 1000)
+
+        def _result(code: Any, out_raw: Any = None, exe_time: Any = None) -> MIoTActionResult:
+            return build_action_result(
+                did=did,
+                siid=siid,
+                aiid=aiid,
+                code=code,
+                source=SOURCE_LOCAL_CENTRAL,
+                out_raw=out_raw,
+                exe_time=exe_time,
+                latency=latency_ms,
+            )
+
         # 同 set_prop_async 的逐层验型理由:result 是非 dict(如整数)会在
         # "code" in result_obj["result"] 处抛 TypeError,error 是字符串而非对象
         # 会原样返回字符串,两条路都被上层判成"肯定没执行"而云端重发——累加型
         # 动作(窗帘 +10% / 音量 +1)正是本模块反复强调最不能容忍双发的场景。
+        # 判型与 code 取值一字未动:上层(MIoTClient)靠这个 code 决定是否云端重发。
+        exe_time = result_obj.get("exe_time") if isinstance(result_obj, dict) else None
         if isinstance(result_obj, dict):
             result = result_obj.get("result")
             if isinstance(result, dict) and "code" in result:
-                return result
+                return _result(result["code"], out_raw=result.get("out"), exe_time=exe_time)
             error = result_obj.get("error")
             if isinstance(error, dict) and "code" in error:
-                return error
+                return _result(error["code"], exe_time=exe_time)
             # __request_async 自产的码(如 -10040 应答非合法 JSON)原样上抛,不要在
             # 这里重新贴成 -10004:那会把"网关已回包"的事实抹掉,让上层误判成
             # "肯定没执行"而重发云端。落到最后一行的是"回了包但结构不认识",同样
             # 是结果未知。
             if "code" in result_obj:
-                return result_obj
-        return {
-            "code": MIoTErrorCode.CODE_MIPS_RESULT_UNKNOWN.value,
-            "message": "Invalid result",
-        }
+                return _result(
+                    result_obj["code"], out_raw=result_obj.get("out"), exe_time=exe_time
+                )
+        return _result(MIoTErrorCode.CODE_MIPS_RESULT_UNKNOWN.value)
 
     # ------------------------------------------------------- push subscription
 
-    def sub_prop(
-        self,
-        did: str,
-        handler: Callable[[dict, Any], None],
-        siid: Optional[int] = None,
-        piid: Optional[int] = None,
-        handler_ctx: Any = None,
+    def unsub_prop(
+        self, did: str, siid: Optional[int] = None, piid: Optional[int] = None
     ) -> bool:
-        """Subscribe property-change pushes for a device (all props if siid/piid None)."""
-        topic = (
-            f"appMsg/notify/iot/{did}/property/"
-            f'{"#" if siid is None or piid is None else f"{siid}.{piid}"}'
-        )
+        return self.__unreg_broadcast(self.__props_topic(did, siid, piid))
 
-        def on_prop_msg(sub_topic: str, payload: str, ctx: Any) -> None:
+    def has_props_sub(self, did: str) -> bool:
+        """这台设备的属性注册还在不在本实例上。
+
+        中枢靠它路由退订：设备改嫁网关后设备表指向新的那台、注册却仍留在旧实例上，
+        按设备表找就会漏（旧注册清不掉，重连还会被 ``_on_connect`` 重放）。
+        """
+        sub_topic = self.__broadcast_key(self.__props_topic(did))
+        with self._broadcasts_lock:
+            return sub_topic in self._broadcasts
+
+    async def sub_device_props_async(
+        self, did: str, handler: Callable[[MIoTDevicePropsEvent], None]
+    ) -> None:
+        """订阅一台设备的属性推送，解码成正典形状后交给 ``handler``；**等网关确认**。
+
+        与云端那条（``mips_cloud.sub_device_props_async``）同形，调用方不必知道这条
+        订阅落在哪条通道上；订不上就抛，调用方据此不记账、保留旧来源。
+
+        为什么必须等确认：向网关发 ``master/appMsg/notify/iot/{did}/property/#`` 才是
+        「让网关开始转发这台设备属性」的动作，而 ``mqtt.subscribe()`` 只是把请求排出去
+        —— 连接恰在此刻断掉、或网关在 SUBACK 里拒绝，都只有后续回包才知道。把「发出
+        去了」当成功，上层会记「推送走本地」并把还在工作的云端订阅退掉，而这台本地
+        一条订阅都没有：推送静默丢失，镜像还判「已订在本地」，后续对账不再重订。
+        """
+
+        def on_prop_msg(sub_topic: str, payload: str, _ctx: Any) -> None:
             try:
                 msg = json.loads(payload)
             except json.JSONDecodeError:
                 _LOGGER.info("mips_local unknown prop msg, %s", payload)
                 return
+            # 网关还会发第二种形状 `{"did","type":"property","name":"ota_state","value":…}`
+            # —— 用 name 而不是 siid/piid。2026-10 实测它只承载 OTA 遥测（不在容器的
+            # 属性词表里），支持它要先证明 name→iid 的映射稳定，所以先丢弃。
+            # 打 INFO 而不是静默：万一某天有意义的属性只走这一种，日志里看得见。
             if not isinstance(msg, dict) or not {"did", "siid", "piid", "value"} <= set(
                 msg
             ):
                 _LOGGER.info("mips_local unknown prop msg, %s", payload)
                 return
+            event = _decode_prop_push(msg)
+            if event is None:
+                return
+            if event.did != did:
+                _LOGGER.warning(
+                    "mips_local prop push did contradicts subscription: "
+                    "subscribed=%s payload=%s",
+                    did,
+                    event.did,
+                )
+                return
+            # 归一到与云端同形之后，下游分不出这条来自哪条通道；排查「网关到底
+            # 有没有转发」时把日志级别放开看这一行。云端那条见 mips_cloud。
+            for change in event.changes:
+                _LOGGER.debug(
+                    "mips_local prop push did=%s iid=prop.%s.%s",
+                    did,
+                    change.siid,
+                    change.piid,
+                )
             if handler:
-                handler(msg, ctx)
+                handler(event)
 
-        return self.__reg_broadcast(topic, on_prop_msg, handler_ctx)
+        topic = self.__props_topic(did)
+        sub_topic = self.__broadcast_key(topic)
+        with self._broadcasts_lock:
+            confirm = self._props_confirms.get(sub_topic)
+            if confirm is not None:
+                owner = False
+            elif sub_topic in self._broadcasts:
+                return  # 已确认的注册,这个早退才是真成功
+            else:
+                self._broadcasts[sub_topic] = _MipsBroadcast(
+                    topic=sub_topic, handler=on_prop_msg, handler_ctx=None
+                )
+                confirm = self._main_loop.create_future()
+                self._props_confirms[sub_topic] = confirm
+                owner = True
+        if not owner:
+            # 另一路正在订同一台:等它的结局。它成功了就等于我们成功(注册是同一条);
+            # 它失败了就跟着失败 —— 乐观返回成功会让上层记下「走本地」,而那条注册
+            # 马上被它回滚掉,推送静默丢失且镜像还判「已订」。
+            # 并发后来者的 handler 不会被注册（注册对象归首订），上层对同一 did
+            # 恒传同一个单槽回调，所以这里不替换、也不比对。
+            outcome = await asyncio.shield(confirm)
+            if outcome is None:
+                return
+            if isinstance(outcome, asyncio.CancelledError):
+                # 首订是被**别处**取消的，本调用方并没有被取消 —— 原样抛出去会被外层
+                # 当成「我也被取消了」：SDK 的 except Exception 记不上账，asyncio.gather
+                # 还会带着 CancelledError 结束整批，搬运的第二阶段（退旧）被跳过，
+                # 旧注册留着就是双通道同投。
+                raise MipsConnectionError(
+                    f"mips_local subscribe cancelled while awaiting SUBACK did={did}"
+                ) from None
+            raise outcome
+        confirm_sub: asyncio.Future = self._main_loop.create_future()
+        try:
+            mid = self.__mips_subscribe_tracked(f"master/{topic}", confirm_sub)
+            if mid is None:
+                self.__forget_broadcast(sub_topic)
+                raise MipsConnectionError(
+                    f"mips_local subscribe not issued; did={did} topic={topic}"
+                )
+            await self.__await_suback(mid, confirm_sub, sub_topic, did)
+        except BaseException as e:
+            self.__settle_confirm(sub_topic, confirm, e)
+            raise
+        self.__settle_confirm(sub_topic, confirm, None)
 
-    def unsub_prop(
-        self, did: str, siid: Optional[int] = None, piid: Optional[int] = None
-    ) -> bool:
-        topic = (
-            f"appMsg/notify/iot/{did}/property/"
-            f'{"#" if siid is None or piid is None else f"{siid}.{piid}"}'
-        )
-        return self.__unreg_broadcast(topic)
+    def unsub_device_props(self, did: str) -> bool:
+        """退订一台设备的属性推送。客户端已断开时退订是空操作，不算失败。"""
+        return self.unsub_prop(did)
 
     def sub_event(
         self,
@@ -667,15 +830,48 @@ class MipsLocalClient:
         self._mips_seed_id = (self._mips_seed_id + 1) % (_UINT32_MAX + 1)
         return mips_id
 
-    def __mips_subscribe(self, topic: str) -> None:
+    def __mips_subscribe_tracked(
+        self, topic: str, future: asyncio.Future
+    ) -> Optional[int]:
+        """发包 + 双表登记在同一把锁内完成 —— 回包线程要么还没发包、要么看得见登记。
+
+        分开写会留一个 GIL 抢占窗口:主线程 `mqtt.subscribe()` 返回后被抢占,网络线程
+        走完「收 SUBACK → 派发 `_on_subscribe`」,此刻两张表都还没有这个 mid,回包落进
+        「untracked」分支丢掉,等的一方白等满超时,把**网关已授予**的订阅判成失败。
+        `_on_subscribe` 进场要拿同一把锁,所以它看不到半登记状态。
+        """
         mqtt = self._mqtt
         if mqtt is None:
-            return
+            return None
+        with self._pending_subacks_lock:
+            result, mid = mqtt.subscribe(topic, qos=_MIPS_QOS)
+            if result != MQTTErrorCode.MQTT_ERR_SUCCESS or mid is None:
+                _LOGGER.warning("mips_local subscribe(%s) failed: %s", topic, result)
+                return None
+            self._pending_subacks[mid] = future
+            self._sub_topic_by_mid[mid] = topic
+        _LOGGER.debug("mips_local subscribed topic=%s mid=%s", topic, mid)
+        return mid
+
+    def __mips_subscribe(self, topic: str) -> Optional[int]:
+        """把订阅请求发出去，返回 mid（可据此等 SUBACK）；根本没发出去则 None。
+
+        这一步只能抓住**立即**失败：paho 对未连接不抛异常、只返 MQTT_ERR_NO_CONN
+        并丢弃请求（与 ``__mips_publish`` 同一个坑），连接恰在 ``is_connected`` 检查
+        与这里之间断掉时就是如此。网关在 SUBACK 里的拒绝看不到，那条归
+        ``__await_suback``。
+        """
+        mqtt = self._mqtt
+        if mqtt is None:
+            return None
         result, mid = mqtt.subscribe(topic, qos=_MIPS_QOS)
-        if result != MQTTErrorCode.MQTT_ERR_SUCCESS:
+        if result != MQTTErrorCode.MQTT_ERR_SUCCESS or mid is None:
             _LOGGER.warning("mips_local subscribe(%s) failed: %s", topic, result)
-        else:
-            _LOGGER.debug("mips_local subscribed topic=%s", topic)
+            return None
+        with self._pending_subacks_lock:
+            self._sub_topic_by_mid[mid] = topic
+        _LOGGER.debug("mips_local subscribed topic=%s mid=%s", topic, mid)
+        return mid
 
     def __mips_unsubscribe(self, topic: str) -> None:
         mqtt = self._mqtt
@@ -752,12 +948,25 @@ class MipsLocalClient:
                 "message": f"Error: {result}",
             }
 
+    def __props_topic(
+        self, did: str, siid: Optional[int] = None, piid: Optional[int] = None
+    ) -> str:
+        """属性推送的 topic。只此一处拼装 —— 查注册表那条路也要用同一个字面量。"""
+        return (
+            f"appMsg/notify/iot/{did}/property/"
+            f'{"#" if siid is None or piid is None else f"{siid}.{piid}"}'
+        )
+
+    def __broadcast_key(self, topic: str) -> str:
+        """``_broadcasts`` 的键。前缀规则也只此一处 —— sub/unsub/查询共用。"""
+        return f"{self._did}/{topic}"
+
     def __reg_broadcast(
         self, topic: str, handler: Callable[[str, str, Any], None], handler_ctx: Any
     ) -> bool:
         # Matcher key is prefixed with our did (broadcasts are delivered under
         # {did}/...); registration is issued to the gateway as master/{topic}.
-        sub_topic = f"{self._did}/{topic}"
+        sub_topic = self.__broadcast_key(topic)
         with self._broadcasts_lock:
             if sub_topic in self._broadcasts:
                 _LOGGER.debug("mips_local re-reg broadcast, %s", sub_topic)
@@ -765,19 +974,111 @@ class MipsLocalClient:
             self._broadcasts[sub_topic] = _MipsBroadcast(
                 topic=sub_topic, handler=handler, handler_ctx=handler_ctx
             )
-        self.__mips_subscribe(f"master/{topic}")
+        if self.__mips_subscribe(f"master/{topic}") is None:
+            # 发都没发出去:把刚写进去的键摘掉再报失败。留着它 has_props_sub 会说
+            # 「订上了」,上层据此记「走本地」并退掉还在工作的云端订阅 —— 这台就
+            # 一条订阅都没有了,而且幂等早退让后续重试也进不来。
+            self.__forget_broadcast(sub_topic)
+            return False
         return True
 
+    def __settle_confirm(
+        self, sub_topic: str, fut: asyncio.Future, outcome: Optional[BaseException]
+    ) -> None:
+        """把这次在飞订阅的结局交给后来者，并从在飞表里摘掉。
+
+        结局走 **result**（None=成功 / 异常实例=失败）而不是 set_exception：没人等
+        的时候 set_exception 会刷 "exception was never retrieved"。
+        """
+        with self._broadcasts_lock:
+            self._props_confirms.pop(sub_topic, None)
+        if not fut.done():
+            fut.set_result(outcome)
+
+    def __forget_broadcast(self, sub_topic: str) -> None:
+        """摘掉一条没订成的注册(与 __unreg_broadcast 的区别:不向网关发退订)。"""
+        with self._broadcasts_lock:
+            self._broadcasts.pop(sub_topic, None)
+
     def __unreg_broadcast(self, topic: str) -> bool:
-        sub_topic = f"{self._did}/{topic}"
+        sub_topic = self.__broadcast_key(topic)
         with self._broadcasts_lock:
             if sub_topic not in self._broadcasts:
                 return False
             del self._broadcasts[sub_topic]
+            # 同时在飞的确认也要摘：注册已被撤，再让后来者共享它的「成功」结局，
+            # 就会变成「镜像记 local、注册表空」（与刚修的那条同一类损害）。
+            self._props_confirms.pop(sub_topic, None)
         self.__mips_unsubscribe(f"master/{topic}")
         return True
 
+    async def __await_suback(
+        self, mid: int, future: asyncio.Future, sub_topic: str, did: str
+    ) -> None:
+        """等网关确认这次订阅；失败就把注册摘掉并抛。
+
+        与云端那条（``mips_cloud._subscribe_async``）同口径：只有确认成功才算订上。
+        超时、断连、拒绝、取消都当失败 —— 上游据此不记账、保留旧来源。``future``
+        由 ``__mips_subscribe_tracked`` 在发包同一把锁内登记好（回包抢跑也不会丢）。
+        """
+        try:
+            codes = await asyncio.wait_for(future, timeout=MIPS_LOCAL_SUBSCRIBE_TIMEOUT)
+        except asyncio.CancelledError:
+            # 任务在等回包时被取消（deinit / 重绑会 cancel 后台任务）：注册不能留着，
+            # 上层镜像根本没记这次订阅，留着就是「镜像说没订、表说订了」。
+            self.__forget_broadcast(sub_topic)
+            raise
+        except asyncio.TimeoutError:
+            self.__forget_broadcast(sub_topic)
+            raise MipsSubscribeTimeoutError(f"mips_local did={did} {sub_topic}") from None
+        except MipsConnectionError:
+            self.__forget_broadcast(sub_topic)
+            raise
+        finally:
+            with self._pending_subacks_lock:
+                self._pending_subacks.pop(mid, None)
+                self._sub_topic_by_mid.pop(mid, None)
+        rejected = [c for c in codes if c not in SUBACK_SUCCESS_CODES]
+        if rejected:
+            self.__forget_broadcast(sub_topic)
+            _LOGGER.warning(
+                "mips_local gateway rejected subscription: did=%s topic=%s codes=%s",
+                did,
+                sub_topic,
+                rejected,
+            )
+            raise MipsSubscribeRejectedError(sub_topic, rejected[0])
+
     # ----------------------------------------------------------- paho hooks
+
+    def _on_subscribe(
+        self, client: Client, userdata: Any, mid: int, reason_codes: Any, properties: Any
+    ) -> None:
+        # paho v5: reason_codes 是 list[ReasonCode]，取其 .value。fire-and-forget
+        # 的那些订阅（连接时重放、事件推送）没有等在飞的 future，忽略即可。
+        codes_int = [getattr(rc, "value", rc) for rc in reason_codes]
+        with self._pending_subacks_lock:
+            future = self._pending_subacks.get(mid)
+            topic = self._sub_topic_by_mid.pop(mid, None)
+        if future is None:
+            # 没人等这一次（连接时重放那批）。网关拒绝时不能只打一行 debug：表里
+            # 那条键还在，而 has_props_sub 会拿它回答「注册落在哪台」。
+            rejected = [c for c in codes_int if c not in SUBACK_SUCCESS_CODES]
+            if rejected and topic:
+                self.__forget_broadcast(self.__broadcast_key(topic.removeprefix("master/")))
+                _LOGGER.warning(
+                    "mips_local replayed subscribe rejected: topic=%s codes=%s",
+                    topic,
+                    rejected,
+                )
+            else:
+                _LOGGER.debug(
+                    "mips_local SUBACK for untracked mid=%s codes=%s", mid, codes_int
+                )
+            return
+        # done() 与 set_result 必须落在同一个 loop 回调里:分开写时超时回调(也跑在
+        # loop 上)能挤在中间把 future 完成掉,排队的那次 set_result 撞 InvalidState。
+        self._main_loop.call_soon_threadsafe(_resolve_future, future, codes_int)
 
     def _on_connect(
         self, client: Client, userdata: Any, flags: Any, reason_code: Any, properties: Any
@@ -828,6 +1129,16 @@ class MipsLocalClient:
         log("mips_local disconnected, group_id=%s reason_code=%s", self._group_id, reason_code)
         with self._state_lock:
             self._connected = False
+        # 在等 SUBACK 的那些要立刻失败:断连后回包不会来了,让它们干等满超时等于把
+        # 一次「明确失败」拖成一次「疑似超时」,而调用方在等这个结果才决定记不记账。
+        with self._pending_subacks_lock:
+            pending = list(self._pending_subacks.items())
+        for mid, future in pending:
+            self._main_loop.call_soon_threadsafe(
+                _complete_future,
+                future,
+                MipsConnectionError("mips_local disconnected while awaiting SUBACK"),
+            )
 
     def _on_message(self, client: Client, userdata: Any, msg: MQTTMessage) -> None:
         topic = msg.topic

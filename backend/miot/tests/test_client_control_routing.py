@@ -26,6 +26,7 @@ matrix:
 from __future__ import annotations
 
 import pytest
+from miot.action_result import SOURCE_CLOUD, build_action_result
 from miot.client import MIoTClient
 from miot.error import MIoTErrorCode
 from miot.types import (
@@ -713,3 +714,218 @@ async def test_backfill_handles_duplicate_iid_in_one_batch():
     res = await client.set_props_async([_sp("A", 1), _sp("A", 2)])
     assert [r["code"] for r in res] == [0, 0]
     assert all(r["did"] == "A" for r in res)
+
+
+# ─── action 的 out：云端被拍平的 piid 按 spec 声明补回来 ──────────────────────
+#
+# 不补的话，本地中枢那条给 {"piid", "value"}、云端那条给裸标量，下游仍要按
+# "这条走了哪条通道"写两套解析 —— 那这个归一化就等于没做。
+
+
+class _FakeOutProp:
+    def __init__(self, iid: int):
+        self.iid = iid
+
+
+class _FakeSpecAction:
+    def __init__(self, iid: int, out_iids: list[int]):
+        self.iid = iid
+        self.out = [_FakeOutProp(i) for i in out_iids]
+
+
+class _FakeSpecService:
+    def __init__(self, iid: int, actions: list):
+        self.iid = iid
+        self.actions = actions
+
+
+class _FakeSpec:
+    def __init__(self, services: list):
+        self.services = services
+
+
+class _FakeSpecParser:
+    """只实现控制热路径用到的那一个取法：只读缓存、绝不联网。"""
+
+    def __init__(self, spec):
+        self._spec = spec
+        self.calls: list[str] = []
+
+    async def get_cached_async(self, urn):
+        self.calls.append(urn)
+        return self._spec
+
+
+class _FakeDev:
+    def __init__(self, urn: str):
+        self.urn = urn
+
+
+class _CloudActionHttp:
+    """云端 action 返回（真实云端形状：``out`` 是裸标量，piid 被拍平）。
+
+    用 ``build_action_result`` 拼，和真的 ``MIoTHttpClient.action_async`` 一样 ——
+    真实 transport 出来的**永远是正典形状**（哪怕没有 ``out`` 也有这个键）。
+    ``out_raw=None`` 模拟**失败**那条：实测云端失败时连 ``out`` 键都没有。
+    """
+
+    def __init__(self, out: list | None = None, code: int = 0):
+        self._out = out
+        self._code = code
+        self.action_calls: list = []
+
+    async def action_async(self, param):
+        self.action_calls.append(param)
+        return build_action_result(
+            did=param.did,
+            siid=param.siid,
+            aiid=param.aiid,
+            code=self._code,
+            source=SOURCE_CLOUD,
+            out_raw=self._out,
+            exe_time=19,
+            latency=213,
+        )
+
+
+_URN = "urn:miot-spec-v2:device:occupancy-sensor:0000A0BF:xiaomi-p1:3"
+_TRACKING = '{"l":182,"mv":0}'
+
+
+def _cloud_client(out, spec):
+    """走云端(设备不可本地控)的最小 client，带上设备表与 spec。"""
+    ch = FakeCentralHub(controllable=[])
+    http = _CloudActionHttp(out)
+    client = _make_client(ch, http)
+    client._device_buffer = {"A": _FakeDev(_URN)}
+    client._spec_parser = _FakeSpecParser(spec)
+    return client, http
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_cloud_action_out_piid_filled_from_spec():
+    """spec 声明 action.2.1 的输出是 piid 7 → 云端那条补成和本地中枢同形。"""
+    spec = _FakeSpec([_FakeSpecService(2, [_FakeSpecAction(1, [7])])])
+    client, _ = _cloud_client([_TRACKING], spec)
+
+    res = await client.action_async(_ap("A"))
+
+    assert res["out"] == [{"piid": 7, "value": _TRACKING}]
+    assert client._spec_parser.calls == [_URN]
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_cloud_action_out_piid_stays_none_when_spec_not_cached():
+    """spec 未缓存 → 不补、不炸，留 None（``get_cached_async`` 绝不联网）。"""
+    client, _ = _cloud_client([_TRACKING], None)
+
+    res = await client.action_async(_ap("A"))
+
+    assert res["out"] == [{"piid": None, "value": _TRACKING}]
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_cloud_action_out_piid_not_filled_on_count_mismatch():
+    """spec 声明 2 个输出、云端只回 1 个 → 数量不符，宁可留空也不赌顺序。"""
+    spec = _FakeSpec([_FakeSpecService(2, [_FakeSpecAction(1, [7, 8])])])
+    client, _ = _cloud_client([_TRACKING], spec)
+
+    res = await client.action_async(_ap("A"))
+
+    assert res["out"] == [{"piid": None, "value": _TRACKING}]
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_cloud_action_out_piid_not_filled_without_device_table():
+    """设备表还没刷出来（did 查不到 urn）→ 放弃补全，不抛异常。"""
+    spec = _FakeSpec([_FakeSpecService(2, [_FakeSpecAction(1, [7])])])
+    client, _ = _cloud_client([_TRACKING], spec)
+    client._device_buffer = {}
+
+    res = await client.action_async(_ap("A"))
+
+    assert res["out"] == [{"piid": None, "value": _TRACKING}]
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_cloud_action_out_piid_safe_without_init_attributes():
+    """client 没跑过 ``__init__``（``object.__new__`` 造的最小 client）也不能炸。
+
+    ``_device_buffer`` / ``_spec_parser`` 都只在 ``__init__`` 里赋值，补全逻辑必须
+    容忍它们缺席。**这个缺口值得单独钉一条**：现有用例的假云端回包都不带 ``out``，
+    第一道 guard 就 return 了，所以真机上一有带 ``out`` 的云端回包就会踩到。
+    """
+    ch = FakeCentralHub(controllable=[])
+    http = _CloudActionHttp([_TRACKING])
+    client = _make_client(ch, http)  # 刻意不设 _device_buffer / _spec_parser
+
+    res = await client.action_async(_ap("A"))
+
+    assert res["out"] == [{"piid": None, "value": _TRACKING}]
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_cloud_action_without_out_is_untouched():
+    """实测：云端失败时连 out 键都没有 —— 补全逻辑不该碰它，也不该炸。"""
+    ch = FakeCentralHub(controllable=[])
+    http = _CloudActionHttp(out=None, code=-704220025)
+    client = _make_client(ch, http)
+    client._device_buffer = {"A": _FakeDev(_URN)}
+    client._spec_parser = _FakeSpecParser(_FakeSpec([]))
+
+    res = await client.action_async(_ap("A"))
+
+    assert res["code"] == -704220025
+    assert res["out"] == []
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_a_raising_spec_lookup_does_not_break_a_successful_action():
+    """补全是**锦上添花**：spec 解析器抛错绝不能把一次成功的云端动作变成异常。
+
+    补全失败只该降级成「piid 留空」—— 那正是补全之前的行为，下游本来就容忍。
+    叫不上来就往上抛的话，一次已经执行成功的设备动作会变成一次调用失败，
+    调用方（Agent / 规则引擎）会当成没执行去重试，而非幂等动作就做了两遍。
+    """
+
+    class _Boom:
+        async def get_cached_async(self, urn):
+            raise RuntimeError("spec cache exploded")
+
+    ch = FakeCentralHub(controllable=[])
+    http = _CloudActionHttp([_TRACKING])
+    client = _make_client(ch, http)
+    client._device_buffer = {"A": _FakeDev(_URN)}
+    client._spec_parser = _Boom()
+
+    res = await client.action_async(_ap("A"))
+
+    assert res["code"] == 0
+    assert res["out"] == [{"piid": None, "value": _TRACKING}]
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_an_unexpected_spec_shape_does_not_break_a_successful_action():
+    """spec 里 ``services`` 形状不认识（这里放个 dict）同样只降级、不抛。"""
+
+    class _WeirdSpec:
+        services = {"2": "not a service object"}
+
+    ch = FakeCentralHub(controllable=[])
+    http = _CloudActionHttp([_TRACKING])
+    client = _make_client(ch, http)
+    client._device_buffer = {"A": _FakeDev(_URN)}
+    client._spec_parser = _FakeSpecParser(_WeirdSpec())
+
+    res = await client.action_async(_ap("A"))
+
+    assert res["code"] == 0
+    assert res["out"] == [{"piid": None, "value": _TRACKING}]
