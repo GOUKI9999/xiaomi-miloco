@@ -392,7 +392,7 @@ class IdentityEngineConfig:
 
 @dataclass
 class OmniConfig:
-    model: str = "xiaomi/mimo-v2.5"
+    model: str = "mimo-v2.6-flash"
     api_key: str = ""  # Set via MILOCO_MODEL__OMNI__API_KEY env var or config
     base_url: str = "https://api.xiaomimimo.com/v1"
     max_completion_tokens: int = 512
