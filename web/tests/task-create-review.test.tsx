@@ -64,7 +64,7 @@ describe("task creation gate", () => {
 
   it("treats a selection disjoint from the selectable list as empty", () => {
     // 勾选后摄像头被占用 / 下线，重渲染后的可选列表已不含该 key：
-// 勾选集合非空但交集为空，创建按钮必须视为不可提交，而不是点击后静默空转。
+    // 勾选集合非空但交集为空，创建按钮必须视为不可提交，而不是点击后静默空转。
     const selectable = [{ ...base, channel: 0, inUse: true }];
     const stale = new Set(["camera-9:0"]);
     expect(stale.size).toBeGreaterThan(0);
@@ -116,11 +116,11 @@ describe("task creation review regressions", () => {
     expect(html).toContain("当前没有正在使用的摄像头");
   });
 
-  it("uses the shared moving and fixed lens labels", () => {
+  it("uses the shared lens labels and channel fallback", () => {
     const base: Omit<ScopeCamera, "channel"> = {
       did: "camera-1",
       name: "阳台摄像头",
-      channelCount: 2,
+      channelCount: 3,
       roomName: "阳台",
       cloudOnline: true,
       lanReachable: true,
@@ -135,6 +135,7 @@ describe("task creation review regressions", () => {
         cameras={[
           { ...base, channel: 0 },
           { ...base, channel: 1 },
+          { ...base, channel: 2 },
         ]}
         camerasState={{ kind: "ready" }}
         onCamerasRetry={() => undefined}
@@ -145,7 +146,9 @@ describe("task creation review regressions", () => {
 
     expect(html).toContain("移动画面");
     expect(html).toContain("固定画面");
+    expect(html).toContain("通道 2");
     expect(html).not.toContain("镜头 1");
     expect(html).not.toContain("镜头 2");
+    expect(html).not.toContain("镜头 3");
   });
 });

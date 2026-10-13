@@ -57,7 +57,6 @@
     "createIntro": "填写任务与触发条件，保存后立即建立感知规则，不必先与 Agent 对话。",
     "cameraLabel": "感知摄像头",
     "cameraRequired": "至少选择一个正在使用的摄像头",
-    "cameraChannel": "镜头 {{channel}}",
     "noActiveCameras": "当前没有正在使用的摄像头，请先在首页启用摄像头感知。",
     "camerasLoading": "正在加载摄像头…",
     "camerasLoadFail": "摄像头列表加载失败：{{msg}}",

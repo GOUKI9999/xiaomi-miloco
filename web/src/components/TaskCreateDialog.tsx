@@ -229,8 +229,8 @@ export function TaskCreateDialog({
                       ? ` · ${
                           lensKey
                             ? t(lensKey)
-                            : t("tasks.cameraChannel", {
-                                channel: camera.channel + 1,
+                            : t("hero.channelLabel", {
+                                n: camera.channel,
                               })
                         }`
                       : "";
