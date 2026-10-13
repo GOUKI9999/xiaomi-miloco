@@ -153,7 +153,7 @@
     "profileNameRequired": "Custom name, Base URL, and model are required",
     "fallbackColumn": "Call order",
     "fallbackUse": "Use as fallback",
-    "fallbackHint": "On network errors, timeouts, 429, or 5xx, try these in order. Authentication and configuration errors do not trigger fallback.",
+    "fallbackHint": "On network errors, timeouts, 429, 5xx, or malformed responses, try these in order. Primary authentication or request configuration errors do not trigger fallback; credential or routing errors on a fallback profile skip to the next one.",
     "fallbackOrder": "Priority {{n}}",
     "fallbackMoveUp": "Move {{name}} up",
     "fallbackMoveDown": "Move {{name}} down",

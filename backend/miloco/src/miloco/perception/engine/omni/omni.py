@@ -205,7 +205,9 @@ async def run_omni_fused(
                 break
             except OmniError as error:
                 has_next = index + 1 < len(configs)
-                if not has_next or not _is_fallback_eligible(error):
+                if not has_next or not _is_fallback_eligible(
+                    error, is_primary=index == 0
+                ):
                     raise
                 logger.warning(
                     "[omni] fused provider fallback: model=%s code=%s -> model=%s",

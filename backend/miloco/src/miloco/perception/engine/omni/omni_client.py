@@ -91,7 +91,7 @@ class OmniError(Exception):
         return name
 
 
-def _is_fallback_eligible(error: OmniError) -> bool:
+def _is_fallback_eligible(error: OmniError, *, is_primary: bool = True) -> bool:
     """Return whether a failed request may safely move to the next provider."""
     original = error.original
     if original is None:
@@ -110,7 +110,13 @@ def _is_fallback_eligible(error: OmniError) -> bool:
         if isinstance(original, httpx.HTTPStatusError)
         else classify_exception(original)
     )
-    return classified is not None and classified.category is ErrorCategory.RECOVERABLE
+    if classified is None:
+        return False
+    if classified.category is ErrorCategory.RECOVERABLE:
+        return True
+    # A fallback profile owns its credentials and route. If either is stale,
+    # skip that profile and continue; malformed requests still fail fast.
+    return not is_primary and classified.code in {"bad_key", "not_found"}
 
 
 @dataclass(frozen=True)
@@ -406,7 +412,7 @@ async def call_omni(
             )
         except OmniError as error:
             has_next = index + 1 < len(configs)
-            if not has_next or not _is_fallback_eligible(error):
+            if not has_next or not _is_fallback_eligible(error, is_primary=index == 0):
                 raise
             logger.warning(
                 "[omni] provider fallback: model=%s code=%s -> model=%s",
@@ -671,7 +677,11 @@ async def call_omni_stream(
             return
         except OmniError as error:
             has_next = index + 1 < len(configs)
-            if emitted or not has_next or not _is_fallback_eligible(error):
+            if (
+                emitted
+                or not has_next
+                or not _is_fallback_eligible(error, is_primary=index == 0)
+            ):
                 raise
             if usage_out is not None:
                 usage_out.clear()

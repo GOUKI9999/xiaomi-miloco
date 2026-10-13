@@ -44,6 +44,10 @@ def test_fallback_eligible_only_for_recoverable_failures():
     assert not _is_fallback_eligible(_http_error(400))
     assert not _is_fallback_eligible(_http_error(401))
     assert not _is_fallback_eligible(_http_error(404))
+    assert not _is_fallback_eligible(_http_error(422), is_primary=False)
+    assert _is_fallback_eligible(_http_error(401), is_primary=False)
+    assert _is_fallback_eligible(_http_error(403), is_primary=False)
+    assert _is_fallback_eligible(_http_error(404), is_primary=False)
     assert not _is_fallback_eligible(
         OmniError(
             "open",
@@ -122,6 +126,35 @@ async def test_call_omni_uses_ordered_fallback_without_primary_breaker(monkeypat
 
     assert result["choices"][0]["message"]["content"] == "ok"
     assert calls == [("primary", True), ("backup", False)]
+
+
+@pytest.mark.asyncio
+async def test_call_omni_skips_bad_credentials_in_middle_of_chain(monkeypatch):
+    primary = OmniConfig(model="primary", base_url="https://p/v1", api_key="p")
+    broken = OmniConfig(model="broken", base_url="https://a/v1", api_key="a")
+    healthy = OmniConfig(model="healthy", base_url="https://b/v1", api_key="b")
+    calls: list[str] = []
+
+    monkeypatch.setattr(
+        omni_client,
+        "resolve_fallback_omni_configs",
+        lambda config: [broken, healthy],
+    )
+
+    async def fake_call(payload, config, type="realtime", *, use_circuit_breaker=True):
+        calls.append(config.model)
+        if config.model == "primary":
+            raise _http_error(429)
+        if config.model == "broken":
+            raise _http_error(401)
+        return {"choices": [{"message": {"content": "ok"}}]}
+
+    monkeypatch.setattr(omni_client, "_call_omni_once", fake_call)
+
+    result = await omni_client.call_omni({"messages": []}, primary)
+
+    assert result["choices"][0]["message"]["content"] == "ok"
+    assert calls == ["primary", "broken", "healthy"]
 
 
 @pytest.mark.asyncio
