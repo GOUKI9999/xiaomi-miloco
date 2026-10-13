@@ -1803,8 +1803,12 @@ class RuleRunner:
                 actual_exited_at=actual_exited_at,
             )
         except Exception:
+            # 带上 context：失败路径上再没有别的日志能说清是谁发起的这次 fire
+            # （rule_fire 事件与 trigger_context 都写不进 —— 异常穿出 _fire 时
+            # 那条 RuleLog 根本不会产生），跨日强发与普通 fire 在这里就分不开。
             logger.exception(
-                "Rule fire failed: rule=%s event=%s", rule.id, event.value
+                "Rule fire failed: rule=%s event=%s context=%s",
+                rule.id, event.value, context,
             )
 
     def force_cross_day_reset(
@@ -1860,10 +1864,10 @@ class RuleRunner:
             #    session 边界操作；若投 actual_exited_at=midnight，preamble 会
             #    强制 agent 调 session-end --at midnight，而新 record 的
             #    active_session_start_at > midnight，触发 RecordSchemaError。
-            self._spawn_force_fire(
+            self._spawn_fire(
                 rule, RuleEvent.EXITED, sources, "cross_day_rollover",
             )
-            self._spawn_force_fire(
+            self._spawn_fire(
                 rule, RuleEvent.ENTERED, sources, "cross_day_rollover",
             )
 
@@ -1874,38 +1878,6 @@ class RuleRunner:
         )
         self._fire_tasks.add(handle)
         handle.add_done_callback(self._fire_tasks.discard)
-
-    def _spawn_force_fire(
-        self,
-        rule: Rule,
-        event: RuleEvent,
-        sources: list[str],
-        context: str,
-    ) -> None:
-        """跨日 force-reset 专用：fire on_exit / on_enter 不带 session 时间戳
-        metadata（rollover_one 已处理 session 切段）。独立错误日志保留 context 上下文。"""
-        task = asyncio.create_task(
-            self._force_fire_safely(rule, event, sources, context)
-        )
-        self._fire_tasks.add(task)
-        task.add_done_callback(self._fire_tasks.discard)
-
-    async def _force_fire_safely(
-        self,
-        rule: Rule,
-        event: RuleEvent,
-        sources: list[str],
-        context: str,
-    ) -> None:
-        try:
-            await self._fire(
-                rule, event, sources, context, str(uuid.uuid4()),
-            )
-        except Exception:
-            logger.exception(
-                "Cross-day force fire failed: rule=%s event=%s",
-                rule.id, event.value,
-            )
 
     async def drain(self) -> None:
         """Wait for all in-flight fire tasks to finish.
