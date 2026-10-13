@@ -286,6 +286,9 @@ class PendingEnterContext:
     extra_metadata: dict | None = None
     caption: str = ""
     device_name: str = ""
+    # 边沿被守卫拦下时那一轮的事件行 id：动作要等到前提恢复才发, 那一刻已经在别的
+    # 周期里, 父指针只能随 payload 一起存着(与 RuleRuntimeState 那份同一个理由)。
+    trigger_event_id: str | None = None
 
 
 class RuleRunner:
@@ -1263,6 +1266,7 @@ class RuleRunner:
                 },
                 caption=caption,
                 device_name=device_name,
+                trigger_event_id=trigger_event_id,
             )
             if not self._state_machine_allows(rule, RuleEvent.ENTERED, payload):
                 # 在清窗口 / 标记 fired 之前问闸：被吞掉时这两样都不该动，否则
@@ -1386,6 +1390,7 @@ class RuleRunner:
                 },
                 caption=caption,
                 device_name=device_name,
+                trigger_event_id=trigger_event_id,
             )
             if not self._state_machine_allows(rule, RuleEvent.ENTERED, payload):
                 # 状态机吞掉了这次边沿（已在态内 / 被对侧条件拦住）。按 STILL_IN
@@ -1623,7 +1628,12 @@ class RuleRunner:
                 extra_metadata=payload.extra_metadata,
                 caption=payload.caption,
                 device_name=payload.device_name,
+                trigger_event_id=payload.trigger_event_id,
             )
+            # 补停车：动作挂的是它自己那一轮的事件行, 而退出支(debounced exit)读的
+            # 正是这份值。不补写的话, 这一次会话的 on_exit 会拿到上一轮配对遗留的
+            # 旧 id —— 不是丢父, 是指错父, 比丢更难发现。
+            self._ensure_state(rule.id).round_trigger_event_id = payload.trigger_event_id
             self._sync_record_source(rule, signal.slot)
             fired = True
         return fired

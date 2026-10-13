@@ -5608,6 +5608,106 @@ class TestRecordMilestoneSessionBoundary:
         assert r.record_source._timers == {}
 
 
+class TestGuardBlockedEnterKeepsEventLink:
+    """进边沿被前提拦下、恢复后才补发时，台账父指针仍指向**被拦那一轮**的事件行。
+
+    拦下与补发跨了感知周期：写事件行的是被拦的那一轮，补发发生在后面某一轮，那一
+    轮的事件行是别人的、甚至没有。所以指针只能随挂起的上下文一起存着。退出支同理
+    —— 它读的是"本轮进入时记下的"那份值，补发不补写这份值，这一次会话的 on_exit
+    就会挂到上一轮配对遗留的旧 id 上：丢父是空指针、指错父是指向别人的行，后者更
+    难发现。
+    """
+
+    @staticmethod
+    def _build(rules, task_id=TASK_ID):
+        from miloco.task.state_machine import TaskStateMachine, derive_directions
+
+        svc = MagicMock()
+        svc.read_duration_target_state = MagicMock(return_value=(None, 0))
+        r = RuleRunner(
+            rules=[], miot_proxy=AsyncMock(), rule_log_repo=MagicMock(),
+            task_record_service=svc,
+        )
+        sm = TaskStateMachine(
+            is_condition_satisfied=r.is_condition_satisfied,
+            dispatch_action=lambda *_a: None,
+        )
+        r.attach_state_machine(sm)
+        for rule in rules:
+            r.add_rule(rule)
+        r.set_task_actions(task_id, {
+            "on_enter_actions": [
+                {"did": "d-enter", "iid": "prop.2.1", "value": True,
+                 "params": None, "idempotent": False, "cooldown_minutes": 10}
+            ],
+            "on_enter_desc": None,
+            "on_exit_actions": [
+                {"did": "d-exit", "iid": "prop.2.1", "value": True,
+                 "params": None, "idempotent": False, "cooldown_minutes": 10}
+            ],
+            "on_exit_desc": None,
+        })
+        sm.register_task(
+            task_id,
+            derive_directions((x.id, x.resolved_direction.value) for x in rules),
+        )
+        return r, sm
+
+    @staticmethod
+    def _rule(rule_id, direction, task_id=TASK_ID):
+        return Rule(
+            id=rule_id, name=rule_id, task_id=task_id,
+            mode=(
+                RuleMode.STATE if direction is RuleDirection.SESSION
+                else RuleMode.EVENT
+            ),
+            direction=direction,
+            lifecycle=RuleLifecycle.PERMANENT,
+            condition=RuleCondition(perceive_device_ids=["cam-001"], query="有人"),
+            exit_debounce_seconds=0,
+        )
+
+    @pytest.mark.asyncio
+    async def test_released_enter_and_its_exit_fold_into_the_blocked_cycle(
+        self, monkeypatch, mock_miot_proxy, mock_log_repo,
+    ):
+        spy = AsyncMock()
+        monkeypatch.setattr("miloco.miot.service._write_action_ledger", spy)
+
+        session_rule = self._rule("r-ses", RuleDirection.SESSION)
+        guard_rule = self._rule("r-guard", RuleDirection.GUARD)
+        r, sm = self._build([session_rule, guard_rule])
+
+        # 前提先明确为假：走"未就绪"那条分支的话，拦下与恢复可能被同一轮吃掉。
+        await r.update_state("r-guard", "cam-001", False, "")
+        await r.update_state("r-ses", "cam-001", True, "有人", trigger_event_id="ev-1")
+        await r.drain()
+
+        assert sm.runtime_state(TASK_ID) is not TaskRuntimeState.ON
+        assert spy.await_args_list == []
+
+        # 前提恢复：补发的动作挂的是被拦那一轮的事件行。
+        await r.update_state("r-guard", "cam-001", True, "")
+        await r.drain()
+
+        assert sm.runtime_state(TASK_ID) is TaskRuntimeState.ON
+
+        # 第一帧 False 会被帧级抗抖吸收，第二帧才确认退出。第二帧刻意带另一个
+        # 事件 id：实现若改成"退出挂本帧那条事件"，这里的断言就变红。
+        await r.update_state("r-ses", "cam-001", False, "没人")
+        await r.update_state(
+            "r-ses", "cam-001", False, "没人", trigger_event_id="ev-2"
+        )
+        await asyncio.sleep(0.05)
+        await r.drain()
+
+        links = [
+            (c.kwargs["phase"], c.kwargs["trigger_event_id"])
+            for c in spy.await_args_list
+        ]
+        assert links == [("enter", "ev-1"), ("exit", "ev-1")]
+
+
 # ============================================================
 # task 全貌校验：进路径 + session 独占（spec §9）
 # ============================================================
