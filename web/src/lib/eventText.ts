@@ -59,6 +59,15 @@ export interface HumanizedSection {
 }
 
 /**
+ * 非触发摘要仍保留规则短名，避免同一事件里的多个规则折叠后显示成完全相同的文案。
+ * 老数据没有当前格式的 `规则：` 行时，保持原来的通用摘要。
+ */
+function withRuleAnchor(sectionText: string, summary: string): string {
+  const ruleLine = sectionText.split("\n").find((line) => line.startsWith("规则："));
+  return ruleLine ? `${ruleLine}\n${summary}` : summary;
+}
+
+/**
  * 把 humanize 后的文本切成折叠态要渲染的段，并抽出每段的「触发状态」。
  *
  * 为什么要抽出来：折叠态每段被裁到 2 视觉行且**没有** `pre-wrap`（块内换行塌成空格），
@@ -101,9 +110,11 @@ export function collapsedSectionText(
   observationText: string,
   stillInText: string,
 ): string {
-  if (section.status === "stillIn") return stillInText;
+  if (section.status === "stillIn") {
+    return withRuleAnchor(section.text, stillInText);
+  }
   if (section.status === "counting" || section.status === "notFired") {
-    return observationText;
+    return withRuleAnchor(section.text, observationText);
   }
   return section.text;
 }

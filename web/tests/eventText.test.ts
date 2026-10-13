@@ -154,9 +154,11 @@ describe("collapsedSectionText（折叠态区分观察与异常）", () => {
         collapsedSectionText(
           parsed,
           "规则正在观察，尚未达到触发条件",
-          "条件仍在持续；进入时已提醒过，本次不重复提醒",
+          "条件仍在持续；进入时已触发过，本次不重复触发",
         ),
-      ).toBe("规则正在观察，尚未达到触发条件");
+      ).toBe(
+        "规则：[开放盆占用状态] 当前猫在盆内\n规则正在观察，尚未达到触发条件",
+      );
       // 原始证据仍留在 section.text，展开态可以完整显示。
       expect(parsed.text).toContain("阳台开放式猫砂盆：连续停留过长");
       expect(parsed.text).toContain("猫刚进入猫砂盆");
@@ -169,9 +171,29 @@ describe("collapsedSectionText（折叠态区分观察与异常）", () => {
       collapsedSectionText(
         parsed,
         "规则正在观察，尚未达到触发条件",
-        "条件仍在持续；进入时已提醒过，本次不重复提醒",
+        "条件仍在持续；进入时已触发过，本次不重复触发",
       ),
-    ).toBe("条件仍在持续；进入时已提醒过，本次不重复提醒");
+    ).toBe(
+      "规则：[开放盆占用状态] 当前猫在盆内\n条件仍在持续；进入时已触发过，本次不重复触发",
+    );
+  });
+
+  it("多个未触发规则保留各自短名，不折叠成相同摘要", () => {
+    const occupancy = section("未触发（计时中）");
+    const repeatedEntry = {
+      ...occupancy,
+      text: occupancy.text.replace("[开放盆占用状态]", "[开放盆频繁进出]"),
+    };
+    const summarize = (parsed: typeof occupancy) =>
+      collapsedSectionText(
+        parsed,
+        "规则正在观察，尚未达到触发条件",
+        "条件仍在持续；进入时已触发过，本次不重复触发",
+      );
+
+    expect(summarize(occupancy)).toContain("规则：[开放盆占用状态]");
+    expect(summarize(repeatedEntry)).toContain("规则：[开放盆频繁进出]");
+    expect(summarize(occupancy)).not.toBe(summarize(repeatedEntry));
   });
 
   it.each(["已触发", "未知"])("%s 仍显示原始正文", (status) => {
@@ -180,7 +202,7 @@ describe("collapsedSectionText（折叠态区分观察与异常）", () => {
       collapsedSectionText(
         parsed,
         "规则正在观察，尚未达到触发条件",
-        "条件仍在持续；进入时已提醒过，本次不重复提醒",
+        "条件仍在持续；进入时已触发过，本次不重复触发",
       ),
     ).toBe(parsed.text);
   });
