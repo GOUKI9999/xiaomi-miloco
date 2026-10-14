@@ -13,6 +13,9 @@ import { isRoomOpen } from "@/components/DevicesByRoom";
 const perfInlinePath = fileURLToPath(
   new URL("../src/components/PerfInline.tsx", import.meta.url),
 );
+const perfRtfChartPath = fileURLToPath(
+  new URL("../src/components/PerfRtfChart.tsx", import.meta.url),
+);
 const zhPerfPath = fileURLToPath(
   new URL("../src/i18n/locales/zh/perf.json", import.meta.url),
 );
@@ -69,6 +72,10 @@ describe("性能总览文案", () => {
     const inlineSource = readFileSync(perfInlinePath, "utf8");
     expect(inlineSource).toContain("formatRelativeDuration(omniP95)");
     expect(inlineSource).not.toContain("omniP95.toFixed");
+
+    const chartSource = readFileSync(perfRtfChartPath, "utf8");
+    expect(chartSource).toContain("formatRelativeDuration(v)");
+    expect(chartSource).not.toContain("v.toFixed(2)");
   });
 
   it("英文说明同样保留可核对的技术指标名称", () => {

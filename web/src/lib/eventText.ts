@@ -81,7 +81,10 @@ export function splitHumanizedSections(humanized: string): HumanizedSection[] {
   if (!humanized) return [];
   return humanized
     .split(/\n\n/)
-    .filter((s) => s.trim())
+    .filter((s) => {
+      const trimmed = s.trim();
+      return trimmed.length > 0 && !/^═+$/.test(trimmed);
+    })
     .map((section) => {
       const lines = section.split("\n");
       const idx = lines.findIndex((l) => l.startsWith("触发状态："));

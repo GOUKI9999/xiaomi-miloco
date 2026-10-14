@@ -131,6 +131,8 @@ describe("splitHumanizedSections（折叠态「触发状态」→ badge）", () 
     const text = block("已触发") + "\n\n═══\n\n" + block("未触发（持续中）").replace("[感知引擎]规则提醒：\n", "");
     const secs = splitHumanizedSections(text);
     const statuses = secs.map((s) => s.status).filter(Boolean);
+    expect(secs).toHaveLength(2);
+    expect(secs.every((s) => s.text.trim() !== "═══")).toBe(true);
     expect(statuses).toEqual(["fired", "stillIn"]);
   });
 });
