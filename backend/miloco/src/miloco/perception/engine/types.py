@@ -84,6 +84,7 @@ class GateTiming:
     # 诊断用:cross >> intra 持续高,基本是 ISP 长周期漂移(AGC/IR/AWB)误判 motion。
     video_intra_score: float = 0.0
     video_cross_score: float = 0.0
+    checked_frame_count: int = 0
 
     @property
     def total_ms(self) -> float:
