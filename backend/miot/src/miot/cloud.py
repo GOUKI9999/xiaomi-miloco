@@ -24,6 +24,11 @@ from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 from cryptography.hazmat.primitives.serialization import load_pem_public_key
 from pydantic import ValidationError
 
+from .action_result import (
+    SOURCE_CLOUD,
+    MIoTActionResult,
+    build_action_result,
+)
 from .common import calc_group_id
 from .const import (
     MIHOME_HTTP_API_PUBKEY,
@@ -521,6 +526,25 @@ class MIoTHttpClient:
         # _LOGGER.debug("mihome api post, %s%s, %s -> %s", self._base_url, url_path, data, res_obj)
         return res_obj
 
+    async def get_central_cert_async(self, csr: str) -> str:
+        """Submit a CSR and get a central-hub-gateway client cert signed by cloud.
+
+        Used for the local mTLS connection to the central hub gateway. Only
+        meaningful in regions listed in ``SUPPORT_CENTRAL_GATEWAY_CTRL``.
+        """
+        if not isinstance(csr, str):
+            raise MIoTHttpError("invalid params")
+        res_obj: Dict = await self.__mihome_api_post_async(
+            url_path="/app/v2/ha/oauth/get_central_crt",
+            data={"csr": str(base64.b64encode(csr.encode("utf-8")), "utf-8")},
+        )
+        if "result" not in res_obj:
+            raise MIoTHttpError("invalid response result")
+        cert: str = res_obj["result"].get("cert", None)
+        if not isinstance(cert, str):
+            raise MIoTHttpError("invalid cert")
+        return cert
+
     async def get_user_info_async(self) -> MIoTUserInfo:
         """Get user info."""
         http_res = await self._ensure_session().get(
@@ -1005,21 +1029,50 @@ class MIoTHttpClient:
 
         return res_obj["result"]
 
-    async def action_async(self, param: MIoTActionParam) -> Dict:
-        """Action.
+    async def action_async(self, param: MIoTActionParam) -> MIoTActionResult:
+        """Action. 返回**正典形状**（见 ``action_result``）。
+
         params = {"did": "xxxx", "siid": 2, "aiid": 1, "in": []}
         "in": in_list  # [item["value"] for item in in_list]
+
+        云端信封与本地中枢**整体**不同：带 ``miid``/``exe_time``/``net_cost`` 等一串
+        遥测，失败时连 ``out`` 键都没有，``out`` 还是把 piid 拍平的裸标量列表。
+        这里只留 ``exe_time``；``net_cost`` 不取上游的 —— 那个只覆盖"云端→设备"
+        一段，与本地中枢的局域网往返不是同一条路径，直接用会得到假对等。
         """
         # NOTICE: Non-standard action param
+        sent_at = time.monotonic()
         res_obj = await self.__mihome_api_post_async(
             url_path="/app/v2/miotspec/action",
             data={"params": param.model_dump(by_alias=True)},
             timeout=15,
         )
+        latency_ms = int((time.monotonic() - sent_at) * 1000)
         if "result" not in res_obj:
             raise MIoTHttpError("invalid response result")
 
-        return res_obj["result"]
+        result = res_obj["result"]
+        if not isinstance(result, dict):
+            # 旧代码把非 dict 的 result 原样上抛,上层只在 dict 上取 code,等于
+            # 静默无结论。归一到正典形状反而把这件事说清楚。
+            return build_action_result(
+                did=param.did,
+                siid=param.siid,
+                aiid=param.aiid,
+                code=None,
+                source=SOURCE_CLOUD,
+                latency=latency_ms,
+            )
+        return build_action_result(
+            did=param.did,
+            siid=param.siid,
+            aiid=param.aiid,
+            code=result.get("code"),
+            source=SOURCE_CLOUD,
+            out_raw=result.get("out"),
+            exe_time=result.get("exe_time"),
+            latency=latency_ms,
+        )
 
     async def __get_manual_scenes_with_home_id_async(
         self, uid: str, home_id: str, scene_ids: Optional[List[int]] = None

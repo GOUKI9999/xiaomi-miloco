@@ -297,6 +297,24 @@ async def test_init_registers_the_props_push_callback(proxy_env):
 
 
 @pytest.mark.asyncio
+async def test_init_registers_the_central_hub_dev_list_callback(proxy_env):
+    """中枢那份回调由 SDK 持有（它要据此搬属性推送的来源）再扇出来，所以本层
+    必须注册成它的下游 —— 漏了这一行，网关上下线不会触发重拉，设备表停在旧集。
+
+    注册不依赖中枢是否已建好：SDK 在触发时才读这个槽位，而中枢是在 mips 起来
+    之后才懒建的，构造时去 `getattr(client, "central_hub")` 只会拿到 None。
+    """
+    p, client = proxy_env
+    await p.init()
+
+    cb = client.register_dev_list_changed_callback.call_args.args[0]
+    assert cb.__self__ is p
+    assert cb.__func__.__name__ == "_on_central_hub_dev_list_changed"
+
+    await p.deinit()
+
+
+@pytest.mark.asyncio
 async def test_bind_event_forwards_despite_sub_failure(proxy_env):
     """A failed bind-triggered subscribe must only log — it must NOT abort
     delivery to _bind_listener.on_event, or this bind's debounce/welcome
