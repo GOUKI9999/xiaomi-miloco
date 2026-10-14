@@ -1280,7 +1280,86 @@ class TestAudioObservationDestinations:
         environment_destination = "听到的声音只如实写进 env_sounds"
         assert (speech_destination in sp) is (has_audio and has_speech)
         assert (environment_destination in sp) is (has_audio and not has_speech)
-        assert "名册姓名 / bbox 仅供定位，不代表当前有人" in sp
+        assert "不代表当前有人" in sp
+
+
+class TestPersonNamingPolicy:
+    """真实装配入口须保留名册命名条件、候选独立性与人物否证出口。"""
+
+    @staticmethod
+    def _assert_visual_policy(sp, has_candidates):
+        assert "只有画面确认名册 bbox 对应真人" in sp
+        assert "且该名册项不在本轮待识别 track 中，才可沿用其姓名" in sp
+        assert "无法对应或未确认有人，不得沿用名册姓名" in sp
+        assert "本轮有待识别 track 时，该目标的姓名只用本轮 identities 结果" in sp
+        assert "unknown / 没给出 → 画面确认有人时写“某人 / 陌生人”" in sp
+        assert "no_person → 不据该框描述人物或动作" in sp
+        assert "不得借名册覆盖该结果" in sp
+        assert "规则点名的人未确认在场或姓名无依据则不成立" in sp
+        assert "matched_rules 与 suggestions 的结论都不得与 caption 相矛盾" in sp
+        assert "caption 写锅静置就不能判“在加热”" in sp
+        assert "caption 认定是小明就不能当成小红" in sp
+        assert ('"identities"' in sp) is has_candidates
+        assert ("## identities\n" in sp) is has_candidates
+        assert ("名册项不重判、不补进 identities" in sp) is has_candidates
+        assert ("在 caption / matched_rules / suggestions 中禁用该姓名及其人物结论" in sp) is has_candidates
+
+        caption = sp.split("## caption\n", 1)[1].split("\n## ", 1)[0]
+        rules = sp.split("## matched_rules\n", 1)[1].split("\n## ", 1)[0]
+        suggestions = sp.split("## suggestions\n", 1)[1].split("\n## ", 1)[0]
+        assert "画面确认后的非待识别名册姓名" in caption
+        assert "该目标本轮 identities 判出的姓名" in caption
+        assert "按总原则确认在场及姓名来源" in rules
+        assert "人物称呼遵守总原则" in suggestions
+        assert "按同一授权确认该成员姓名及在场" in suggestions
+        assert "涉及人物只用本轮 identities" not in caption
+        assert "指称画面里的人只用本轮 identities" not in suggestions
+        assert "须 identities 已确认该成员在场" not in suggestions
+
+    @pytest.mark.parametrize("has_audio,has_speech", [(True, True), (True, False), (False, False)])
+    @pytest.mark.parametrize("identity_mode", ["none", "match", "no-match"])
+    def test_fused_roster_and_candidate_naming_scopes(self, has_audio, has_speech, identity_mode):
+        from miloco.perception.engine.identity.dispatcher import IdentityQueryItem
+        from miloco.perception.engine.omni.prompt_builder import build_fused_payload
+
+        ep = _video_packet(audio_active=has_audio, speech_active=has_speech)
+        ep.targets = [
+            TestDeviceHeaderRoster._target(1, "stable", (100, 100, 400, 900)),
+            TestDeviceHeaderRoster._target(2, "recheck", (500, 100, 900, 900)),
+        ]
+        has_candidates = identity_mode != "none"
+        candidates = [IdentityQueryItem(track_id=2, bbox_xyxy_norm=(500, 100, 900, 900))] if has_candidates else []
+        context = OmniContext(
+            per_camera_crop_enabled=False,
+            rule_conditions=[RuleCondition(rule_id="member_pc", rule_name="成员用电脑", query="稳定成员正在使用电脑")],
+        )
+        with patch("miloco.perception.engine.omni.prompt_builder.get_home_profile_prefix", return_value=""):
+            fused = build_fused_payload(
+                packets=[ep], context=context, candidates=candidates, gallery_snapshot={},
+                label_lookup={"stable": "稳定成员", "recheck": "重核旧名"},
+                matching_moot=identity_mode == "no-match",
+            )
+        self._assert_visual_policy(fused["messages"][0]["content"], has_candidates)
+        main = _multimodal_user_content(fused["messages"])
+        text = "\n".join(b.get("text", "") for b in main if b.get("type") == "text")
+        assert "稳定成员[bbox=(100, 100, 400, 900)]" in text
+        assert ("重核旧名" in text) is (not has_candidates)
+        assert fused["candidate_track_ids"] == ([2] if has_candidates else [])
+
+    @pytest.mark.parametrize("has_audio,has_speech", [(True, True), (True, False), (False, False)])
+    def test_stream_roster_uses_same_naming_policy(self, has_audio, has_speech):
+        ep = _video_packet(audio_active=has_audio, speech_active=has_speech)
+        with patch("miloco.perception.engine.omni.prompt_builder.get_home_profile_prefix", return_value=""):
+            payload = build_stream_prompt(ep, OmniContext())
+        self._assert_visual_policy(payload["system_prompt"], has_candidates=False)
+
+    def test_audio_only_does_not_authorize_visual_roster_names(self):
+        from miloco.perception.engine.omni.field_registry import SceneDescriptor
+
+        sp = build_system_prompt(SceneDescriptor(route="audio"), include_home_profile=False)
+        assert "名册 bbox 对应真人" not in sp
+        assert "名册项不在本轮待识别 track" not in sp
+        assert '"caption"' not in sp
 
 
 class TestPendingStitchPromptWording:
@@ -1778,7 +1857,7 @@ class TestAdaptiveResolution:
     def test_candidate_bbox_outside_region_falls_back_whole_window(self):
         """候选 bbox 换算不出来 → **整窗**回退全景(all-or-nothing)。
 
-        与名册 bbox 的处置有意不同:名册 bbox 是先验,撤掉退化成"只给姓名不给位置"仍正确;
+        与名册 bbox 的处置有意不同:名册只撤去坐标,人物称呼仍由总原则限制;
         候选 bbox 是模型把 track_id 对到画面里某个人的**唯一定位锚**,撤掉后多 track 场景
         只能凭猜分配姓名 —— 错认代价比分辨率收益高一个量级。故不允许"裁了但候选无锚"的
         中间态,宁可整窗不裁。
@@ -2092,7 +2171,7 @@ class TestAdaptiveResolution:
         assert "最后一帧" in self._bbox_note(content)  # 说明句照发
 
     def test_roster_disclaimer_not_duplicated_on_fused_path(self):
-        # 名册否证条件("名册仅供定位;bbox 若对应非人体…")与坐标系说明同门:fused 入口传
+        # 名册否证条件("名册是定位线索;bbox 若对应非人体…")与坐标系说明同门:fused 入口传
         # emit_bbox_note=False,该判据由组合说明句出,整条 user 消息里只该出现一次。门一松、
         # 或入口漏传该参数,同一条消息里就会出现两句近逐字相同的话 —— 白付 token,且同一
         # 判据存两份,改一处忘一处即漂移。
