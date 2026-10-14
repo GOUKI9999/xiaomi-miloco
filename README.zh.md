@@ -44,7 +44,7 @@ Miloco 2.0 能感知家中发生的事件，能基于常识主动判断并操控
 - **操作系统**：macOS / Linux（Windows 请在 WSL 中运行）
 - **OpenClaw** — Miloco 以插件形式运行其上，需先[安装](https://openclaw.ai)且版本 ≥ 2026.5.2
 - **小米账号** + 已接入米家的设备
-- **多模态大模型 API Key** — 推荐使用[小米 MiMo](https://platform.xiaomimimo.com)：感知用 MiMo-v2.5，Agent 用 MiMo-v2.5-pro（在 OpenClaw 中配置）
+- **多模态大模型 API Key** — 推荐使用[小米 MiMo](https://platform.xiaomimimo.com)
 
 > [!CAUTION]
 > **成本提示**：Miloco 2.0 的感知与 Agent 主要依赖云端大模型，会持续产生 API 调用费用，请关注用量。可在家庭面板「模型」页查看 token 消耗。

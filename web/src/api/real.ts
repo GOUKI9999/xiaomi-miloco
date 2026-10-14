@@ -44,6 +44,8 @@ import type {
   OmniModelsResult,
   UpgradeCheck,
   UpgradeStatus,
+  TaskRuleDirection,
+  TaskRuleSourceType,
 } from "@/lib/types";
 
 export async function realGetPerceptionFlow(
@@ -2218,7 +2220,8 @@ interface BackendTaskSummary {
   rule_briefs?: {
     rule_id: string;
     query: string;
-    direction?: "enter" | "exit" | "session";
+    direction?: TaskRuleDirection;
+    source_type?: TaskRuleSourceType;
     actions_desc?: string[];
   }[];
   actions?: {
@@ -2253,6 +2256,7 @@ export async function realListTasks(): Promise<Task[]> {
       ruleId: b.rule_id,
       query: b.query,
       direction: b.direction ?? "enter",
+      sourceType: b.source_type ?? "omni",
       actionsDesc: b.actions_desc ?? [],
     })),
     // 六个槽恒有。后端漏传时归一成"全空"而不是 null —— 调用方据此决定整个分区
