@@ -1417,6 +1417,58 @@ class TestSpeakerNamingPolicy:
         assert "画面里看到对应的人正在说话" not in speeches
 
 
+class TestNoPersonCriterion:
+    """完整与精简身份说明都须区分确认非人体、真人及无法辨别。"""
+
+    @pytest.mark.parametrize("matching_moot", [False, True])
+    @pytest.mark.parametrize("has_audio,has_speech", [(True, True), (True, False), (False, False)])
+    def test_fused_criterion_preserves_human_recall(self, matching_moot, has_audio, has_speech):
+        from miloco.perception.engine.identity.dispatcher import IdentityQueryItem
+        from miloco.perception.engine.omni.prompt_builder import build_fused_payload
+
+        with patch("miloco.perception.engine.omni.prompt_builder.get_home_profile_prefix", return_value=""):
+            payload = build_fused_payload(
+                packets=[_video_packet(audio_active=has_audio, speech_active=has_speech)],
+                context=OmniContext(per_camera_crop_enabled=False),
+                candidates=[IdentityQueryItem(track_id=7, bbox_xyxy_norm=(100, 100, 200, 400), face_visible=False)],
+                gallery_snapshot={}, matching_moot=matching_moot,
+            )
+        sp = payload["messages"][0]["content"]
+        assert payload["candidate_track_ids"] == [7]
+        assert '"identities"' in sp
+        identities = sp.split("## identities\n", 1)[1].split("\n## ", 1)[0]
+        assert ("不做成员匹配" in identities) is matching_moot
+        assert ("本人正向吻合" in identities) is (not matching_moot)
+        criterion = identities.replace("name 填 ", "")
+        assert '明确有人（哪怕背影/侧身/局部/遮挡/模糊）→ "unknown"' in criterion
+        assert '能确认是非人体（包括椅子、椅背、头枕、扶手、衣物等，即使叫不出具体名称）→ "no_person"，纵使轮廓像人' in criterion
+        assert '分不清是人还是物 → "unknown"（保护真人召回，别把真人误判成没人）' in criterion
+
+
+class TestPrincipleHeading:
+    """字段委托到总原则时，所有模态都须有包含正文的同名段。"""
+
+    @pytest.mark.parametrize("stream", [False, True])
+    @pytest.mark.parametrize("route,has_audio,has_speech", [
+        ("audio", True, True), ("video", False, False),
+        ("video", True, False), ("video", True, True),
+    ])
+    def test_all_variants_have_named_principle_section(self, route, has_audio, has_speech, stream):
+        from miloco.perception.engine.omni.field_registry import SceneDescriptor
+
+        sp = build_system_prompt(
+            SceneDescriptor(route=route, has_audio=has_audio, has_speech=has_speech, stream=stream),
+            include_home_profile=False,
+        )
+        heading = "\n\n# 总原则\n\n"
+        assert sp.count(heading) == 1
+        principle, task = sp.split(heading, 1)[1].split("\n\n# 任务\n", 1)
+        assert principle.startswith("宁缺毋滥（贯穿所有字段的默认姿态）：")
+        assert "拿不准 → 一律不输出该字段或该条" in principle
+        assert "# 输出格式\n" in task
+        assert "# 字段说明\n" in task
+
+
 class TestPendingStitchPromptWording:
     """last_speech 续接：数据与 gate-first 判断指令捆在 user 段（实测正样本 6/6 拼对、
     多数无关句不乱拼）。锁住 prompt 形态：last_speech 块在 user 段、用"能否拼接"判断式、
@@ -1666,8 +1718,23 @@ class TestIdentityMatchDisabled:
             route="video", has_identity=True, has_audio=True, has_speech=True,
             identity_match_disabled=False))
         assert self._EXAMPLE_A_MARKER in out
-        # 库非空用带名版实例 B（专名由实例 A 的 gallery 铺垫），非泛称版
+        # 带名版实例 B 自带名册授权依据，不依赖实例 A 的铺垫。
         assert "小明坐在电脑前" in out
+        assert "非待识别名册项小明[bbox=" in out
+        assert "画面确认该框对应真人" in out
+
+    @pytest.mark.parametrize("has_speech", [False, True])
+    def test_roster_example_authorization_without_identity_example(self, has_speech):
+        from miloco.perception.engine.omni.field_registry import SceneDescriptor
+
+        sp = build_system_prompt(SceneDescriptor(
+            route="video", has_identity=False, has_audio=True, has_speech=has_speech,
+            identity_match_disabled=False), include_home_profile=False)
+        assert self._EXAMPLE_A_MARKER not in sp
+        example = sp.split("## 实例 B", 1)[1]
+        assert "非待识别名册项小明[bbox=" in example
+        assert "画面确认该框对应真人" in example
+        assert "小明坐在电脑前" in example
 
     def test_system_prompt_no_member_matching_leak_when_moot(self):
         """整类 catch-all：库空 system prompt 不得残留任何成员匹配内容（任务描述 /

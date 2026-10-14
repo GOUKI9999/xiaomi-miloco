@@ -127,7 +127,7 @@ _EXAMPLE_IDENTITY = """\
 输出：
 {"identities":[{"track_id":1,"name":"小明","confidence":0.88,"reason":"五官与小明 gallery 清晰一致"},{"track_id":2,"name":"unknown","confidence":0,"reason":"五官与小明对不上，仅同性别"}],"caption":"小明坐在电脑前操作鼠标键盘，屏幕显示游戏画面","speeches":[{"speaker":"小明","content":"把客厅灯调暗一点","is_complete":true,"needs_response":true}]}"""
 
-# 输出实例——本轮独立观察（始终注入），演示如实描述本轮 + 空字段省略。
+# 输出实例——本轮独立观察，演示如实描述本轮 + 空字段省略。
 # suggestion 不带 prev_id：去重交给系统按事件链自动做，模型只管如实报本轮。
 _EXAMPLE_CHAIN = """\
 ## 实例 B — 本轮独立观察（画面 + 环境音 + 隐患）
@@ -135,9 +135,8 @@ _EXAMPLE_CHAIN = """\
 输出（speeches 无故省略）：
 {"caption":"小明坐在电脑前操作鼠标键盘，屏幕显示游戏画面","env_sounds":"重物倒地声","suggestions":[{"event":"听到重物倒地声","action":"提醒用户确认房间情况","urgency":"medium"}]}"""
 
-# 身份库为空（identity_match_disabled）时用的实例 B 变体：把示范专名换成泛称。库空窗口没有
-# 成员铺垫（实例 A 已被 gate 掉），caption 示范不该叫专名——与 caption 字段说明「没识别出的
-# 人写 某人 / 陌生人」一致。从 _EXAMPLE_CHAIN 派生而非另写一份，避免两份实例将来漂移；
+# 身份库为空（identity_match_disabled）时用的实例 B 变体：把示范专名换成泛称，
+# 避免示范姓名被误作可用的成员身份。从 _EXAMPLE_CHAIN 派生而非另写一份，避免两份实例将来漂移；
 # assert 兜住「示范专名被改名致 replace 静默失效」。
 _EXAMPLE_CHAIN_NO_NAME = _EXAMPLE_CHAIN.replace("小明", "某人")
 assert "小明" not in _EXAMPLE_CHAIN_NO_NAME

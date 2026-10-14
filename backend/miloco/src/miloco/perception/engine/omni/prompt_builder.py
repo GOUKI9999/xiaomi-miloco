@@ -572,7 +572,7 @@ def build_system_prompt(
     parts: list[str] = [
         role,
         _OUTPUT_MODE_JSON,
-        principle,
+        "# 总原则\n\n" + principle,
         _render_task_list(scene),
         "# 输出格式\n\n" + _render_schema_section(scene),
         "# 字段说明\n\n" + render_field_spec(scene),
