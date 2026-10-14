@@ -1,5 +1,6 @@
 """Tests for Omni Provider Adapter."""
 
+import pytest
 from miloco.perception.engine.omni import provider
 from miloco.perception.engine.omni.provider import (
     GeminiAdapter,
@@ -111,12 +112,9 @@ class TestKimiAdapter:
             "video_url": {"url": "data:video/mp4;base64,AAAA"},
         }
 
-    def test_audio_block_shape_is_explicit(self):
-        block = self.adapter.build_audio_block("BBBB", _AUDIO_MEDIA)
-        assert block == {
-            "type": "input_audio",
-            "input_audio": {"data": "data:audio/m4a;base64,BBBB"},
-        }
+    def test_audio_block_is_rejected_before_request_assembly(self):
+        with pytest.raises(ValueError, match="Kimi.*does not support audio"):
+            self.adapter.build_audio_block("BBBB", _AUDIO_MEDIA)
 
     def test_kimi_k2_6_forces_supported_sampling_parameters(self):
         body = self.adapter.build_request_body(
@@ -198,20 +196,16 @@ class TestKimiAdapterWireShape:
         assert len(content) == 2
         assert content[1]["type"] == "video_url"
 
-    def test_audio_only_payload_data_uri_survives_assembly(self):
-        """纯音频窗口（仅 audio_base64）——input_audio 形状同样要落到 wire body。"""
-        body = self._wire_body({
-            "system_prompt": "你是助手",
-            "user_content": "听这段音频",
-            "audio_base64": "AUD",
-            "media_info": _AUDIO_MEDIA,
-            "crops": [],
-        })
-        content = body["messages"][1]["content"]
-        assert content[1] == {
-            "type": "input_audio",
-            "input_audio": {"data": "data:audio/m4a;base64,AUD"},
-        }
+    def test_audio_only_payload_is_rejected_before_wire_body(self):
+        """纯音频窗口不能退化成 text-only，也不能生成 Moonshot 不支持的块。"""
+        with pytest.raises(ValueError, match="Kimi.*does not support audio"):
+            self._wire_body({
+                "system_prompt": "你是助手",
+                "user_content": "听这段音频",
+                "audio_base64": "AUD",
+                "media_info": _AUDIO_MEDIA,
+                "crops": [],
+            })
 
     def test_wire_body_pairs_media_blocks_with_normalized_sampling(self):
         """多模态与采样归一必须同时成立：媒体块就位 + k2.6 采样合法 + thinking 已删。"""

@@ -179,11 +179,8 @@ class KimiAdapter(MiMoAdapter):
         }
 
     def build_audio_block(self, audio_base64: str, media: LocalMediaInfo) -> dict[str, Any]:
-        """Keep the audio block explicit instead of inheriting future MiMo extensions."""
-        return {
-            "type": "input_audio",
-            "input_audio": {"data": f"data:audio/m4a;base64,{audio_base64}"},
-        }
+        """Reject audio before assembling a request Moonshot cannot accept."""
+        raise ValueError("Kimi does not support audio input")
 
     def build_request_body(
         self,
