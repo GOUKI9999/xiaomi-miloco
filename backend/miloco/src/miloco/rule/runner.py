@@ -756,9 +756,16 @@ class RuleRunner:
                     and not enabled_changed
                     and self._has_dispatched_enter(existing)
                 )
+                # 本轮事件 id 要在 _reset_runtime_state 之前取：那份状态整个
+                # 被 pop, 之后再取只剩空。
+                round_event_id = (
+                    self._state[rule.id].round_trigger_event_id
+                    if carry and rule.id in self._state
+                    else None
+                )
                 self._reset_runtime_state(rule.id)
                 if carry:
-                    self._carry_entered_baseline(rule)
+                    self._carry_entered_baseline(rule, round_event_id)
         self._rules[rule.id] = rule
 
     def _has_dispatched_enter(self, rule: Rule) -> bool:
@@ -782,7 +789,7 @@ class RuleRunner:
             return state.state_duration_fired
         return state.last_rule_state
 
-    def _carry_entered_baseline(self, rule: Rule) -> None:
+    def _carry_entered_baseline(self, rule: Rule, round_event_id: str | None) -> None:
         """换条件形状时把「已经进入」带到新状态上, 与 ``_rewind_abandoned_exit``
         是同一条命题: 撤掉一个中间态要连聚合基线一起拨回。
 
@@ -793,9 +800,15 @@ class RuleRunner:
 
         带 duration 时还要一并置 ``state_duration_fired``: 退出边沿被
         「没配对的 ENTERED」那道闸挡着, 不置位一样退不出去。
+
+        本轮事件 id (``round_trigger_event_id``) 跟着一起带: 换条件是一次配置
+        变更、不是一次会话重启 —— 状态机那边留在 on、也不重发 ENTERED, 这一次
+        会话挂的是哪条事件行没有变, 退出支马上就会来读这份值。不跟着带, 编辑期
+        间这个 id 被整份状态清掉, 本段退出就丢父。
         """
         state = self._ensure_state(rule.id)
         state.last_rule_state = True
+        state.round_trigger_event_id = round_event_id
         if rule.duration_seconds:
             state.state_duration_fired = True
 
@@ -927,9 +940,9 @@ class RuleRunner:
         ``trigger_event_id`` is the id of this cycle's event row (minted on the
         perception side so that both the early-send and the main loop share
         one). It rides down to the action ledger's ``trigger_event_id`` column:
-        the ENTERED branch parks it on the rule state so the debounced EXITED
-        can hand the same value to the exit actions. Callers with no event row
-        behind them (record-source ticks) leave it None.
+        the ENTERED branch records it on the rule state so the debounced
+        EXITED can hand the same value to the exit actions. Callers with no
+        event row behind them (record-source ticks) leave it None.
         """
         async with get_monitor().track_async(NodeName.RULE, "update") as h:
             h.add_input(1)
@@ -1547,6 +1560,12 @@ class RuleRunner:
             self._iot_source.record_compensated_exit()
         self._record_source.disarm(rule.task_id)
 
+        # 取与清放在同一个同步段里、排在 fire 之前。退出动作要 await 网络, 那
+        # 段时间里新开的一段会话会在同一个状态对象上改写这个 id (进入边沿), 清
+        # 排在 await 之后抹掉的就是新那一段记下的值 —— 比留着旧值更糟。
+        round_event_id = rs.round_trigger_event_id
+        rs.round_trigger_event_id = None
+
         # Background-task path: swallow exceptions so they don't surface as
         # "Task exception was never retrieved" warnings.
         try:
@@ -1556,7 +1575,7 @@ class RuleRunner:
                 extra_metadata=exit_metadata,
                 # 退出支挂回本轮进入时的那条事件: 确认离开的那个感知周期不写事件,
                 # 这里现找只会找到别人的行或空。
-                trigger_event_id=rs.round_trigger_event_id,
+                trigger_event_id=round_event_id,
             )
         except Exception:
             logger.exception(
@@ -1630,9 +1649,9 @@ class RuleRunner:
                 device_name=payload.device_name,
                 trigger_event_id=payload.trigger_event_id,
             )
-            # 补停车：动作挂的是它自己那一轮的事件行, 而退出支(debounced exit)读的
-            # 正是这份值。不补写的话, 这一次会话的 on_exit 会拿到上一轮配对遗留的
-            # 旧 id —— 不是丢父, 是指错父, 比丢更难发现。
+            # 补记这个 id：动作挂的是它自己那一轮的事件行, 而退出支(debounced
+            # exit)读的正是这份值。不补写的话, 这一次会话的 on_exit 会拿到上一轮
+            # 配对遗留的旧 id —— 不是丢父, 是指错父, 比丢更难发现。
             self._ensure_state(rule.id).round_trigger_event_id = payload.trigger_event_id
             self._sync_record_source(rule, signal.slot)
             fired = True
@@ -1864,9 +1883,15 @@ class RuleRunner:
             #    session 边界操作；若投 actual_exited_at=midnight，preamble 会
             #    强制 agent 调 session-end --at midnight，而新 record 的
             #    active_session_start_at > midnight，触发 RecordSchemaError。
+            # 强发 EXITED 带上这一段会话记下的那个 id: 被结束的正是那次感知进入
+            # 打开的会话, 父可确知为真。取与清之间没有 await, 新一天的会话紧接着
+            # 从强发进入开始 —— 它不感知进入、也就不会记下新值; 不清则第二天早上
+            # 的真退出会挂回午夜之前那条事件 (指错父, 比丢父更难发现)。
             self._spawn_fire(
                 rule, RuleEvent.EXITED, sources, "cross_day_rollover",
+                trigger_event_id=rs.round_trigger_event_id,
             )
+            rs.round_trigger_event_id = None
             self._spawn_fire(
                 rule, RuleEvent.ENTERED, sources, "cross_day_rollover",
             )

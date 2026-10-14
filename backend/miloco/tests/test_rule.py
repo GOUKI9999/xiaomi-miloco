@@ -40,7 +40,7 @@ from miloco.rule.schema import (
     aggregate_outcomes,
 )
 from miloco.rule.service import RuleService
-from miloco.task.state_machine import TaskRuntimeState
+from miloco.task.state_machine import ActionSlot, TaskRuntimeState
 from pydantic import ValidationError
 
 # ---- Helpers ----
@@ -5608,15 +5608,8 @@ class TestRecordMilestoneSessionBoundary:
         assert r.record_source._timers == {}
 
 
-class TestGuardBlockedEnterKeepsEventLink:
-    """进边沿被前提拦下、恢复后才补发时，台账父指针仍指向**被拦那一轮**的事件行。
-
-    拦下与补发跨了感知周期：写事件行的是被拦的那一轮，补发发生在后面某一轮，那一
-    轮的事件行是别人的、甚至没有。所以指针只能随挂起的上下文一起存着。退出支同理
-    —— 它读的是"本轮进入时记下的"那份值，补发不补写这份值，这一次会话的 on_exit
-    就会挂到上一轮配对遗留的旧 id 上：丢父是空指针、指错父是指向别人的行，后者更
-    难发现。
-    """
+class _EventLinkFixtures:
+    """台账父指针用例共用的装配：挂了状态机的 runner、进 / 出两个槽都配好动作。"""
 
     @staticmethod
     def _build(rules, task_id=TASK_ID):
@@ -5667,6 +5660,25 @@ class TestGuardBlockedEnterKeepsEventLink:
             exit_debounce_seconds=0,
         )
 
+
+def _ledger_links(spy):
+    """台账 spy 收到的 (相位, 父指针) 序列 —— 断言就写在这个形状上。"""
+    return [
+        (c.kwargs["phase"], c.kwargs["trigger_event_id"])
+        for c in spy.await_args_list
+    ]
+
+
+class TestGuardBlockedEnterKeepsEventLink(_EventLinkFixtures):
+    """进边沿被前提拦下、恢复后才补发时，台账父指针仍指向**被拦那一轮**的事件行。
+
+    拦下与补发跨了感知周期：写事件行的是被拦的那一轮，补发发生在后面某一轮，那一
+    轮的事件行是别人的、甚至没有。所以指针只能随挂起的上下文一起存着。退出支同理
+    —— 它读的是"本轮进入时记下的"那份值，补发不补写这份值，这一次会话的 on_exit
+    就会挂到上一轮配对遗留的旧 id 上：丢父是空指针、指错父是指向别人的行，后者更
+    难发现。
+    """
+
     @pytest.mark.asyncio
     async def test_released_enter_and_its_exit_fold_into_the_blocked_cycle(
         self, monkeypatch, mock_miot_proxy, mock_log_repo,
@@ -5706,6 +5718,202 @@ class TestGuardBlockedEnterKeepsEventLink:
             for c in spy.await_args_list
         ]
         assert links == [("enter", "ev-1"), ("exit", "ev-1")]
+
+
+class TestRoundTriggerEventIdLifecycle(_EventLinkFixtures):
+    """本轮事件 id（``round_trigger_event_id``）的一生：谁记、谁取、什么时候清。
+
+    它记的是「这一段会话是从哪条事件行进来的」，是父指针而不是因果指针。写点全在
+    感知进入路径上，读点只有退出支一处。会话边界有三类，清点各守一类：
+
+    - 跨日切段：被结束的那一段带着自己记下的 id 走，新一天从空开始。
+    - 退出消费：退出支取走它的那一次，同一个同步段里把它清掉。
+    - 配置编辑**不是**会话边界：这个 id 随会话延续，不清。
+
+    留旧值比留空更糟 —— 读回空值能看出「没有父」，旧值会让第二天的退出挂回昨晚那
+    条事件行，而两者在展示层是两句不同的话。
+    """
+
+    @pytest.mark.asyncio
+    async def test_cross_day_reset_closes_yesterday_and_opens_today(
+        self, monkeypatch, mock_miot_proxy, mock_log_repo,
+    ):
+        """跨日切段：强发的 EXITED 带走旧 id，随后那段会话的 id 是空的。
+
+        强发 EXITED 结束的正是那次感知进入打开的会话，父指针可确知为真。紧接着的
+        ENTERED 起的是新一段，它不感知进入、也就不记这个 id，第二天早上的真退出只
+        能是空父。这一行把三种写法分开：不清（末行挂回 ``ev-day1``）与清错（末行挂
+        上 ``ev-day2``）都不是「没有父」。
+        """
+        spy = AsyncMock()
+        monkeypatch.setattr("miloco.miot.service._write_action_ledger", spy)
+
+        session_rule = self._rule("r-ses", RuleDirection.SESSION)
+        r, _sm = self._build([session_rule])
+
+        await r.update_state(
+            "r-ses", "cam-001", True, "有人", trigger_event_id="ev-day1"
+        )
+        await r.drain()
+
+        r.force_cross_day_reset(TASK_ID)
+        await r.drain()
+
+        # 第二帧刻意带 ev-day2：实现若改成「退出挂本帧那条事件」，末行就变红。
+        await r.update_state("r-ses", "cam-001", False, "没人")
+        await r.update_state(
+            "r-ses", "cam-001", False, "没人", trigger_event_id="ev-day2"
+        )
+        await asyncio.sleep(0.05)
+        await r.drain()
+
+        assert _ledger_links(spy) == [
+            ("enter", "ev-day1"),
+            ("exit", "ev-day1"),
+            ("enter", None),
+            ("exit", None),
+        ]
+
+    @pytest.mark.asyncio
+    async def test_edit_during_session_keeps_the_recorded_id(
+        self, monkeypatch, mock_miot_proxy, mock_log_repo,
+    ):
+        """改规则是一次配置变更，不是一次会话重启 —— 记下的 id 随会话延续。
+
+        换条件时下游把这份运行态整个弹掉重建，状态机那边却留在 on、也不重发
+        ENTERED：这一次会话挂的是哪条事件行并没有变，而退出支马上就会来读这份值。
+        """
+        spy = AsyncMock()
+        monkeypatch.setattr("miloco.miot.service._write_action_ledger", spy)
+
+        session_rule = self._rule("r-ses", RuleDirection.SESSION)
+        r, _sm = self._build([session_rule])
+
+        await r.update_state(
+            "r-ses", "cam-001", True, "有人", trigger_event_id="ev-1"
+        )
+        await r.drain()
+        assert r._state["r-ses"].round_trigger_event_id == "ev-1"
+
+        # 等价于 service.patch_rule 改一个字段后回灌 add_rule：只动描述，
+        # 方向 / 启用 / 感知设备都没变，状态机那侧留在 on。
+        r.add_rule(session_rule.model_copy(update={"on_target_desc": "改了个描述"}))
+        assert r._state["r-ses"].round_trigger_event_id == "ev-1"
+
+        await r.update_state("r-ses", "cam-001", False, "没人")
+        await r.update_state(
+            "r-ses", "cam-001", False, "没人", trigger_event_id="ev-2"
+        )
+        await asyncio.sleep(0.05)
+        await r.drain()
+
+        assert _ledger_links(spy) == [("enter", "ev-1"), ("exit", "ev-1")]
+
+    @pytest.mark.asyncio
+    async def test_exit_consumes_the_recorded_id(
+        self, monkeypatch, mock_miot_proxy, mock_log_repo,
+    ):
+        """取用即清：退出支取走它的那一次，同一个同步段里把它清掉。
+
+        第二条进入路径（``trigger_rule`` 桥，以及它背后的 ``manual_inject``）不经
+        感知进入，因此不会记这个 id。第一段会话退出时若不消费掉旧值，第二段退出读到
+        的还是第一段的父指针 —— 挂到一条毫不相干的事件行上。
+
+        只走桥不成：状态机留在 OFF，后续退出被闸挡死（``ALREADY_OFF`` 不在
+        ``_FIRING_OUTCOMES`` 里），根本不出行。所以这里把状态机一起掰回 on。
+        """
+        spy = AsyncMock()
+        monkeypatch.setattr("miloco.miot.service._write_action_ledger", spy)
+
+        session_rule = self._rule("r-ses", RuleDirection.SESSION)
+        r, sm = self._build([session_rule])
+
+        # 第一段：感知进入记下 id，退出把它取走、同时清掉。
+        await r.update_state(
+            "r-ses", "cam-001", True, "有人", trigger_event_id="ev-1"
+        )
+        await r.drain()
+        assert r._state["r-ses"].round_trigger_event_id == "ev-1"
+
+        await r.update_state("r-ses", "cam-001", False, "没人")
+        await r.update_state("r-ses", "cam-001", False, "没人")
+        await asyncio.sleep(0.05)
+        await r.drain()
+        assert r._state["r-ses"].round_trigger_event_id is None
+
+        # 第二段：从桥进来，两条路都不经过感知进入路径上那个写点。
+        await r.trigger_rule("r-ses")
+        await r.drain()
+        sm.manual_inject(TASK_ID, ActionSlot.ON_ENTER)
+        assert sm.runtime_state(TASK_ID) is TaskRuntimeState.ON
+
+        await r.update_state("r-ses", "cam-001", False, "没人")
+        await r.update_state("r-ses", "cam-001", False, "没人")
+        await asyncio.sleep(0.05)
+        await r.drain()
+
+        # 末行是空父。不清则挂回 ev-1 —— 那是上一段会话的事件行。
+        assert _ledger_links(spy) == [
+            ("enter", "ev-1"),
+            ("exit", "ev-1"),
+            ("enter", None),
+            ("exit", None),
+        ]
+
+    @pytest.mark.asyncio
+    async def test_new_session_can_start_while_an_exit_is_in_flight(
+        self, monkeypatch, mock_miot_proxy, mock_log_repo,
+    ):
+        """退出在途时新一段会话会改写这个 id —— 所以清零不能挂在 fire 之后。
+
+        退出动作要 await 网络，那段时间里条件回升是允许的（`exit_debounce_task`
+        已经置 None，两帧抗抖不再生效），新进入边沿会把 id 改写成新值。清零若写成
+        ``finally``（或任何排在 await 之后的写法），抹掉的就是**新那一段**记下的。
+        """
+        from miloco.rule.runner import RuleRunner as _RR
+
+        gate = asyncio.Event()
+        gate.set()
+        orig = _RR._fire
+
+        async def slow_fire(self, *a, **kw):
+            await gate.wait()
+            return await orig(self, *a, **kw)
+
+        monkeypatch.setattr(_RR, "_fire", slow_fire)
+
+        session_rule = self._rule("r-ses", RuleDirection.SESSION)
+        r, sm = self._build([session_rule])
+
+        await r.update_state(
+            "r-ses", "cam-001", True, "有人", trigger_event_id="ev-1"
+        )
+        await r.drain()
+        assert r._state["r-ses"].round_trigger_event_id == "ev-1"
+
+        # 退出边沿：debounce=0，_debounced_exit 走到 fire 处被闸门拦住。
+        gate.clear()
+        await r.update_state("r-ses", "cam-001", False, "没人")
+        await r.update_state("r-ses", "cam-001", False, "没人")
+        for _ in range(100):
+            await asyncio.sleep(0.01)
+            if sm.runtime_state(TASK_ID) is not TaskRuntimeState.ON:
+                break
+        assert sm.runtime_state(TASK_ID) is not TaskRuntimeState.ON, "退出没走到 fire"
+
+        # 新一段会话在旁边开始。
+        await r.update_state(
+            "r-ses", "cam-001", True, "又有人", trigger_event_id="ev-2"
+        )
+        await asyncio.sleep(0.01)
+        assert r._state["r-ses"].round_trigger_event_id == "ev-2"
+
+        gate.set()
+        await asyncio.sleep(0.05)
+        await r.drain()
+
+        # 旧退出 fire 返回之后，新那一段记下的 id 必须还在。
+        assert r._state["r-ses"].round_trigger_event_id == "ev-2"
 
 
 # ============================================================
