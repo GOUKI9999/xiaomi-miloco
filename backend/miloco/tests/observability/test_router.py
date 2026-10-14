@@ -125,6 +125,28 @@ async def test_get_perception_flow_returns_service_unavailable_without_store(app
     assert response.status_code == 503
 
 
+async def test_get_perception_flow_rejects_overlong_device_id(app_with_db):
+    app, _db, _client = app_with_db
+
+    async def allow_request():
+        return None
+
+    app.dependency_overrides[verify_token] = allow_request
+    bind_perception_flow_store(PerceptionFlowSnapshotStore())
+    try:
+        async with AsyncClient(
+            transport=ASGITransport(app=app),
+            base_url="http://testserver",
+        ) as client:
+            response = await client.get(
+                "/api/perf/perception-flow?device_id=" + "x" * 129
+            )
+
+        assert response.status_code == 422
+    finally:
+        bind_perception_flow_store(None)
+
+
 async def test_list_traces_filters(app_with_db):
     app, _db, client = app_with_db
     await client.start()

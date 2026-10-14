@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import base64
 import logging
+from collections.abc import Iterator
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Literal
 
@@ -1554,23 +1555,22 @@ def _resize_video_frames(
     target_w: int,
     target_h: int,
     interpolation: int,
-) -> list[NDArray[np.uint8]]:
-    resized_frames = [
-        cv2.resize(
+) -> Iterator[NDArray[np.uint8]]:
+    from miloco.perception.flow_context import record_media_transform
+
+    for index, frame in enumerate(frames):
+        resized = cv2.resize(
             frame,
             (target_w, target_h),
             interpolation=interpolation,
         )
-        for frame in frames
-    ]
-    from miloco.perception.flow_context import record_media_transform
-
-    record_media_transform(
-        width=target_w,
-        height=target_h,
-        frame_count=len(resized_frames),
-    )
-    return resized_frames
+        if index == len(frames) - 1:
+            record_media_transform(
+                width=target_w,
+                height=target_h,
+                frame_count=len(frames),
+            )
+        yield resized
 
 
 def _encode_video_mp4(

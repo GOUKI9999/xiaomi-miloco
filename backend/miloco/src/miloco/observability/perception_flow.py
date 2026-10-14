@@ -1180,6 +1180,15 @@ def _device_node(
                 diagnostic.media_encode_status is GraphStatus.OK,
             )
         )
+        if diagnostic.error_stage:
+            metrics.append(
+                _metric(
+                    "error_code",
+                    "Error",
+                    f"{diagnostic.error_stage}: {diagnostic.error_code or 'unknown'}",
+                    severity=GraphSeverity.ERROR,
+                )
+            )
     return GraphNode(
         id=template.id,
         kind=template.kind,

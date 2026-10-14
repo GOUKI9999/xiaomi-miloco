@@ -218,13 +218,13 @@ GET /api/perf/perception-flow?device_id=<device-id>
 
 边包含 source、target、active、状态、freshness 和可选 media。媒体数据保留在协议中，用于校验节点边界和后续通用消费；当前 SVG 不在普通连线上重复渲染媒体摘要，避免五节点行的标签互相覆盖。尺寸、FPS 和帧数统一展示在节点 `In/Out` 区域。
 
-语义标签只用于非普通边：
+语义标签赋予边并进入屏幕阅读器的 `aria-label`，但 SVG 连接线不渲染任何可见文字：
 
 - `Gate blocked`
 - `Audio bypass`
 - `Inactive video path`
 
-普通 `Frames` 标签不重复显示，避免与媒体摘要重叠；Gate 放行后的普通流和 `Omni Request → Result Complete` 均使用该普通语义，不在连线上显示额外文字。
+普通边赋予 `Frames` 标签，同样不渲染。媒体摘要统一展示在节点 `In/Out` 区域，连线画布上不出现文字。
 
 ### 5.4 状态与 freshness
 

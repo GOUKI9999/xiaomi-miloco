@@ -371,6 +371,7 @@ class PipelineProcessor:
         """软停底层引擎(删当前生效模型→回未配态),保留 tick 自愈循环。透传 proxy。"""
         self.clear_flow_snapshots()
         await self._perception_engine_proxy.stop_to_unconfigured()
+        self.clear_flow_snapshots()
 
     async def apply_omni_fps(self, omni_fps: int) -> None:
         """运行时热更 omni_fps（含顶起的 tracker fps），免重建引擎。透传 proxy。"""

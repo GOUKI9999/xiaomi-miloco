@@ -630,11 +630,7 @@ async def run_batch_pipeline(
                 flow_diagnostics=diagnostics,
             )
         if diagnostics is not None:
-            interval = max(1, round(config.input.fps / config.gate.check_fps))
-            checked = len(range(0, len(snapshot.frames), interval))
-            if checked < 2 and len(snapshot.frames) >= 2:
-                checked += 1
-            diagnostics.gate_checked_frame_count = checked
+            diagnostics.gate_checked_frame_count = gate_timing.checked_frame_count
             if last_checked is not None and last_checked.ndim >= 2:
                 diagnostics.gate_output_height = int(last_checked.shape[0])
                 diagnostics.gate_output_width = int(last_checked.shape[1])
@@ -829,6 +825,8 @@ async def run_batch_pipeline(
             room_timing[f"omni_{did}_ms"] = _ms_since(t)
             if diagnostics is not None:
                 diagnostics.omni_status = GraphStatus.OK
+                if omni_output.skipped:
+                    diagnostics.status = GraphStatus.WARNING
                 # 音频编码失败时请求退化为 text-only:encode 已标 ERROR,request
                 # 保持 SKIPPED,不在这里覆盖成 OK。
                 if diagnostics.media_encode_status is GraphStatus.OK:
