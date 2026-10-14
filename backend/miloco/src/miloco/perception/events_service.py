@@ -229,13 +229,15 @@ class EventsService:
                         "read_crop_meta bad crop meta event_id=%s device_id=%s: %s",
                         safe_log(event_id),
                         safe_log(device_id),
-                        e,
+                        safe_log(e),
                     )
                     return (self._no_box_status(event_id, device_id), None)
         except Exception as e:  # noqa: BLE001
             # path 里拼着 event_id,与上面那条同源 —— CodeQL 的 taint 没追进 Path 拼接
             # 只报了上面两处,但只清洗被点名的那处、留下这处,防线就是漏的。
-            logger.warning("read_crop_meta failed to parse trace %s: %s", safe_log(path), e)
+            logger.warning(
+                "read_crop_meta failed to parse trace %s: %s", safe_log(path), safe_log(e)
+            )
             return (self._no_box_status(event_id, device_id), None)
         return (self._no_box_status(event_id, device_id), None)
 

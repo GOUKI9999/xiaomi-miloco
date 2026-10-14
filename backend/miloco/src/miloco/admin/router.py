@@ -52,7 +52,7 @@ async def get_system_status(current_user: str = Depends(verify_token)):
     - Perception model: whether a vision_understanding model is activated
     - Rule engine: whether running and how many rules are loaded
     """
-    logger.info("Get system status API called - User: %s", current_user)
+    logger.info("Get system status API called - User: %s", safe_log(current_user))
 
     # MiOT login status
     try:
@@ -244,7 +244,13 @@ def _write_dismissed(version: str) -> None:
     try:
         _dismiss_file().write_text(version.strip(), encoding="utf-8")
     except Exception as e:
-        logger.warning("failed to persist dismissed version %s: %s", safe_log(version), e)
+        # 版本串来自请求体，异常消息可能把它原样嵌回来，两个都要中和——只包前一个
+        # 等于从旁路把换行重新带回日志。
+        logger.warning(
+            "failed to persist dismissed version %s: %s",
+            safe_log(version),
+            safe_log(e),
+        )
 
 
 def _deploy_kind() -> str:

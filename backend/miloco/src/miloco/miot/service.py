@@ -72,6 +72,7 @@ from miloco.miot.schema import (
     DeviceInfo,
     SceneInfo,
 )
+from miloco.utils.common import cam_tag, safe_log
 
 logger = logging.getLogger(__name__)
 
@@ -211,7 +212,7 @@ async def _write_action_ledger(
                     # scene_id,cache 必 miss——那条路径由调用方带场景所属家传入。
                     home_id = getattr(dev, "home_id", None)
         except Exception as e:  # noqa: BLE001 - 解析失败不影响审计主体
-            logger.debug("action_ledger device lookup failed: %s", e)
+            logger.debug("action_ledger device lookup failed: %s", safe_log(e))
         if home_id is None:
             # 降级态下上面那两级缓存都填不回来——填它们要走云端，而那正是被拒的
             # 原因。缺了这一列的行会被查询侧的 NULL 放行捞进**每一个**家的合流页，
@@ -223,7 +224,7 @@ async def _write_action_ledger(
             try:
                 home_id = _sole_enabled_home(miot_proxy)
             except Exception as e:  # noqa: BLE001 - 问不出归属也不该拖掉这一行审计
-                logger.debug("sole-enabled-home fallback failed: %s", e)
+                logger.debug("sole-enabled-home fallback failed: %s", safe_log(e))
 
         client = get_metrics_client()
         if client is not None:
@@ -254,17 +255,17 @@ async def _write_action_ledger(
         logger.info(
             "action_ledger device=%s(did=%s room=%s) type=%s iid=%s success=%s "
             "reason=%s value_len=%d",
-            device_name or "?",
-            did,
-            room or "?",
-            action_type,
-            iid,
-            success,
-            (result_msg or error or "ok"),
+            safe_log(device_name or "?"),
+            safe_log(did),
+            safe_log(room or "?"),
+            safe_log(action_type),
+            safe_log(iid),
+            safe_log(success),
+            safe_log(result_msg or error or "ok"),
             _truncate_value_len(value_json),
         )
     except Exception as e:  # noqa: BLE001 —— 审计 fail-open,绝不拖垮控制调用
-        logger.warning("action_ledger write failed (did=%s): %s", did, e)
+        logger.warning("action_ledger write failed (did=%s): %s", safe_log(did), safe_log(e))
 
 
 def _sole_enabled_home(miot_proxy: MiotProxy) -> str | None:
@@ -276,6 +277,18 @@ def _sole_enabled_home(miot_proxy: MiotProxy) -> str | None:
     """
     enabled = allowed_home_ids(miot_proxy._kv_repo)
     return next(iter(enabled)) if len(enabled) == 1 else None
+
+
+def _refusal_ledger_reason(miot_proxy: MiotProxy) -> str:
+    """被拒那一行台账的原因列。与拒绝文案同一道分档。
+
+    没绑定时写成「凭据已失效」是自相矛盾的：同一行的授权状态列取的是健康度，
+    而解绑会把它复位成全新的正常态——两列对不上，网页那个失效角标又恰好按状态列
+    判，于是住户看到的是一条毫无解释的失败记录。
+    """
+    if not miot_proxy.is_authenticated:
+        return "refused: mi home account is not bound"
+    return "refused: mi home authorization no longer valid"
 
 
 def _degraded_scene_home(miot_proxy: MiotProxy, scene_id: str) -> str | None:
@@ -326,13 +339,16 @@ async def _trigger_scene(
             did=scene_id, iid=scene_id, value_json=None,
             result_code=None, result_msg=None,
             success=False,
-            error="refused: mi home authorization no longer valid",
+            error=_refusal_ledger_reason(miot_proxy),
             source=source, source_id=source_id,
             home_id=_degraded_scene_home(miot_proxy, scene_id),
         )
+        # 措辞取代理层那一处：它把「从未绑定 / 刚解绑」与「绑着但凭据废了」分开
+        # 说，这里自己拼一份的话，没绑定的机器上会让住户去「重新绑定」一个他没绑
+        # 过的账号。
         raise MiotAuthUnavailableError(
-            "execute scene refused: Mi Home authorization is no longer valid. "
-            "Rebind in the web console, or run `miloco-cli account bind`."
+            miot_proxy.refusal_reason("execute scene")
+            or "execute scene refused: Mi Home authorization is no longer valid."
         )
     try:
         scenes = (await miot_proxy.get_all_scenes()) or {}
@@ -382,7 +398,7 @@ async def _trigger_scene(
         )
         raise
     except Exception as e:
-        logger.error("Failed to trigger scene %s: %s", scene_id, e)
+        logger.error("Failed to trigger scene %s: %s", safe_log(scene_id), safe_log(e))
         await _write_action_ledger(
             miot_proxy,
             action_type="scene_trigger",
@@ -467,7 +483,7 @@ class MiotService:
             for iid in iids:
                 self._lru.touch(did, iid)
         except Exception as e:
-            logger.warning("LRU touch failed for did=%s iids=%s: %s", did, iids, e)
+            logger.warning("LRU touch failed for did=%s iids=%s: %s", safe_log(did), safe_log(iids), safe_log(e))
 
     async def _cancel_running_alignment(self) -> None:
         """取消上一轮状态对齐，并等它真的停下来。
@@ -648,7 +664,14 @@ class MiotService:
         # fail-closed 兜底。闭包内赋值要 nonlocal 才传得出来。
         same_account: bool = False
         try:
-            logger.info("authorize_with_code state=%s code=%s…", state, code[:8])
+            # state 是请求体里的自由字符串、没有字符集约束，而这一行打在
+            # check_state_async 校验它**之前**——不剥换行的话，调用方塞一个含换行
+            # 的值进来，日志里就多出一整行格式完全正常的记录。
+            logger.info(
+                "authorize_with_code state=%s code=%s…",
+                safe_log(state),
+                safe_log(code[:8]),
+            )
 
             async def _rebuild() -> None:
                 nonlocal prev_token, same_account
@@ -752,14 +775,27 @@ class MiotService:
             # 指向一个已不属于当前账号的家。身份未知一律按「换了账号」处理，与那道
             # 比对同向：跨账号残留的拾音白名单若在新账号下命中，会让住户从未授权的
             # 摄像头麦克风直接生效，那是唯一「误命中等于隐私泄露」的键。
-            if prev_token is not self._TOKEN_UNREAD and (
-                self._kv_repo.get(AuthConfigKeys.MIOT_TOKEN_INFO_KEY) != prev_token
+            # `same_account` 为真 = 身份**已经比对过且相等**，不属于上面说的「身份
+            # 未知」那一档。此时再清，会把刚刚刻意保住的接入配置抹掉，与「同账号
+            # 重绑保留配置」直接相反——而摄像头停用集是「默认启用」语义，清掉等于
+            # 把住户特意关掉的相机重新打开投喂，他看到的却只是一句「授权处理失败」。
+            # 换账号那一支在上面已经清过一次，这个出口真正唯一有价值的场景，是
+            # 「换票已成功、但身份还没比出来就抛了」。
+            if (
+                not same_account
+                and prev_token is not self._TOKEN_UNREAD
+                and self._kv_repo.get(AuthConfigKeys.MIOT_TOKEN_INFO_KEY) != prev_token
             ):
                 logger.warning(
                     "Authorization failed after the new token was already persisted; "
                     "clearing home / camera scope fail-closed"
                 )
                 self._clear_account_scope_state()
+                # 与上面换账号那一支同一个理由：这个出口的语义就是「按换了账号
+                # 处理」。作用域清了而会话不清，等于留着上一个账号的房间名与设备名
+                # 去答新账号的话——住户问「客厅的灯开着吗」，会话拿旧家的设备名应答，
+                # 而白名单里已经一台都不剩。
+                self._schedule_agent_session_reset()
             logger.error("Failed to process Xiaomi MiOT authorization code: %s", e)
             raise MiotServiceException(
                 f"Failed to process Xiaomi MiOT authorization code: {str(e)}"
@@ -1103,9 +1139,9 @@ class MiotService:
                 )
                 if not camera_img_seq:
                     logger.error(
-                        "get_miot_cameras_img, get recent camera img failed, did: %s, channel: %s",
-                        camera_channel.did,
-                        camera_channel.channel,
+                        "get_miot_cameras_img, get recent camera img failed, "
+                        "camera: %s",
+                        cam_tag(camera_channel.did, camera_channel.channel),
                     )
                     continue
 
@@ -1187,7 +1223,7 @@ class MiotService:
         """Start audio stream."""
         try:
             logger.info(
-                "Starting audio stream: camera_id=%s, channel=%s", camera_id, channel
+                "Starting audio stream: camera_id=%s, channel=%s", safe_log(camera_id), safe_log(channel)
             )
             await self._miot_proxy.start_camera_raw_audio_stream(
                 camera_id, channel, callback
@@ -1199,7 +1235,7 @@ class MiotService:
     async def stop_audio_stream(self, camera_id: str, channel: int):
         """Stop audio stream."""
         try:
-            logger.info("Stopping audio stream: camera_id=%s", camera_id)
+            logger.info("Stopping audio stream: camera_id=%s", safe_log(camera_id))
             await self._miot_proxy.stop_camera_raw_audio_stream(camera_id, channel)
         except Exception as e:
             logger.error("Failed to stop audio stream: %s", e)
@@ -1220,13 +1256,13 @@ class MiotService:
         try:
             logger.info(
                 "Starting decoded video stream: camera_id=%s, channel=%s",
-                camera_id,
-                channel,
+                safe_log(camera_id),
+                safe_log(channel),
             )
             if callback is None:
                 logger.info(
                     "No callback function, skipping registration: camera_id=%s",
-                    camera_id,
+                    safe_log(camera_id),
                 )
                 return -1
             return await self._miot_proxy.start_camera_decode_video_stream(
@@ -1240,9 +1276,9 @@ class MiotService:
         """Unsubscribe from the decoded video stream (paired with start)."""
         try:
             logger.info(
-                "Stopping decoded video stream: camera_id=%s, reg_id=%d",
-                camera_id,
-                reg_id,
+                "Stopping decoded video stream: camera_id=%s, reg_id=%s",
+                safe_log(camera_id),
+                safe_log(reg_id),
             )
             await self._miot_proxy.stop_camera_decode_video_stream(
                 camera_id, channel, reg_id
@@ -1367,9 +1403,9 @@ class MiotService:
             # 会抛同一个异常，两者由同一个分支收口。
             if not self._miot_proxy.is_operational:
                 raise MiotAuthUnavailableError(
-                    "device control refused: Mi Home authorization is no longer "
-                    "valid. Rebind in the web console, or run "
-                    "`miloco-cli account bind`."
+                    self._miot_proxy.refusal_reason("device control")
+                    or "device control refused: Mi Home authorization is no "
+                    "longer valid."
                 )
             await self._assert_did_in_allowed_home(did)
 
@@ -1462,7 +1498,8 @@ class MiotService:
                 did=did, iid=_request_iid(request),
                 value_json=attempted_value_json,
                 result_code=None, result_msg=None,
-                success=False, error="refused: mi home authorization no longer valid",
+                success=False,
+                error=_refusal_ledger_reason(self._miot_proxy),
             )
             raise
         # 兜底：原写法 `except A, B:` 是 Python 2 语法，在 Python 3 上为 SyntaxError，
@@ -1470,7 +1507,7 @@ class MiotService:
         except (ValidationException, ResourceNotFoundException):
             raise
         except Exception as e:
-            logger.error("Failed to control device %s: %s", did, e)
+            logger.error("Failed to control device %s: %s", safe_log(did), safe_log(e))
             # 异常路径也落一行:success=0 + error + 尝试参数(失败审计完整性)
             await _write_action_ledger(
                 self._miot_proxy,
@@ -1525,7 +1562,7 @@ class MiotService:
         except (ValidationException, ResourceNotFoundException):
             raise
         except Exception as e:
-            logger.error("Failed to get device status %s: %s", did, e)
+            logger.error("Failed to get device status %s: %s", safe_log(did), safe_log(e))
             raise MiotServiceException(f"Failed to get device status: {str(e)}") from e
 
     # ─── scope: 家庭 / 相机接入范围 ──────────────────────────────────────────
