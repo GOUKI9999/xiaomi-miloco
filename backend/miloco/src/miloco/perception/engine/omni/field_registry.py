@@ -58,7 +58,7 @@ IDENTITY = FieldSpec(
 - 先定 name 与 confidence，再用 reason（≤20字）简述所靠特征（面部/发型/体型）；reason 是对已定结论的事后交代，不得先编"吻合"叙事把自己说服进匹配
 
 - 待识别 track（无论首次出现还是系统重核）一律只凭 <gallery> 独立判断、不沿用任何旧结论
-- 已识别人物/陌生人的名册项不重判、不补进 identities；画面否证其在场时，在 caption / matched_rules / suggestions 中禁用该姓名及其人物结论（见总原则）
+- 已识别人物/陌生人的名册项不重判、不补进 identities；画面否证其在场时，在其余输出字段中禁用该姓名及其人物结论（见总原则）
 - 判据优先级 面部 > 发型/体型 > 衣着
 - 认定是「本人正向吻合」不是「相对最像 / 排除法」：必须该成员本人面部确实吻合才填其名；某成员即便是库中唯一同性别、唯一候选，也不能因「排除了其他人」或「最接近」就认定——对不上本人就填 unknown。库中某性别只有一名成员时尤其警惕：不要因「同性别只剩他一个」就认成他
 
@@ -99,7 +99,7 @@ IDENTITY_NO_MATCH = FieldSpec(
     schema_literal='"identities":[{"track_id":<int>,"name":"<unknown|no_person>","confidence":0-1,"reason":"≤20字"}]',
     spec_md="""## identities
 - 本轮无注册成员、不做成员匹配：只判每个"待识别 track"是「确有人体」还是「非人误检」，覆盖所有 track_id、不遗漏不新增
-- 已识别人物/陌生人的名册项不重判、不补进 identities；画面否证其在场时，在 caption / matched_rules / suggestions 中禁用该姓名及其人物结论（见总原则）
+- 已识别人物/陌生人的名册项不重判、不补进 identities；画面否证其在场时，在其余输出字段中禁用该姓名及其人物结论（见总原则）
 - 明确有人（哪怕背影/侧身/局部/遮挡/模糊）→ name 填 "unknown"
 - 能确认是非人体（包括椅子、椅背、头枕、扶手、衣物等，即使叫不出具体名称）→ name 填 "no_person"，纵使轮廓像人
 - 分不清是人还是物→ name 填 "unknown"（保护真人召回）
@@ -125,7 +125,7 @@ SPEECHES = FieldSpec(
     schema_literal='"speeches":[{"speaker":"人","content":"原文","is_complete":true|false,"needs_response":true|false}]',
     spec_md="""## speeches
 - 仅人声。needs_response：仅当本句是对智能助手说的【信息查询】（问时间/天气/日程）、【设备控制】（开关/调节某设备）或【任务请求】（要助手去做/记某件事）才=true；家人间对话、自言自语、情绪感叹、纯陈述/闲聊、以及疑问句但显然在问家人而非助手的，一律=false
-- speaker：画面里看到某人正在说话（嘴动/说话姿态）、且其已在 identities 识别出 → 填其姓名；否则填"未知"。无声纹，不凭声音猜、不从 <gallery> 或家庭档案取名
+- speaker：画面里看到对应的人正在说话（嘴动/说话姿态）、且其姓名可按总原则确认（本轮 identities 判出的姓名，或画面确认后的非待识别名册姓名）→ 填其姓名；否则填"未知"。无声纹，不凭声音猜、不从 <gallery> 或家庭档案取名
 - content：仅转录清晰可辨的人声；嘈杂、含糊、听不清在说什么 → 不输出该条（宁可不转也不硬凑、不把同一句反复输出）。本轮输入若带 last_speech（上一窗没说完的半句），是否与本轮拼接成完整句见该处说明
 - is_complete：语义完整=true；不完整（只有动词没宾语，如"打开""帮我"）=false""",
     spec_md_audio="""## speeches

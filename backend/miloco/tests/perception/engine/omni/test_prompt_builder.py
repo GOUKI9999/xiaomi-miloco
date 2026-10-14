@@ -1292,7 +1292,7 @@ class TestPersonNamingPolicy:
         assert "且该名册项不在本轮待识别 track 中，才可沿用其姓名" in sp
         assert "无法对应或未确认有人，不得沿用名册姓名" in sp
         assert "本轮有待识别 track 时，该目标的姓名只用本轮 identities 结果" in sp
-        assert "unknown / 没给出 → 画面确认有人时写“某人 / 陌生人”" in sp
+        assert "unknown / 没给出 → 不得安成员名，画面确认有人时按对应字段要求使用泛称" in sp
         assert "no_person → 不据该框描述人物或动作" in sp
         assert "不得借名册覆盖该结果" in sp
         assert "规则点名的人未确认在场或姓名无依据则不成立" in sp
@@ -1302,7 +1302,7 @@ class TestPersonNamingPolicy:
         assert ('"identities"' in sp) is has_candidates
         assert ("## identities\n" in sp) is has_candidates
         assert ("名册项不重判、不补进 identities" in sp) is has_candidates
-        assert ("在 caption / matched_rules / suggestions 中禁用该姓名及其人物结论" in sp) is has_candidates
+        assert ("在其余输出字段中禁用该姓名及其人物结论" in sp) is has_candidates
 
         caption = sp.split("## caption\n", 1)[1].split("\n## ", 1)[0]
         rules = sp.split("## matched_rules\n", 1)[1].split("\n## ", 1)[0]
@@ -1360,6 +1360,61 @@ class TestPersonNamingPolicy:
         assert "名册 bbox 对应真人" not in sp
         assert "名册项不在本轮待识别 track" not in sp
         assert '"caption"' not in sp
+
+
+class TestSpeakerNamingPolicy:
+    """speaker 姓名沿用同一授权，还须看到对应的人正在说话。"""
+
+    @staticmethod
+    def _video_prompt(entry):
+        from miloco.perception.engine.identity.dispatcher import IdentityQueryItem
+        from miloco.perception.engine.omni.prompt_builder import build_fused_payload
+
+        ep = _video_packet(audio_active=True, speech_active=True)
+        ep.targets = [TestDeviceHeaderRoster._target(1, "stable", (100, 100, 400, 900))]
+        context = OmniContext(per_camera_crop_enabled=False)
+        with patch("miloco.perception.engine.omni.prompt_builder.get_home_profile_prefix", return_value=""):
+            if entry == "stream":
+                payload = build_stream_prompt(ep, context, label_lookup={"stable": "登记成员"})
+                sp, text = payload["system_prompt"], payload["user_content"]
+            else:
+                candidates = [IdentityQueryItem(track_id=2, bbox_xyxy_norm=(500, 100, 900, 900))] if entry == "fused-candidate" else []
+                payload = build_fused_payload(
+                    packets=[ep], context=context, candidates=candidates, gallery_snapshot={},
+                    label_lookup={"stable": "登记成员"},
+                )
+                sp = payload["messages"][0]["content"]
+                text = "\n".join(b.get("text", "") for b in _multimodal_user_content(payload["messages"]) if b.get("type") == "text")
+        assert "登记成员[bbox=(100, 100, 400, 900)]" in text
+        return sp
+
+    @pytest.mark.parametrize("entry", ["fused-roster", "fused-candidate", "stream"])
+    def test_visible_video_speaker_uses_authorized_name(self, entry):
+        sp = self._video_prompt(entry)
+        speeches = sp.split("## speeches\n", 1)[1].split("\n## ", 1)[0]
+        assert "且其姓名可按总原则确认" in speeches
+        assert "本轮 identities 判出的姓名，或画面确认后的非待识别名册姓名" in speeches
+        assert "画面里看到对应的人正在说话（嘴动/说话姿态）" in speeches
+        assert '否则填"未知"' in speeches
+        assert "不凭声音猜、不从 <gallery> 或家庭档案取名" in speeches
+        assert "且该名册项不在本轮待识别 track 中，才可沿用其姓名" in sp
+        assert "unknown / 没给出 → 不得安成员名" in sp
+        assert "不得借名册覆盖该结果" in sp
+        assert "unknown / 没给出 → 画面确认有人时写“某人 / 陌生人”" not in sp
+
+    def test_identity_example_has_visual_speaker_evidence(self):
+        sp = self._video_prompt("fused-candidate")
+        assert "看到其嘴动说话，听到" in sp
+        assert '"speaker":"小明"' in sp
+
+    def test_audio_speaker_keeps_self_report_exception(self):
+        with patch("miloco.perception.engine.omni.prompt_builder.get_home_profile_prefix", return_value=""):
+            sp = build_prompt(_audio_only_packet(), OmniContext())["system_prompt"]
+        speeches = sp.split("## speeches\n", 1)[1].split("\n## ", 1)[0]
+        assert 'speaker 一律填"未知"（除非本人在话里自报姓名）' in speeches
+        assert "不凭声音猜、不臆测姓名，也不从家庭档案取成员名" in speeches
+        assert "非待识别名册姓名" not in speeches
+        assert "画面里看到对应的人正在说话" not in speeches
 
 
 class TestPendingStitchPromptWording:

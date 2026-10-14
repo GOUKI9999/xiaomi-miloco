@@ -660,8 +660,8 @@ def _render_examples(scene: SceneDescriptor) -> str:
     examples = []
     if scene.has_identity and scene.has_speech and not scene.identity_match_disabled:
         examples.append(_EXAMPLE_IDENTITY)
-    # 库空时实例 B 用泛称版：此窗无成员铺垫（实例 A 已 gate 掉），caption 示范不该叫专名，
-    # 与「库空不产成员名」收敛一致。库非空照旧用带名版（其"小明"由上方实例 A 的 gallery 铺垫）。
+    # 库空时实例 B 用泛称版，避免示范姓名被当成无依据的命名许可。
+    # 带名版本也须遵守总原则的人物称呼授权。
     examples.append(
         _EXAMPLE_CHAIN_NO_NAME if scene.identity_match_disabled else _EXAMPLE_CHAIN
     )
