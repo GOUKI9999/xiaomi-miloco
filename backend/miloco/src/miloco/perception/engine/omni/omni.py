@@ -43,7 +43,7 @@ from miloco.perception.engine.omni.prompt_builder import (
     build_stream_prompt,
     format_person_label,
 )
-from miloco.perception.engine.omni.provider import get_adapter
+from miloco.perception.engine.omni.provider import OmniCapabilityError, get_adapter
 from miloco.perception.engine.omni.response_parser import (
     parse_identity_assignments,
     parse_omni_response,
@@ -192,6 +192,10 @@ async def run_omni_fused(
             matching_moot=person_lib_empty,
         )
         raw_response = await _call_omni_messages(payload["messages"], config, adapter=adapter)
+    except OmniCapabilityError as e:
+        if candidates:
+            await identity_engine.deliver_fused_failure(str(e))
+        raise
     except OmniError as e:
         # omni API / 网络错:_call_omni_messages 已在源头打日志(omni API 调用失败),
         # 这里只做 inflight track 清理 + 上抛,不重复打。

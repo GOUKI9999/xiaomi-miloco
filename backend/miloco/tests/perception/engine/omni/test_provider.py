@@ -53,7 +53,6 @@ class TestGetAdapter:
 
     def test_kimi_case_insensitive(self):
         assert isinstance(get_adapter("Kimi-K2.6"), KimiAdapter)
-
     def test_openai_compat_family(self):
         # MiMo / Qwen / Kimi 都归 OpenAI 兼容族；Gemini 不是。
         assert isinstance(get_adapter("mimo-v2.6-flash"), OpenAICompatAdapter)
@@ -66,6 +65,49 @@ class TestGetAdapter:
         assert get_adapter("qwen3.5-omni-flash") is get_adapter("qwen3.5-omni-plus")
         assert get_adapter("gemini-3-flash") is get_adapter("gemini-3-pro")
         assert get_adapter("kimi-k2.6") is get_adapter("kimi-k2-turbo-preview")
+
+
+def test_fused_capability_error_avoids_duplicate_error_log(caplog):
+    """Fused cleanup re-raises capability rejection for pipeline classification."""
+    import asyncio
+    import logging
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock, patch
+
+    from miloco.perception.engine.config import OmniConfig
+    from miloco.perception.engine.omni.omni import run_omni_fused
+    from miloco.perception.engine.types import OmniContext
+
+    deliver_fused_failure = AsyncMock()
+    identity_engine = SimpleNamespace(
+        library=SimpleNamespace(list_persons=lambda: []),
+        take_fused_pending=lambda: SimpleNamespace(
+            candidates=[object()], gallery_snapshot={}
+        ),
+        deliver_fused_failure=deliver_fused_failure,
+    )
+    capability_error = provider.OmniCapabilityError(
+        "Kimi does not support audio input"
+    )
+
+    caplog.set_level(logging.WARNING, logger="miloco.perception.engine.omni.omni")
+    with patch(
+        "miloco.perception.engine.omni.omni.build_fused_payload",
+        side_effect=capability_error,
+    ), pytest.raises(provider.OmniCapabilityError):
+        asyncio.run(
+            run_omni_fused(
+                [],
+                OmniContext(),
+                OmniConfig(model="kimi-k2.6"),
+                identity_engine,
+            )
+        )
+
+    assert not [r for r in caplog.records if r.levelno >= logging.ERROR]
+    deliver_fused_failure.assert_awaited_once_with(
+        "Kimi does not support audio input"
+    )
 
 
 class TestMiMoAdapter:

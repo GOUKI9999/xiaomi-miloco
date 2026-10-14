@@ -32,6 +32,7 @@ from miloco.perception.engine.omni.omni_client import (
     OmniError,
     resolve_live_omni_config,
 )
+from miloco.perception.engine.omni.provider import OmniCapabilityError
 
 if TYPE_CHECKING:
     import numpy as np
@@ -629,6 +630,19 @@ async def run_batch_pipeline(
                     [omni_packet], context, omni_cfg,
                 )
             room_timing[f"omni_{did}_ms"] = _ms_since(t)
+        except OmniCapabilityError as capability_err:
+            room_timing[f"omni_{did}_ms"] = _ms_since(t)
+            logger.warning(
+                "[omni](room=%s device=%s) 能力边界，跳过窗口: %s",
+                room_name,
+                f"{device_name}({did})",
+                capability_err,
+            )
+            return DevicePipelineResult(
+                device_id=did, input_slice=snapshot,
+                gate_packet=gate_packet, identity_packet=identity_packet,
+                omni_output=None, skipped=True,
+            )
         except OmniError as omni_err:
             # partial 结果:单设备 omni 失败(超时/429/模型错)→ 记 omni_ms + 失败标记 + log,
             # **不连累整窗**——返回 skipped(omni_output=None;_merge_results line855 会跳过该设备),

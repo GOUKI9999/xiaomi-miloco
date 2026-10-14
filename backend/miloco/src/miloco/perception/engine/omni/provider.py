@@ -32,6 +32,10 @@ logger = logging.getLogger(__name__)
 _warned_non_flash_gemini: set[str] = set()
 
 
+class OmniCapabilityError(ValueError):
+    """Provider does not support the requested local input capability."""
+
+
 @dataclass(frozen=True)
 class LocalMediaInfo:
     """本地编码后的视频/音频实际参数。"""
@@ -180,7 +184,7 @@ class KimiAdapter(MiMoAdapter):
 
     def build_audio_block(self, audio_base64: str, media: LocalMediaInfo) -> dict[str, Any]:
         """Reject audio before assembling a request Moonshot cannot accept."""
-        raise ValueError("Kimi does not support audio input")
+        raise OmniCapabilityError("Kimi does not support audio input")
 
     def build_request_body(
         self,

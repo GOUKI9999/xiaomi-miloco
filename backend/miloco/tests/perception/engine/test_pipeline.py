@@ -523,6 +523,51 @@ async def test_batch_omni_error_all_fail_room_skipped():
     assert result.rooms["study-room"].omni_outputs == {}
 
 
+def test_batch_capability_error_is_expected_skip(caplog):
+    """Provider capability rejection skips locally without inflating Omni errors."""
+    import asyncio
+    import logging
+
+    from miloco.perception.engine.omni.provider import OmniCapabilityError
+
+    gray = _solid(100, 100, 100)
+    white = _solid(255, 255, 255)
+    frames = [gray, gray, white, white, white, white]
+    snap = _make_snapshot(
+        "study-room", "cam-1", frames, np.zeros(16000, dtype=np.int16)
+    )
+    batch = BatchedSnapshot(snapshots=[snap])
+
+    config = PerceptionConfig()
+    config.omni.api_key = "test-key"
+    contexts = {"cam-1": OmniContext()}
+    tracking = MockTrackingService(create_default_mock_response())
+
+    async def unsupported(*args, **kwargs):
+        raise OmniCapabilityError("Kimi does not support audio input")
+
+    caplog.set_level(logging.WARNING, logger="miloco.perception.engine.pipeline")
+    with patch(
+        "miloco.perception.engine.pipeline.run_omni_batch", side_effect=unsupported
+    ):
+        result = asyncio.run(
+            run_batch_pipeline(
+                batch,
+                contexts,
+                config,
+                get_tracking_service=lambda did, room_name: tracking,
+            )
+        )
+
+    room = result.rooms["study-room"]
+    assert room.device_results["cam-1"].skipped is True
+    assert "_omni_error_cam-1" not in room.timing
+    capability_logs = [r for r in caplog.records if "能力边界" in r.message]
+    assert len(capability_logs) == 1
+    assert capability_logs[0].levelno == logging.WARNING
+    assert not [r for r in caplog.records if r.levelno >= logging.ERROR]
+
+
 @pytest.mark.asyncio
 async def test_query_rooms_run_concurrently():
     """on_demand 查询路径跨 room 并发（run_query_pipeline 嵌套 gather）。
