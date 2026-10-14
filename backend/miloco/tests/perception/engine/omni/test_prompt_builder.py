@@ -1261,6 +1261,28 @@ class TestSpeechFieldsGatedByVAD:
         assert self._SPEECH_LIT in sp
 
 
+class TestAudioObservationDestinations:
+    """音频观察的落点与本轮可用字段一致，人物在场仍由画面确认。"""
+
+    @pytest.mark.parametrize("stream", [False, True])
+    @pytest.mark.parametrize(
+        ("has_audio", "has_speech"),
+        [(True, True), (True, False), (False, True), (False, False)],
+    )
+    def test_video_audio_observations_follow_available_fields(self, has_audio, has_speech, stream):
+        from miloco.perception.engine.omni.field_registry import SceneDescriptor
+
+        sp = build_system_prompt(
+            SceneDescriptor(route="video", has_audio=has_audio, has_speech=has_speech, stream=stream),
+            include_home_profile=False,
+        )
+        speech_destination = "听到的话 / 声音只如实写进 speeches / env_sounds"
+        environment_destination = "听到的声音只如实写进 env_sounds"
+        assert (speech_destination in sp) is (has_audio and has_speech)
+        assert (environment_destination in sp) is (has_audio and not has_speech)
+        assert "名册姓名 / bbox 仅供定位，不代表当前有人" in sp
+
+
 class TestPendingStitchPromptWording:
     """last_speech 续接：数据与 gate-first 判断指令捆在 user 段（实测正样本 6/6 拼对、
     多数无关句不乱拼）。锁住 prompt 形态：last_speech 块在 user 段、用"能否拼接"判断式、
