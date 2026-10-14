@@ -7,7 +7,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
 
 from miloco.config import get_settings
 from miloco.middleware import verify_token
@@ -23,7 +23,9 @@ router = APIRouter(dependencies=[Depends(verify_token)])
 
 
 @router.get("/api/perf/perception-flow")
-async def get_perception_flow(device_id: str | None = None):
+async def get_perception_flow(
+    device_id: str | None = Query(default=None, max_length=128),
+):
     store = get_perception_flow_store()
     if store is None:
         raise HTTPException(503, "perception flow diagnostics unavailable")

@@ -2571,12 +2571,25 @@ def test_video_transform_status_requires_every_frame_to_resize():
         ),
         pytest.raises(RuntimeError, match="resize failed"),
     ):
-        pb._resize_video_frames(frames, 4, 4, pb.cv2.INTER_AREA)
+        list(pb._resize_video_frames(frames, 4, 4, pb.cv2.INTER_AREA))
 
     assert diagnostics.media_transform_status.value == "unknown"
 
     with flow_diagnostics_scope(diagnostics):
-        resized = pb._resize_video_frames(frames, 4, 4, pb.cv2.INTER_AREA)
+        resized = list(pb._resize_video_frames(frames, 4, 4, pb.cv2.INTER_AREA))
 
     assert len(resized) == 2
     assert diagnostics.media_transform_status.value == "ok"
+
+
+def test_video_resize_is_lazy_to_avoid_retaining_the_whole_window():
+    from unittest.mock import patch as _patch
+
+    import miloco.perception.engine.omni.prompt_builder as pb
+
+    frames = [np.zeros((8, 8, 3), dtype=np.uint8) for _ in range(2)]
+    with _patch.object(pb.cv2, "resize", wraps=pb.cv2.resize) as spy:
+        resized = pb._resize_video_frames(frames, 4, 4, pb.cv2.INTER_AREA)
+        assert spy.call_count == 0
+        next(resized)
+        assert spy.call_count == 1

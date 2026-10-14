@@ -93,3 +93,40 @@ def test_cycle_merge_does_not_readd_device_unregistered_during_processing():
     processor._merge_flow_snapshot(cycle, batch)
 
     assert processor.perception_flow_store.snapshot().per_device == {}
+
+
+@pytest.mark.asyncio
+async def test_soft_stop_clears_snapshot_after_inflight_cycle_finishes():
+    processor = PipelineProcessor.__new__(PipelineProcessor)
+    processor._flow_store = PerceptionFlowSnapshotStore()
+    processor._perception_engine_proxy = MagicMock()
+
+    cycle = PerceptionFlowCycleDiagnostics(
+        cycle_id="trace-1",
+        observed_at=1_000,
+        devices={
+            "camera-1": PerDeviceFlowDiagnostics(
+                device_id="camera-1",
+                room_name="Living Room",
+                trace_id="trace-1",
+                device_trace_id="device-trace-1",
+                observed_at=1_000,
+                status=GraphStatus.OK,
+            )
+        },
+    )
+    batch = MagicMock()
+    batch.devices = {"camera-1": MagicMock()}
+    processor._collector = MagicMock()
+    processor._collector.get_all_active_sources.return_value = {"camera-1"}
+
+    async def stop_and_finish_inflight_cycle():
+        processor._merge_flow_snapshot(cycle, batch)
+
+    processor._perception_engine_proxy.stop_to_unconfigured = AsyncMock(
+        side_effect=stop_and_finish_inflight_cycle
+    )
+
+    await processor.stop_to_unconfigured()
+
+    assert processor.perception_flow_store.snapshot().per_device == {}

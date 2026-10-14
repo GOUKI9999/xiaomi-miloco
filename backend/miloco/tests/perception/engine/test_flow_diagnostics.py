@@ -170,6 +170,74 @@ async def test_gate_failure_returns_partial_diagnostics_without_aborting_batch()
     assert skipped.status == GraphStatus.SKIPPED
 
 
+@pytest.mark.asyncio
+async def test_parser_skip_is_visible_as_warning_in_flow_diagnostics():
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock
+
+    from miloco.perception.engine.types import FrameInfo, GatePacket, GateTrigger
+    from miloco.perception.types import RealtimePerceptionResult
+
+    snapshot = _snapshot("camera-1")
+    gate_packet = GatePacket(
+        packet_id="gate-1",
+        room_name="Living Room",
+        timestamp=4_000,
+        trigger=GateTrigger(
+            visual_changed=True,
+            visual_change_score=1.0,
+            audio_active=False,
+            audio_energy_level=0.0,
+        ),
+        frames=[frame.data for frame in snapshot.video.frames],
+        audio_clip=np.zeros(1, dtype=np.int16),
+    )
+    identity_packet = SimpleNamespace(
+        all_frames=gate_packet.frames,
+        frame_info=FrameInfo(start_timestamp=1_000, end_timestamp=4_000, fps=1),
+        speeches=[],
+        suggestions=[],
+        matched_rules=[],
+        caption=[],
+    )
+
+    with (
+        patch(
+            "miloco.perception.engine.pipeline.run_gate",
+            new=AsyncMock(
+                return_value=(
+                    gate_packet,
+                    GateTiming(1.0, 1.0, True, False),
+                    None,
+                    None,
+                    None,
+                )
+            ),
+        ),
+        patch(
+            "miloco.perception.engine.pipeline.run_identity",
+            new=AsyncMock(return_value=identity_packet),
+        ),
+        patch(
+            "miloco.perception.engine.pipeline.run_omni_batch",
+            new=AsyncMock(return_value=RealtimePerceptionResult(skipped=True)),
+        ),
+    ):
+        config = PerceptionConfig()
+        config.input.omni_fps = config.input.fps
+        result = await run_batch_pipeline(
+            BatchedSnapshot(snapshots=[snapshot]),
+            {"camera-1": OmniContext()},
+            config,
+            trace_id="trace-parser-skip",
+            collect_flow_diagnostics=True,
+        )
+
+    diagnostic = result.flow_diagnostics.devices["camera-1"]
+    assert diagnostic.status == GraphStatus.WARNING
+    assert diagnostic.omni_status == GraphStatus.OK
+
+
 def test_runtime_flow_diagnostics_are_excluded_from_result_serialization():
     result = RealtimePerceptionResult(
         flow_diagnostics=PerceptionFlowCycleDiagnostics(

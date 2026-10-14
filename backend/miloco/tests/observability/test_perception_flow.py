@@ -195,6 +195,14 @@ def test_device_graph_does_not_propagate_omni_error_to_upstream_nodes():
     assert statuses["omni.request"] == GraphStatus.ERROR
     assert statuses["result.complete"] == GraphStatus.ERROR
 
+    result_node = next(
+        node for node in response.graph.nodes if node.id == "result.complete"
+    )
+    error_metric = next(
+        metric for metric in result_node.metrics if metric.key == "error_code"
+    )
+    assert error_metric.value == "omni: unknown"
+
 
 def test_global_graph_only_exposes_discrete_counts_and_no_media():
     store = PerceptionFlowSnapshotStore()
