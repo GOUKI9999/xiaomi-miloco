@@ -83,6 +83,10 @@ async def fetch_models(base_url: str, api_key: str) -> dict[str, Any]:
     is_gemini = (
         (urlparse(base).hostname or "").lower() == "generativelanguage.googleapis.com"
     )
+    # 刻意只发鉴权头(Authorization / x-goog-api-key),**不**复用 build_request_headers():
+    # GET /models 是选定 model 之前的预检,没有 model 就没有 adapter 可传(只能按 base_url
+    # 判 provider),问的只是「endpoint 认不认这个 key」;session 头是推理请求的路由亲和 ID,
+    # 在这里带上没有意义。别"顺手收敛"——预检与运行时的差异是设计,不是遗漏。
     headers = (
         {"x-goog-api-key": api_key}
         if is_gemini
@@ -191,7 +195,10 @@ async def probe_chat(model: str, base_url: str, api_key: str) -> dict[str, Any]:
         return {"ok": False, "code": "unreachable", "message": err}
     # 延迟 import 避免 probe 被 wire 时循环拉起 provider (provider 只依赖标准库,
     # 但保险起见延后到函数内)。
-    from miloco.perception.engine.omni.provider import get_adapter
+    from miloco.perception.engine.omni.provider import (
+        build_request_headers,
+        get_adapter,
+    )
 
     adapter = get_adapter(model)
     body = adapter.build_request_body(
@@ -204,13 +211,8 @@ async def probe_chat(model: str, base_url: str, api_key: str) -> dict[str, Any]:
     )
     forced_stream = body.get("stream", False)
     url = adapter.endpoint(base, model, stream=forced_stream)
-    # adapter.auth_headers 走 provider 特化 —— Gemini 用 ``x-goog-api-key`` 头,
-    # OpenAI 兼容族用 ``Authorization: Bearer``。硬编码 Bearer 会对合法 Gemini
-    # 配置误报失败(401)。
-    headers = {
-        **adapter.auth_headers(api_key),
-        "Content-Type": "application/json",
-    }
+    # 统一走 provider 特化鉴权，并确保 probe 与运行时发送相同的附加头。
+    headers = build_request_headers(adapter, base, api_key)
     t0 = time.monotonic()
     try:
         async with httpx.AsyncClient(timeout=_TIMEOUT) as client:
@@ -353,6 +355,10 @@ async def probe_omni(model: str, base_url: str, api_key: str) -> dict[str, Any]:
     if not isinstance(get_adapter(model), OpenAICompatAdapter):
         return await probe_chat(model, base, api_key)
     try:
+        # 同 fetch_models:预检刻意只发 Authorization、**不**带 x-opencode-session。
+        # 这里的 model 已经能拿到 adapter,但 GET /models 只问「这个 endpoint 认不认我的
+        # key」,不是一次推理,session 头(运行时按 endpoint 派生的进程级路由亲和 ID)在这
+        # 里没有作用;真校验模型的 probe_chat 才按运行时同头发。别"顺手收敛"成半对齐。
         async with httpx.AsyncClient(timeout=_TIMEOUT) as client:
             r = await client.get(
                 f"{base}/models", headers={"Authorization": f"Bearer {api_key}"}
