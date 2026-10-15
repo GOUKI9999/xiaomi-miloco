@@ -23,6 +23,15 @@ class _FakeAdapter:
     def build_audio_block(self, audio_base64, media):
         return {"type": "input_audio", "input_audio": {"data": audio_base64}}
 
+    def build_image_block(self, data):
+        # 复刻生产基类 OmniProviderAdapter.build_image_block 的形态:JPEG data URI,
+        # 下方 _jpeg_payload 据此把 base64 解回原始字节、逐帧核对序列顺序。
+        b64 = base64.b64encode(data).decode()
+        return {
+            "type": "image_url",
+            "image_url": {"url": f"data:image/jpeg;base64,{b64}"},
+        }
+
 
 def _payload(**overrides):
     payload = {

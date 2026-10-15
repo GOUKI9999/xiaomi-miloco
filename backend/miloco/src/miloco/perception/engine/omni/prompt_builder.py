@@ -1255,7 +1255,9 @@ def _build_fused_user_content(
             raise ValueError("image_prepared is required with image_frames")
         content.append({"type": "text", "text": _image_sequence_note(image_prepared)})
         for image_frame in image_frames:
-            content.append(_jpeg_block(image_frame.data))
+            # 图块形态下沉 adapter(与同段的 video/audio 一致);EncodedImageFrame.data
+            # 已在 _encode_image_frames 出厂时过 _MIN_JPEG_BYTES 闸,故此处无需再校验。
+            content.append(adapter.build_image_block(image_frame.data))
         if image_audio_b64:
             content.append(adapter.build_audio_block(
                 image_audio_b64, _audio_only_media_info(image_audio_sample_rate)

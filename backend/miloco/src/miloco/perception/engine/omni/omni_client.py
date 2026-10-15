@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import base64
 import json
 import logging
 import os
@@ -408,12 +407,8 @@ def _build_messages(payload: dict, adapter: OmniProviderAdapter) -> list[dict]:
         for frame in image_frames:
             # 生产侧恒为 _encode_image_frames 产出的 EncodedImageFrame。bytes 过不了 JSON,
             # 所以不存在"序列化回来变成 dict"这条路 —— 不留 dict 兜底, 免得测试拿裸 dict
-            # 把真实那条分支绕过去。
-            data = frame.data
-            content.append({
-                "type": "image_url",
-                "image_url": {"url": f"data:image/jpeg;base64,{base64.b64encode(data).decode()}"},
-            })
+            # 把真实那条分支绕过去。图块形态由 adapter 决定(与 video/audio 一致下沉)。
+            content.append(adapter.build_image_block(frame.data))
     elif payload.get("video_base64"):
         media_info = payload.get("video_media_info", payload.get("media_info"))
         content.append(adapter.build_video_block(payload["video_base64"], media_info))
