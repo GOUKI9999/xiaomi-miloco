@@ -567,8 +567,10 @@ export type PerfBucket = "1m" | "5m" | "1h" | "1d";
 /** /api/stats?metric=summary 返回。 */
 export interface PerfSummary {
   cycle_count: number;
-  /** 窗口内因跳过旧窗口或清理积压而未处理的窗口数。与 cycle_count 之和为收到的任务总数。 */
+  /** 窗口内因 buffer 丢弃、跳过旧窗口或清理积压而未处理的窗口数。与 cycle_count 之和为收到的任务总数。 */
   dropped_count: number;
+  /** 窗口内实际处理的设备窗口数。 */
+  processed_device_window_count: number;
   skip_rate: number;
   drop_rate: number;
   omni_error_rate: number;
