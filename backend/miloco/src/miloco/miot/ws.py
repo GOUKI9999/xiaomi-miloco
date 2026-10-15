@@ -17,7 +17,8 @@ from miot.types import MIoTCameraCodec
 
 from miloco.manager import get_manager
 from miloco.miot.transcoder import H264LiveEncoder
-from miloco.utils.common import cam_tag, safe_log
+from miloco.utils.common import safe_log
+from miloco.utils.logger import cam_tag
 
 if TYPE_CHECKING:
     import numpy as np

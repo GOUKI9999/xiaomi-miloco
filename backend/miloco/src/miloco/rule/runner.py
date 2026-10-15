@@ -2145,7 +2145,14 @@ class RuleRunner:
         is_prop, siid, p_a_id = parsed
 
         # Idempotent check: query current state, skip if already at target.
-        if action.idempotent and is_prop and action.value is not None:
+        # 降级态跳过该预检：那一趟查询注定失败，动作随后又会被闸门拒掉，预检就
+        # 只剩「每次先打一趟云端、再留一条无信息量的 warning」这点副作用。
+        if (
+            action.idempotent
+            and is_prop
+            and action.value is not None
+            and self._miot_proxy.is_operational
+        ):
             try:
                 results = await self._miot_proxy.get_device_properties(
                     [MIoTGetPropertyParam(did=action.did, siid=siid, piid=p_a_id)]

@@ -38,6 +38,7 @@ def _proxy(*, degraded: bool):
         p._auth_health = health
 
     sent: list[str] = []
+    client = MagicMock()
     http = MagicMock()
 
     async def _set_props(_params):
@@ -52,10 +53,12 @@ def _proxy(*, degraded: bool):
         sent.append("save_text")
         return "n1"
 
-    http.set_props_async = _set_props
-    http.action_async = _action
+    # 按代理层的实际调用点装：下发走 SDK 客户端本身，推送「先把文本存上去换通知 id」
+    # 那一步仍从它下面的 http_client 走。装错一层不会报错，只会让 await 拿到一个
+    # 非可等待的 MagicMock——除非把未失效那条路也跑一遍，否则看不出来。
+    client.set_props_async = _set_props
+    client.action_async = _action
     http.create_app_notify_async = _save_text
-    client = MagicMock()
     client.http_client = http
 
     async def _run_scene(scene_info=None):
@@ -285,6 +288,152 @@ async def test_discover_survives_transient_failure():
     assert asked == ["get_cameras"], "瞬时故障不该让感知停下"
 
 
+# ─────────────── 缓存为空的读取点：降级态别去自刷新 ───────────────
+#
+# 这一类入口自己不碰客户端（结构守卫因此看不到它们，见 _cloud_facing_methods
+# 里的盲点说明），却会在本地缓存为空时顺手调一次 refresh_*。降级 / 未绑定之后
+# 那一次就不该再打：未绑定那半边没有令牌可问，降级那半边是凭据判死之后不再问
+# 云端（手上那枚访问令牌未必已作废，见 check_token_valid 的说明）。别把「读取
+# 路径不加闸门」读成「读取点一概不管」：不管的是**已经缓存好了**的读取，缓存
+# 为空时的自刷新是另一回事。
+
+
+#: 这一类入口的**登记表**：``(取数入口, 缓存属性, 刷新方法, 空值)``。空值跟着入口
+#: 的形状走 —— 三个集合类入口是 dict，``get_user_info`` 是单个对象（空即 None）；
+#: 非空样本由 :func:`_nonempty_like` 从空值推出来，免得同一个形状要手写两遍。新增
+#: 一个同形状入口时要一并登记，否则它就落在下面三条用例之外，而上面那处盲点说明
+#: 会继续声称「这一类都由行为测试钉住」。
+_READ_POINTS = [
+    pytest.param(
+        "get_devices", "_device_info_dict", "refresh_devices", {}, id="devices"
+    ),
+    pytest.param(
+        "get_all_scenes", "_scene_info_dict", "refresh_scenes", {}, id="scenes"
+    ),
+    pytest.param(
+        "get_cameras", "_camera_info_dict", "refresh_cameras", {}, id="cameras"
+    ),
+    pytest.param(
+        "get_user_info", "_user_info", "refresh_user_info", None, id="user_info"
+    ),
+]
+
+
+def _nonempty_like(blank):
+    """按登记表里的空值造一个真值样本，形状跟着入口走。
+
+    集合类入口空是 ``{}``，非空就是有键；``get_user_info`` 空是 ``None``，非空就是
+    一个对象。手写第二列会让「空值」与「样本」两处各写各的，而它们本该是同一个
+    形状的两个取值。
+    """
+    return MagicMock() if blank is None else {**blank, "x": MagicMock()}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("getter, cache_attr, refresher, blank", _READ_POINTS)
+async def test_empty_cache_read_does_not_self_refresh_when_degraded(
+    getter, cache_attr, refresher, blank
+):
+    """缓存为空 + 降级态：不去打云端，把手上的那份空值原样返回。
+
+    降级之后本就不该再问云端（未绑定那半边更是没有令牌可问），这一趟的唯一产出是
+    给云端添一次请求、再给日志添一行。返回值刻意与刷新失败时相同（空 dict / None），
+    不新增第三种状态，调用方不必去分辨。
+
+    断言比的是 `is blank` 而不是真假值：空值这一列是有形状的（集合入口是空 dict、
+    账号身份是 None），而调用方正是按形状用的——`get_devices` 的返回值会被直接
+    ``.get(did)``，换成 None 当场 AttributeError。所以「原样返回」这句要真被钉住。
+    """
+    p, _ = _proxy(degraded=True)
+    setattr(p, cache_attr, blank)
+    called: list[str] = []
+
+    async def _refresh(*_a, **_kw):
+        called.append(refresher)
+
+    setattr(p, refresher, _refresh)
+
+    assert await getattr(p, getter)() is blank, "降级态拿到的是手上那份空值，形状不变"
+    assert called == [], f"{getter} 在降级态下不该自刷新"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("getter, cache_attr, refresher, blank", _READ_POINTS)
+async def test_empty_cache_read_still_self_refreshes_when_healthy(
+    getter, cache_attr, refresher, blank
+):
+    """反向：正常态下缓存为空仍要自刷新——闸门不能把这条路一起关掉。
+
+    与上一条成对：只验「降级时不刷新」的话，把判据写成无条件的「缓存空就不刷新」
+    同样是绿的，而那样这条入口就再也不会自己补缓存——只剩启动那趟
+    refresh_miot_info 与各显式刷新往里填，缓存空着的那段时间读到的一直是空值，
+    而凭据其实是好的。
+    """
+    p, _ = _proxy(degraded=False)
+    setattr(p, cache_attr, blank)
+    called: list[str] = []
+
+    async def _refresh(*_a, **_kw):
+        called.append(refresher)
+
+    setattr(p, refresher, _refresh)
+
+    await getattr(p, getter)()
+    assert called == [refresher], f"{getter} 正常态下应当自刷新"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("getter, cache_attr, refresher, blank", _READ_POINTS)
+async def test_degraded_read_serves_what_is_already_cached(
+    getter, cache_attr, refresher, blank
+):
+    """降级态下**已有**的缓存照常返回——闸门只挡「缓存为空时去云端」这一件事。
+
+    把读取点整个判成「降级即空」，会让感知在授权失效那一刻丢掉全部已知设备，而
+    那些信息本来就在本地、且是对的。上面两条只验空缓存的两种走向，这条验反面。
+    """
+    p, _ = _proxy(degraded=True)
+    cached = _nonempty_like(blank)
+    assert cached, "样本要是真值，才验得到「照常给」这一档"
+    setattr(p, cache_attr, cached)
+    called: list[str] = []
+
+    async def _refresh(*_a, **_kw):
+        called.append(refresher)
+
+    setattr(p, refresher, _refresh)
+
+    got = await getattr(p, getter)()
+    assert got is cached, "缓存里有的东西照常给，不该因为降级就丢掉"
+    assert called == [], "缓存非空，本来也不该去刷新"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("getter, cache_attr, refresher, blank", _READ_POINTS)
+async def test_empty_cache_read_does_not_self_refresh_when_unbound(
+    getter, cache_attr, refresher, blank
+):
+    """未绑定（没有凭据、也没降级）同样不自刷新——闸门的另一半。
+
+    ``is_operational`` 是两个来源的合取：凭据在不在，以及有没有被判死。上面几条只
+    实例化了后一半，把判据折成「只要没降级就刷新」时它们仍会全绿。而未绑定是首次
+    安装与解绑之后的常见常驻状态，缓存一空就每调一次白跑一趟刷新——没有令牌可问，
+    ``get_user_info`` 那条 GET 还会把空令牌的请求真发出去。
+    """
+    p, _ = _proxy(degraded=False)
+    p._oauth_info = None  # 与降级相互独立的那一半
+    setattr(p, cache_attr, blank)
+    called: list[str] = []
+
+    async def _refresh(*_a, **_kw):
+        called.append(refresher)
+
+    setattr(p, refresher, _refresh)
+
+    assert await getattr(p, getter)() is blank, "未绑定态同样只回手上那份空值"
+    assert called == [], f"{getter} 未绑定时不该自刷新"
+
+
 # ─────────────── 结构性守卫：下发面别再漏一条 ───────────────
 #
 # 闸门收在代理层是对的，但「逐个方法去加」本身就是会漏的做法——通知的第一步
@@ -324,24 +473,37 @@ MUST_NOT_BE_GATED = {
     "refresh_devices": "拉设备列表",
     "refresh_scenes": "拉场景列表",
     "_get_camera_instance": "建相机实例",
+    "_create_camera_img_manager": "建相机图片管理器",
     "_sync_meta_subscriptions": "同步设备元信息订阅",
-    "_sync_camera_state_subscriptions": "同步设备状态订阅",
+    "_sync_device_state_subscriptions": "同步设备状态订阅",
+    "_sync_props_subscriptions": "同步设备属性订阅",
+    "reconnect_camera": "单台相机重建原生会话——救僵尸连接的自愈路径，而感知侧在更上层已按「能不能用」判过",
+    "_on_camera_status_changed": "相机状态回调：写回缓存并反向同步给局域网层，与其它推送回调同类",
     "_sync_scene_subscriptions": "同步场景订阅",
+    "_on_user_bind_event": "转发绑定与解绑推送，并据此补订退订",
     "init": "初始化与回调注册",
     "deinit": "反初始化",
 }
 
 
 def _reaches_cloud(fn: ast.AST) -> bool:
-    """这个方法体里有没有对 ``self.(_)miot_client...`` 的调用。
+    """这个方法体里有没有碰到 ``self.(_)miot_client`` 下面的东西。
 
     按结构判而不按名字判：名字判会漏掉 ``get_miot_app_notify_id`` 这种「叫
     get_、其实往云端写」的。
+
+    只要**引用**到就算，不要求它在这里被调用——SDK 的方法可以当可调用对象传给
+    别处再调（订阅同步就是这么写的），只认 ``Call`` 节点的话，
+    ``f = self._miot_client.http_client.set_props_async`` 紧跟 ``await f(...)``
+    这种写法会整个漏过去。宁可把「引用了但没调」的也算进来、多问一次归类。
+
+    要的是「引用到客户端的**成员**」，从 ``node.value`` 起判即要求至少一层成员
+    访问：单纯持有或原样返回客户端（构造函数里赋值、属性取值器）不算碰云端。
     """
     for node in ast.walk(fn):
-        if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)):
+        if not isinstance(node, ast.Attribute):
             continue
-        probe = node.func.value
+        probe = node.value
         while isinstance(probe, ast.Attribute):
             if (
                 isinstance(probe.value, ast.Name)
@@ -363,7 +525,26 @@ def _has_gate(fn: ast.AST) -> bool:
 
 
 def _cloud_facing_methods() -> dict[str, bool]:
-    """``{方法名: 有没有闸门}``，只收会打到云端的那些。"""
+    """``{方法名: 有没有闸门}``，只收会打到云端的那些。
+
+    扫的范围是代理类自己。这道守卫成立的前提是「走云端的下发都汇到代理层」——
+    若哪天有条下发绕开代理直接打云端，它落在本守卫的视野之外，得靠把下发收回
+    代理层来维持，而不是靠扩大这里的扫描面。
+
+    **另一处盲点，且是已知的**：判据是「方法体里引用了 ``self._miot_client`` 的
+    成员」，于是那些**自己不碰客户端、只读本地缓存、缓存空了才转手调 ``refresh_*``**
+    的入口整类扫不到——``get_devices``、``get_all_scenes``、``get_cameras``、
+    ``get_user_info`` 都是这个形状，它们走到云端的那一步发生在被调用的 ``refresh_*``
+    里面，而 ``refresh_*`` 属读取路径、按 ``MUST_NOT_BE_GATED`` 的理由不加闸门。
+    所以下面这份清单是**闭合断言**（扫到的每一个都要归类），不是覆盖断言（所有会
+    走云端的方法都会被扫到）——它保证不了「没归类的都不碰云端」。
+
+    这类入口的边界由行为测试钉住：「缓存为空的读取点」那一节的 ``_READ_POINTS``
+    把上面点名的每一个都登记进去（``get_user_info`` 也在内）—— 这张表就是这句话
+    的凭据，新增同形状入口要一并加进去，否则它落在用例之外而这里仍在声称已覆盖。
+    要改成本守卫能覆盖，得让 ``_reaches_cloud`` 走一遍被调方法的传递闭包；那会把
+    一批本来无需归类的内部方法一起卷进来，代价大于收益，因此不做。
+    """
     src = Path(inspect.getsourcefile(MiotProxy)).read_text()
     cls = next(
         n

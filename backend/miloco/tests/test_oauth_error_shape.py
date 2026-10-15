@@ -727,7 +727,7 @@ def test_cam_tag_actually_strips_newlines():
     是裸的）。这种按名字的信任只有在「名字背后的行为被钉住」时才成立：否则把它
     内部的清洗去掉，护栏照样全绿，而外部可控的相机标识就一路裸进日志了。
     """
-    from miloco.utils.common import cam_tag as _cam_tag
+    from miloco.utils.logger import cam_tag as _cam_tag
 
     hostile = "cam-1\n2026-01-01 00:00:00 - root - INFO - 伪造的日志行"
     out = _cam_tag(hostile, 0)

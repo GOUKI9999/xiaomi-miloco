@@ -5,7 +5,8 @@
   连带把感知侧的相机全部断开
 - 超时 / 连接失败 / 5xx / 响应体不合法 = 瞬时故障，只累计次数，不进降级态
 - 401 与响应体带 ``error`` 字段（如 96009）= 凭据被云端拒绝，立刻进降级态
-- 任何一次刷新成功、或用户重新授权成功，都无条件回到 OK
+- 任何一次刷新成功、或用户重新授权成功，都无条件回到 OK；唯一例外是「新令牌
+  没能落库」——那一档只在库里记降级，内存不动
 - 同状态内的重复失败日志按间隔限频，状态迁移那条不限频
 - 定时检查对瞬时故障会退避重试；对凭据失效立刻停手
 - 降级态落 KV，进程重启后仍然可读
@@ -46,6 +47,26 @@ class _FakeKV:
     def delete(self, key: str) -> bool:
         self._store.pop(key, None)
         return True
+
+
+class _FailingKV(_FakeKV):
+    """可以在指定 key 上写失败的 KVRepo，并记下写入次序。
+
+    真实 KVRepo 的失败是**整库级**的（sqlite 异常、affected_rows<=0），不存在
+    「只写不进这个 key」。按键模拟只是为了把「令牌没落库」那个分支单独挑出来，
+    真实世界里它多半伴随健康度也写不进去——那条边界另有用例钉住。
+    """
+
+    def __init__(self, initial: dict[str, str] | None = None):
+        super().__init__(initial)
+        self.fail_on: set[str] = set()
+        self.set_calls: list[str] = []
+
+    def set(self, key: str, value: str) -> bool:
+        self.set_calls.append(key)
+        if key in self.fail_on:
+            return False
+        return super().set(key, value)
 
 
 def _make_proxy(kv: _FakeKV, *, expires_in: int = 600):
@@ -380,6 +401,71 @@ def test_corrupt_stored_state_falls_back_to_ok():
     kv = _FakeKV({AuthConfigKeys.MIOT_AUTH_STATE_KEY: "not-json"})
     proxy = _make_proxy(kv)
     assert proxy.auth_health.state is MiotAuthState.OK
+
+
+def test_token_persist_failure_marks_the_stored_credentials_stale():
+    """令牌没落库时，往**库里**记一笔降级，内存不动。
+
+    库里那对凭据仍是旧的、已被云端作废，重启后读到降级才不会拿着死令牌顶着「一切
+    正常」跑；而手上这枚新令牌是真的，进程该继续拿它跑——所以内存那份健康度不能跟
+    着被拉下去，否则这一轮刷新就白换了。
+    """
+    from miot.types import MIoTOauthInfo
+
+    kv = _FailingKV()
+    proxy = _make_proxy(kv)
+    kv.fail_on.add(AuthConfigKeys.MIOT_TOKEN_INFO_KEY)
+
+    proxy.reset_miot_token_info(
+        MIoTOauthInfo(access_token="new", refresh_token="nrt", expires_ts=9999999999)
+    )
+
+    assert proxy.is_operational, "手上这枚新令牌可用，进程不该停"
+    assert proxy._oauth_info.access_token == "new", "内存要用上刚换来的令牌"
+    stored = json.loads(kv.get(AuthConfigKeys.MIOT_AUTH_STATE_KEY))
+    assert stored["state"] == "degraded", "库里那对凭据已作废，重启后要照实说"
+
+
+def test_token_is_persisted_before_the_health_is_committed():
+    """先落令牌、后提交 OK——次序反过来会留下「库里一切正常 + 一枚死令牌」。"""
+    from miot.types import MIoTOauthInfo
+
+    kv = _FailingKV()
+    proxy = _make_proxy(kv)
+    assert kv.set_calls == [], "前置：构造过程不写库"
+
+    proxy.reset_miot_token_info(
+        MIoTOauthInfo(access_token="new", refresh_token="nrt", expires_ts=9999999999)
+    )
+
+    assert kv.set_calls == [
+        AuthConfigKeys.MIOT_TOKEN_INFO_KEY,
+        AuthConfigKeys.MIOT_AUTH_STATE_KEY,
+    ], "令牌必须先于健康度落库"
+    assert json.loads(kv.get(AuthConfigKeys.MIOT_AUTH_STATE_KEY))["state"] == "ok"
+
+
+def test_token_persist_failure_with_the_whole_kv_down_leaves_it_untouched():
+    """整库写不进去时两次 ``set`` 都失败，库里停在原样。
+
+    真实 KVRepo 的失败是整库级的（sqlite 异常、affected_rows<=0），不存在「只写不
+    进令牌、写得进健康度」。这一格上面那条修法覆盖不到——它只收窄窗口，没消除——
+    钉住它是为了别把说明写成「不一致已经消掉」。
+    """
+    from miot.types import MIoTOauthInfo
+
+    kv = _FailingKV()
+    proxy = _make_proxy(kv)
+    kv.fail_on.update(
+        {AuthConfigKeys.MIOT_TOKEN_INFO_KEY, AuthConfigKeys.MIOT_AUTH_STATE_KEY}
+    )
+
+    proxy.reset_miot_token_info(
+        MIoTOauthInfo(access_token="new", refresh_token="nrt", expires_ts=9999999999)
+    )
+
+    assert proxy.is_operational, "内存不受影响"
+    assert kv.get(AuthConfigKeys.MIOT_AUTH_STATE_KEY) is None, "库里没被写进任何东西"
 
 
 # ─────────────── 定时检查的重试 ───────────────
@@ -883,6 +969,60 @@ async def test_transient_failure_is_not_cached():
 
 
 @pytest.mark.asyncio
+async def test_unbound_check_never_touches_the_cloud():
+    """手上没有令牌时不问云端——这是本地就能定论的确定状态。
+
+    未绑定（首次安装、解绑后未重绑）是常见的**持久**状态，而这条检查被界面按固定
+    间隔轮询；不早退就是每个周期一次注定无效的云端往返。否定结论又只在降级态才进
+    缓存，那趟往返连合并都谈不上。
+    """
+    kv = _FakeKV()
+    proxy = _make_proxy(kv)
+    proxy._oauth_info = None
+    calls: list[int] = []
+
+    async def _check():
+        calls.append(1)
+        return False
+
+    proxy._miot_client.check_token_async = _check
+
+    assert await proxy.check_token_valid() is False
+    assert await proxy.check_token_valid() is False
+
+    assert calls == [], "未绑定时不该打云端"
+    assert proxy._token_valid_cache is None, "确定结论不必进缓存"
+
+
+@pytest.mark.asyncio
+async def test_degraded_check_still_asks_the_cloud():
+    """降级态**仍要**问云端——别把上面那条早退放宽成「不可用就短路」。
+
+    凭据还在、只是续期被云端拒了的时候，这枚访问令牌可能尚未到期、云端还认；「已
+    绑定 + 凭据已失效」这个组合正是靠这次校验才在界面上分得出来。一并短路掉，面板
+    会在这段时间里显示「一切正常」。与上一条成对：只验「未绑定要早退」，把判据放宽
+    成「``is_operational`` 为假就早退」同样是绿的。
+    """
+    kv = _FakeKV()
+    proxy = _make_proxy(kv)
+    health, _ = proxy._auth_health.mark_failure(
+        permanent=True, code=-10021, message="invalid refresh token"
+    )
+    proxy._auth_health = health
+    assert proxy.is_authenticated and not proxy.is_operational, "前置：凭据在、已降级"
+    calls: list[int] = []
+
+    async def _check():
+        calls.append(1)
+        return True
+
+    proxy._miot_client.check_token_async = _check
+
+    assert await proxy.check_token_valid() is True
+    assert len(calls) == 1, "降级态仍要问云端"
+
+
+@pytest.mark.asyncio
 async def test_rebinding_drops_a_pending_verification():
     """重绑之后不该再「验一次」——它走的是授权那条路，不经过定时检查。
 
@@ -909,7 +1049,8 @@ async def test_rebinding_drops_a_pending_verification():
 
 @pytest.mark.asyncio
 async def test_refresh_releases_the_lock_before_the_cleanup():
-    """令牌落库之后临界区就结束了：善后不许还占着与扫码授权共用的那把锁。
+    """善后跑在临界区之外：与扫码授权共用的那把锁，到「换票 + 落库，以及 SDK
+    换票调用内部的收尾（取身份、下发新令牌）」为止，其后那趟全量拉取不再占着它。
 
     占着的话，住户恰好这时提交扫码拿到的授权码，要排队等「睡一会儿 + 全量拉取」
     跑完——设备多的家里是好几秒到十几秒，而那个码是一次性且有有效期的。
@@ -940,9 +1081,10 @@ async def test_refresh_releases_the_lock_before_the_cleanup():
 async def test_authorize_releases_the_lock_before_the_cleanup():
     """授权这条路的善后同样不许占着与定时续期共用的那把锁。
 
-    与续期那一侧同一条边界：锁只护到令牌落库为止，其后那一趟全量拉取（身份 /
-    设备 / 相机 / 场景）与凭据正确性无关。两条路各自有用例，是因为它们是两个
-    独立的入口——只钉一条，另一条改回锁内不会有任何反应。
+    与续期那一侧同一条边界：到「换票 + 落库，以及 SDK 换票调用内部的收尾（取
+    身份、下发新令牌）」为止，其后那一趟全量拉取（身份 / 设备 / 相机 / 场景）
+    与凭据正确性无关。两条路各自有用例，是因为它们是两个独立的入口——只钉一条，
+    另一条改回锁内不会有任何反应。
     """
     from miot.types import MIoTOauthInfo
 

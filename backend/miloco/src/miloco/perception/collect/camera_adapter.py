@@ -252,6 +252,8 @@ class CameraDeviceAdapter(BaseDeviceAdapter):
         ``online_only`` / ``require_lan`` / ``cap`` 同理也是透传生效的——基类
         重算保留集用的 ``require_lan=False, cap=False`` 正是这条不变量的实现。）
         """
+        # 判据用「能不能用」而不是「有没有绑」：凭据还在、但云端已经拒绝续期时，
+        # 拉相机列表必然 401，接着按空集把已连相机全断开——那正是本轮要停下的场景。
         if all_devices is None and self._miot_proxy.is_operational:
             await self._check_stalled_cameras()
             try:

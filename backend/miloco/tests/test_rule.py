@@ -402,6 +402,57 @@ async def test_ordinary_failure_is_still_logged_as_an_error(
     )
 
 
+@pytest.mark.asyncio
+async def test_degraded_auth_skips_the_idempotent_precheck(
+    runner, monkeypatch, mock_miot_proxy
+):
+    """降级态跳过幂等预检——那一趟查询注定失败，动作随后又会被闸门拒掉。
+
+    预检在这时只剩副作用：给云端添一次注定被拒的请求，再给日志添一行「Idempotent
+    check failed」。判定因此排在查询之前。
+    """
+    from unittest.mock import AsyncMock as _AM
+
+    from miloco.rule.schema import RuleAction
+
+    monkeypatch.setattr("miloco.miot.service._write_action_ledger", _AM())
+    mock_miot_proxy.is_operational = False
+
+    action = RuleAction(did="dev1", iid="prop.2.1", value=True, idempotent=True)
+    await runner._execute_action("rule-9", action)
+
+    assert not mock_miot_proxy.get_device_properties.called, (
+        "降级态不该再打一趟注定失败的查询"
+    )
+
+
+@pytest.mark.asyncio
+async def test_healthy_auth_still_runs_the_idempotent_precheck(
+    runner, monkeypatch, mock_miot_proxy
+):
+    """反向：正常态下幂等预检照常——闸门不能把「已经到位就跳过」一起关掉。
+
+    与上一条成对：只验「降级时跳过」的话，把预检整段删掉同样是绿的，而那样每次
+    命中都会白下发一次，还会把 cooldown 一并重置。
+    """
+    from unittest.mock import AsyncMock as _AM
+
+    from miloco.rule.schema import RuleAction
+
+    monkeypatch.setattr("miloco.miot.service._write_action_ledger", _AM())
+    mock_miot_proxy.is_operational = True
+    mock_miot_proxy.get_device_properties = _AM(
+        return_value=[{"code": 0, "value": True}]
+    )
+
+    action = RuleAction(did="dev1", iid="prop.2.1", value=True, idempotent=True)
+    result = await runner._execute_action("rule-9", action)
+
+    assert mock_miot_proxy.get_device_properties.called, "正常态要查当前值"
+    assert result.skipped is True, "已经到位就不再下发"
+    assert not mock_miot_proxy.set_device_properties.called
+
+
 def _make_duration_rule(rule_id, duration_seconds):
     """STATE duration 规则；on_enter_desc 让 slot 非空。sample_interval 默认 3s，
     duration_seconds=3 → maxlen=1（首帧即达标 FIRED）；=6 → maxlen=2（首帧 COUNTING）。"""

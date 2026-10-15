@@ -49,17 +49,3 @@ def safe_log(value: Any) -> str:
     if value is None:
         return "None"
     return str(value).replace("\r\n", " ").replace("\r", " ").replace("\n", " ")
-
-
-def cam_tag(camera_id: str, channel: int) -> str:
-    """把「相机 + 通道」拼成一个可入日志的标识。
-
-    这两个值在日志里总是成对出现、指的是同一路码流，拼一次比每处都写 ``%s.%d``
-    整齐，也让格式串少一个占位符——而「数值占位符配上字符串实参」这种会让整行日志
-    在运行期被整条吞掉的错配，在结构上就不可能发生了。顺带剥掉换行：相机标识是路径
-    参数、外部可控，而拼接之后就分不出哪一段来自请求，所以在这里剥而不在各个日志点包。
-
-    与 :func:`safe_log` 同处一个公共模块：要打这一对值的入口层与服务层分属不同包，
-    谁都不该去 import 对方的私有名字，清洗也就近复用、不必另开一条。
-    """
-    return safe_log(f"{camera_id}.{channel}")

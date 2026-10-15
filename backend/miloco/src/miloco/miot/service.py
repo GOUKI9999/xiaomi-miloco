@@ -72,7 +72,8 @@ from miloco.miot.schema import (
     DeviceInfo,
     SceneInfo,
 )
-from miloco.utils.common import cam_tag, safe_log
+from miloco.utils.common import safe_log
+from miloco.utils.logger import cam_tag
 
 logger = logging.getLogger(__name__)
 
@@ -734,11 +735,17 @@ class MiotService:
                 # 算成功」被标成已对齐，属性订阅的门就开在一个空作用域上。
                 # 走 _ensure_home_selected 而不是 list_homes：后者会再触发一轮编排，
                 # 而我们此刻正拿着编排锁，asyncio.Lock 不可重入
-                await self._ensure_home_selected()
-                # 换账号一定换掉了作用域，会话无条件重置。这件事在 list_homes 的兜底
-                # 选家分支里也有一份，改调 _ensure_home_selected 之后这条路断了，必须
-                # 在这里自己补 —— 不补的话旧账号的设备 / 房间 / 习惯会串进新账号
-                self._schedule_agent_session_reset()
+                _, home_changed = await self._ensure_home_selected()
+                # 会话重置跟着「作用域确实换了」走，两个来源都算：换了账号，或启用集
+                # 被这一趟兜底改写（原启用集与可见家庭没有交集，且这一趟至少看到一个
+                # 家）。两个条件缺一不可——一个家都看不到时兜底没有可选项、不动手，
+                # home_changed 仍是假，此时只剩「换了账号」那半边能触发。后一半是 main
+                # 在 list_homes 的兜底选家分支里原有的行为，改调 _ensure_home_selected
+                # 之后那条路断了，必须在这里自己补 —— 不补的话上一轮的设备 / 房间 /
+                # 习惯会串进新作用域。同账号重绑且家庭没换时不重置：那正是住户要保住
+                # 的上下文，白白丢掉只是损失。
+                if home_changed or not same_account:
+                    self._schedule_agent_session_reset()
                 # 同样，中枢 scope 刷新也在 list_homes 的兜底选家分支里有一份，走
                 # _ensure_home_selected 之后这条路同样断了，必须在这里自己补——不补的话
                 # 首登/换号时 _owned_group_ids 还停留在旧/空集，mDNS 发现的网关会被跳过，
@@ -749,7 +756,10 @@ class MiotService:
                     logger.warning(
                         "authorize_with_code central hub scope refresh failed: %s", e
                     )
-                # get_miot_auth_info 内部那次刷新跑在启用集还空着的时候，这里重来一遍
+                # 换账号那一支里，换票内部那次刷新跑在旧启用集下（新账号的相机会被
+                # 跳过），这里按新启用集重来一遍；同账号那一支它是幂等的 —— 除非上面
+                # 那趟兜底把启用集改了：那时内部那次刷新也是跑在旧集下，这一遍才把新
+                # 家的相机建起来。
                 await self._refresh_all_caches()
 
             await self._reset_state_scope(_rebuild)

@@ -1019,6 +1019,15 @@ class RuleService:
         from miloco.manager import get_manager
 
         manager = get_manager()
+        # 授权失效要排在查家庭之前判：降级态下设备表拉不回来、缓存也是空的，往下
+        # 走只会报「设备不在当前启用的家庭里」——那句话不假，但它把住户引向去改
+        # 家庭配置，而这件事需要他重新授权。与 `_validate_scene_ids` 同一口径。
+        if not manager.miot_proxy.is_operational:
+            raise MiotAuthUnavailableError(
+                manager.miot_proxy.refusal_reason("cannot check device home scope")
+                or "cannot check device home scope: Mi Home authorization is no"
+                " longer valid."
+            )
         # **`get_device_spec` 答不了作用域**: 它走 `get_devices()`, 那是账号全量, 过滤
         # 由各调用方自己做 (同文件的 control_device 就为此额外查了一次)。而容器的三条
         # 写入通道都按启用家庭过滤, 所以未启用家庭的设备那条叶子永远不进容器 —— 规则

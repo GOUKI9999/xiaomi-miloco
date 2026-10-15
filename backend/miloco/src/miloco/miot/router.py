@@ -40,8 +40,8 @@ from miloco.miot.ws import (
     miot_video_stream_manager,
 )
 from miloco.schema.common_schema import NormalResponse
-from miloco.utils.common import cam_tag as _cam_tag
 from miloco.utils.common import escape_for_js_string, safe_log
+from miloco.utils.logger import cam_tag as _cam_tag
 
 logger = logging.getLogger(name=__name__)
 
@@ -409,10 +409,10 @@ async def get_state_dump(
 ):
     """按 pattern 转储容器。比 stats 重、调用少，留一条 info 痕迹是合理的。"""
     logger.info(
-        "State dump API called, user=%s, pattern=%s, limit=%d",
+        "State dump API called, user=%s, pattern=%s, limit=%s",
         safe_log(current_user),
         safe_log(pattern),
-        limit,
+        safe_log(limit),
     )
     try:
         data = build_state_dump(manager.state_store, pattern, limit)

@@ -578,6 +578,13 @@ class MiotProxy:
 
         瞬时故障不在此列（见 :attr:`is_operational`）：一次超时就拒绝下发，会
         把可恢复的抖动变成可见的功能中断。
+
+        **「没绑定」与「绑着但凭据废了」分开说。** 判据是两个条件的与，而解绑会把
+        凭据清空、同时把健康度复位成全新的正常态——于是解绑之后判据为假、降级却
+        并没有发生。此时若照搬「授权已失效」，三处会同时错：文案让住户去「重新
+        绑定」一个他根本没绑的账号；台账的原因列写着凭据失效；而同一行的授权状态
+        列取的是健康度、写着正常，自相矛盾——网页台账页的失效角标恰好按那一列判，
+        于是住户看到的是一条毫无解释的失败记录。
         """
         reason = self.refusal_reason(what)
         if reason is None:
@@ -1101,7 +1108,10 @@ class MiotProxy:
             return None
 
     async def get_cameras(self) -> dict[str, MIoTCameraInfo]:
-        if not self._camera_info_dict:
+        # 降级 / 未绑定时不去打这一趟自刷新（同 cached_scenes 的注释），只回手上
+        # 已有的一份。显式刷新仍走 refresh_cameras，它不受这道闸门约束——恢复
+        # 路径正要靠它把授权修回来。
+        if not self._camera_info_dict and self.is_operational:
             logger.warning("No camera info dict found, refreshing cameras")
             await self.refresh_cameras()
         return self._camera_info_dict
@@ -1128,7 +1138,10 @@ class MiotProxy:
         return camera_dids
 
     async def get_devices(self) -> dict[str, MIoTDeviceInfo]:
-        if not self._device_info_dict:
+        # 降级 / 未绑定时不去打这一趟自刷新（同 cached_scenes 的注释），只回手上
+        # 已有的一份（空则 {}）——返回值与刷新失败时相同，不新增第三种状态。
+        # 显式刷新仍走 refresh_devices，它不在闸门之内。
+        if not self._device_info_dict and self.is_operational:
             await self.refresh_devices()
         return self._device_info_dict
 
@@ -2023,10 +2036,9 @@ class MiotProxy:
     def cached_devices(self) -> dict[str, MIoTDeviceInfo]:
         """已经在手的那份设备表——**不触发刷新**，纯内存读。
 
-        与 :meth:`get_devices` 的区别就在这一点，理由同 :attr:`cached_scenes`：
-        写一行台账要的是「手上已经知道什么」，为它去换一次注定 401 的请求，等于
-        住户每被拒一次就多一次无效云端调用。相机侧同款读取口是
-        :meth:`get_cached_camera`。
+        与 :meth:`get_devices` 的区别只在正常态成立，理由同 :attr:`cached_scenes`：
+        被拒的路径要的是「手上已经知道什么」，为写一行台账去换一次请求没有
+        必要。相机侧同款读取口是 :meth:`get_cached_camera`。
         """
         return self._device_info_dict
 
@@ -2034,15 +2046,23 @@ class MiotProxy:
     def cached_scenes(self) -> dict[str, MIoTManualSceneInfo]:
         """已经在手的那份场景表——**不触发刷新**，纯内存读。
 
-        与 :meth:`get_all_scenes` 的区别就在这一点：后者见缓存为空会去拉一次，
-        而降级态下那一次注定拿无效令牌打一趟云端、401 之后缓存依然为空。被拒的
-        路径要的是「手上已经知道什么」，为写一行台账去换一次必然失败的请求，等于
-        住户每点一次场景就多一次无效云端调用。
+        与 :meth:`get_all_scenes` 的区别只在正常态成立：后者见缓存为空会补一次
+        刷新，而降级 / 未绑定时那道自刷新已被 ``is_operational`` 挡住，两者等价。
+        显式表达「不刷新」的意图仍要留着——被拒的路径要的是「手上已经知道什么」，
+        为写一行台账去换一次请求没有必要。
+
+        「挡住的理由」有两半，别只记一半：未绑定那半边是没有令牌可问，刷新本就
+        无从谈起；降级那半边是凭据已被判死、此后不再问云端——那枚访问令牌未必
+        当场作废（见 :meth:`check_token_valid` 的说明），所以这里要的不是「反正
+        会失败」，而是不再发请求。少掉的东西与刷新失败时相同（空则 ``{}``）。
         """
         return self._scene_info_dict
 
     async def get_all_scenes(self) -> dict[str, MIoTManualSceneInfo] | None:
-        if not self._scene_info_dict:
+        # 同 get_devices：降级 / 未绑定时只回手上已有的一份（空则 {}），不为
+        # 填缓存去打这一趟云端。返回类型保持缓存本体，别改返 None——那会把
+        # 「空列表」变成调用侧的报错，是叠在闸门上的第二处变更。
+        if not self._scene_info_dict and self.is_operational:
             await self.refresh_scenes()
         return self._scene_info_dict
 
@@ -2089,8 +2109,23 @@ class MiotProxy:
         假，与「云端明确说不认」在返回值上分不出——那正是本模块通篇在分的两档。
         降级态下的失败注定还会失败，合并它零代价；而未降级时的失败多半是抖动，
         缓存住它，界面会被钉在「未连」整整一个窗口、住户手动刷新也绕不开。
+
+        **手上没有令牌时不进云端**：这是本地就能定论的确定状态，没有令牌可问，
+        那一趟注定无效。未绑定是常见的持久状态（首次安装、解绑后未重绑），而这
+        条检查是唯一被界面按固定间隔轮询的入口，不早退就是每个周期一次注定失败
+        的云端往返。判据与 :meth:`_check_and_refresh_token` 的早退同款。
+
+        **只覆盖「没有令牌」这一档，不含降级**：凭据还在、只是续期被云端拒了
+        的时候（``is_operational`` 为假而访问令牌尚未到期），这里仍要问云端并
+        可能得到真——「已绑定 + 已失效」这个组合正是靠它才在界面上分得出来，
+        一并短路掉会让面板在这段时间里显示「一切正常」。
         """
         token = self._oauth_info.access_token if self._oauth_info else None
+        if not token:
+            # 本地判据零成本、永远新鲜，也就不必进下面那层 TTL 缓存。
+            # 用 `not token` 而非 `_oauth_info is None`：顺带覆盖「记录在但
+            # access_token 是空串」的坏记录，与 SDK 自己的空令牌守卫同口径。
+            return False
         cached = self._token_valid_cache
         if (
             cached is not None
@@ -2125,7 +2160,16 @@ class MiotProxy:
             return None
 
     async def get_user_info(self) -> MIoTUserInfo | None:
-        if not self._user_info:
+        # 与设备 / 场景 / 相机三个读取入口同款：缓存为空才自刷新，且以「凭据可用」
+        # 为前置。降级说的是凭据被判死——续期被云端永久拒绝，或新令牌没能落库（见
+        # auth_state 的例外说明）——手上这枚访问令牌未必当场作废，所以这一趟理论上
+        # 仍有成功的余地；但判死之后这类读取路径就不该再空打云端（check_token_valid
+        # 与恢复路径是有意的例外），而这里少掉的东西与刷新失败时相同（None）：多数
+        # 调用方把它当空结果，get_miot_user_info 会转成明确的「取不到身份」异常，
+        # 与刷新失败走的是同一条路，不新增第三种状态。
+        # 恢复路径不走这里：refresh_miot_info 直接调 refresh_user_info，不受这道
+        # 前置约束。
+        if not self._user_info and self.is_operational:
             await self.refresh_user_info()
         return self._user_info
 
@@ -2160,9 +2204,11 @@ class MiotProxy:
         # 会各自向云端换一次令牌，后完成的那次把先完成的那枚顶掉。
         async with self._token_refresh_lock:
             oauth_info = await self._do_authorize(code, state)
-        # 善后搬到锁外，与续期那一侧同一条边界：锁只护到令牌落库为止，其后这一趟
-        # 全量拉取（身份 / 设备 / 相机 / 场景）与凭据正确性无关。留在锁内会让同期
-        # 那一轮定时续期干等这四趟请求。
+        # 善后搬到锁外，与续期那一侧同一条边界。临界区实际覆盖到「换票 + 落库」，
+        # 再加 SDK 换票调用内部的收尾：账号身份补拉（续期路径缺身份时、授权路径
+        # 必走）与把新令牌推给原生相机库、云端长连接 —— 这几步在 SDK 调用内部，
+        # 挪不出锁。其后这一趟全量拉取（身份 / 设备 / 相机 / 场景）与凭据正确性
+        # 无关，留在锁内会让同期那一轮定时续期干等这四趟请求。
         await self.refresh_miot_info()
         return oauth_info
 
@@ -2204,23 +2250,45 @@ class MiotProxy:
             logger.warning("Invalid stored auth health, falling back to ok: %s", e)
             return MiotAuthHealth()
 
-    def _set_auth_health(self, health: MiotAuthHealth) -> None:
-        self._auth_health = health
+    def _persist_auth_health(self, health: MiotAuthHealth) -> bool:
+        """把健康度写进 KV，**不动内存那份**。写成功返回 True。
+
+        与 :meth:`_set_auth_health` 拆开，是给 :meth:`reset_miot_token_info`
+        的落库失败分支用的：令牌没进库时，库里那对凭据仍是旧的、已被云端作废，
+        而内存这份是刚换来的、还能用——两边必须能分开写，不能顺手把内存也拉成
+        降级，那会让运行中的进程拿着一枚好令牌停摆。
+        """
         try:
-            self._kv_repo.set(
+            ok = self._kv_repo.set(
                 AuthConfigKeys.MIOT_AUTH_STATE_KEY, health.model_dump_json()
             )
         except Exception as e:
             # 落库失败只影响重启后的首屏判断，不该让刷新流程本身失败
             logger.warning("Failed to persist auth health: %s", e)
+            return False
+        if ok is False:
+            # 不查返回值的话，「没写成」与「写成了」在日志上分不出
+            logger.warning("Failed to persist auth health: KV set returned False")
+            return False
+        return True
+
+    def _set_auth_health(self, health: MiotAuthHealth) -> None:
+        self._auth_health = health
+        self._persist_auth_health(health)
 
     def reset_miot_token_info(self, miot_token_info: MIoTOauthInfo):
-        """落盘米家令牌，并把健康度一起复位。
+        """落盘米家令牌，落库成功才把健康度复位。
 
         令牌是一次性的，这个函数是「新令牌不丢」的最后一道关。内存先更新、库写
         失败也不抛：抛出去会被上层当成「刷新失败」，反而把「已经拿到新令牌」这个
         事实一起吞掉；而内存里那份至少还能撑到下次落盘或进程结束。写库失败按
         ERROR 记——它意味着重启后会退回旧令牌，是需要人看到的。
+
+        **健康度复位的次序由此定死：先落令牌，落库成功才提交 OK。** 反过来先写
+        OK、再落令牌，落库失败就留下「库里写着一切正常、库里那对凭据却已被云端
+        作废」——重启后系统拿着死令牌顶着正常态跑。失败时改为只在库里记一笔降级
+        （内存不动：手上这枚新令牌是真的，进程该继续拿它跑），重启后读到的是
+        「凭据待重新授权」，而不是一个看起来正常的死局。
 
         **健康度必须在这里复位，不能留在换票函数返回之后。** 这个函数的前提是
         「只有刚从云端换到新凭据才允许调它」——换票与续期都经落盘回调走到这里，
@@ -2237,7 +2305,6 @@ class MiotProxy:
         归零，加了判断反而会让计数在刷新成功后留着不清。
         """
         self._oauth_info = miot_token_info
-        self._set_auth_health(self._auth_health.mark_success())
         # 待验意向与健康度同处复位：这个函数的前提就是「刚从云端换到新凭据」，
         # 而上一轮结果未知这件事，到手一对新令牌之后已经无关了。清在这里而不是
         # 清在定时检查的成功出口，是因为重绑走的是授权那条路、不经过定时检查——
@@ -2256,7 +2323,19 @@ class MiotProxy:
                 "Mi Home token NOT persisted; a restart would fall back to the "
                 "previous token, which the cloud has already invalidated"
             )
+            # 库里那对凭据还是旧的、已被云端作废，手上这枚却是刚换来的、可用：
+            # 只把「库里那份不可信」写进库，内存不动。重启后因此读到「凭据待重新
+            # 授权」，而不是「一切正常 + 一枚死令牌」。代价：重绑同账号且库里旧
+            # 凭据仍有效时，重启会先停一下，要等旧访问令牌临期才有下一次刷新纠正。
+            self._persist_auth_health(
+                self._auth_health.mark_failure(
+                    permanent=True,
+                    code=None,
+                    message="new token not persisted; stored credentials are stale",
+                )[0]
+            )
             return
+        self._set_auth_health(self._auth_health.mark_success())
         logger.info(
             "Token information updated, new expiration time: %s",
             miot_token_info.expires_ts,
@@ -2303,10 +2382,11 @@ class MiotProxy:
             oauth_info = await self._do_refresh_token()
         if oauth_info:
             # 善后与凭据正确性无关，搬到锁外。这把锁是与扫码授权共用的（两者都整体
-            # 替换当前那对令牌，共用是对的），而令牌落库之后临界区就结束了：睡这
-            # 一会儿是等云端那边新令牌生效，全量拉取更是纯善后，设备多的家里要好几
-            # 秒到十几秒。留在锁内的话，住户恰好这时点「绑定小米账号」，提交的授权
-            # 码要排队等这一整轮跑完——而那个码是一次性且有有效期的。
+            # 替换当前那对令牌，共用是对的），而临界区到「换票 + 落库，含 SDK 换票
+            # 调用内部的收尾」为止：睡这一会儿是等云端那边新令牌生效，全量拉取更是
+            # 纯善后，设备多的家里要好几秒到十几秒。留在锁内的话，住户恰好这时点
+            # 「绑定小米账号」，提交的授权码要排队等这一整轮跑完——而那个码是一次性
+            # 且有有效期的。
             await asyncio.sleep(3)
             await self.refresh_miot_info()
         return oauth_info
