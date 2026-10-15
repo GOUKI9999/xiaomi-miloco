@@ -5,8 +5,11 @@ from unittest.mock import Mock
 
 import miot.decoder as decoder_module
 import numpy as np
+import pytest
 from miot.decoder import MIoTMediaDecoder
 from miot.types import MIoTCameraCodec
+
+pytestmark = pytest.mark.unit
 
 
 class _FakeLoop:
