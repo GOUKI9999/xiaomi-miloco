@@ -35,6 +35,7 @@ from miloco.perception.engine.identity.gallery_composite import (
     encode_png_bytes,
     hstack_to_height,
 )
+from miloco.perception.engine.identity.names import usable_person_name
 from miloco.perception.engine.types import IdentityPacket, IdentityTarget, OmniContext
 
 from .constants import (
@@ -268,9 +269,9 @@ def build_fused_payload(
 
     if label_lookup is None:
         label_lookup = {
-            pid: format_person_label(s.name, s.role)
+            pid: label
             for pid, s in gallery_snapshot.items()
-            if s.name
+            if (label := format_person_label(s.name, s.role)) is not None
         }
 
     # audio route：无视觉信息，候选作废。与 video 同款 message 隔离（待判断规则/只读历史
@@ -812,9 +813,8 @@ def _build_fused_user_content(
                         pid, samples.name, len(face_jpg), _MIN_JPEG_BYTES,
                     )
                     face_jpg = None
-                # 名册/gallery/输出统一用纯真名（角色上下文在「# 家庭档案」里）；
-                # name_to_pid 对纯名有 key，omni 输出 name 即可反查回 UUID
-                prepared.append((pid, samples.name or pid, body_jpg, face_jpg))
+                # 无可用姓名时仍展示 UUID，保留该成员的参考图。
+                prepared.append((pid, usable_person_name(samples.name) or pid, body_jpg, face_jpg))
 
             if give_up_reason is not None:
                 # 整 gallery 放弃 —— 不渲染 gallery 段，本窗口等价于无 gallery 主调用
@@ -1138,9 +1138,10 @@ def _build_context_parts(context: OmniContext, *, stream: bool = False) -> list[
 def format_person_label(name: str | None, role: str | None) -> str | None:
     """把真名 + 家庭角色拼成 prompt 显示标签：``真名(角色:爸爸)``；role 为空只显真名。
 
-    name 为空时返回 None，由调用方兜底为 person_id（理论上 backfill 后 name 必有）。
+    name 为空或全空白时返回 None；有效姓名保持原样。
     """
-    if not name:
+    name = usable_person_name(name)
+    if name is None:
         return None
     if role:
         return f"{name}(角色:{role})"

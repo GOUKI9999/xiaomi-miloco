@@ -691,18 +691,19 @@ class TestQueryMemberNames:
             assert "只有画面确认给出的 bbox 对应真人" in payload["system_prompt"]
             assert abs(self._video_color(payload) - color) < 8
 
-    @pytest.mark.parametrize("case", ["missing", "empty", "blank", "empty-library", "read-error", "unavailable", "disabled"])
+    @pytest.mark.parametrize("case", ["missing", "empty", "blank", "unicode-blank", "empty-library", "read-error", "os-error", "permission-error", "unavailable", "disabled"])
     async def test_missing_names_keep_query_and_generic_name_policy(self, entry, case, caplog):
         from miloco.perception.engine.identity.library import PersonRef
 
         make, library, build_library, omni = entry
-        if case in {"missing", "empty", "blank"}:
-            name = {"missing": None, "empty": "", "blank": "   "}[case]
+        if case in {"missing", "empty", "blank", "unicode-blank"}:
+            name = {"missing": None, "empty": "", "blank": "   ", "unicode-blank": "\u3000\t\n"}[case]
             library.list_persons.return_value = [PersonRef(self.member_id, name, None, True, 0)]
         elif case == "empty-library":
             library.list_persons.return_value = []
-        elif case == "read-error":
-            library.list_persons.side_effect = RuntimeError("private library detail")
+        elif case in {"read-error", "os-error", "permission-error"}:
+            error_type = {"read-error": RuntimeError, "os-error": OSError, "permission-error": PermissionError}[case]
+            library.list_persons.side_effect = error_type("private library detail")
         elif case == "unavailable":
             build_library.side_effect = RuntimeError("library unavailable")
         engine = make(disabled=case == "disabled")
@@ -723,9 +724,27 @@ class TestQueryMemberNames:
             library.list_persons.assert_called_once_with()
         if case == "disabled":
             build_library.assert_not_called()
-        if case == "read-error":
+        if case in {"read-error", "os-error", "permission-error"}:
             assert "Query name lookup failed" in caplog.text
+            assert f"error_type={error_type.__name__}" in caplog.text
             assert "private library detail" not in caplog.text
+            records = [r for r in caplog.records if "Query name lookup failed" in r.getMessage()]
+            assert len(records) == 1
+            assert records[0].exc_info is None
+            assert records[0].stack_info is None
+
+    @pytest.mark.parametrize("name", ["登记成员", " 登记成员 "])
+    async def test_valid_name_spelling_survives_query_entry(self, entry, name):
+        from miloco.perception.engine.identity.library import PersonRef
+
+        make, library, _, omni = entry
+        library.list_persons.return_value = [PersonRef(self.member_id, name, None, True, 0)]
+        result = await make().on_demand_perceive(self._batch(("study", "cam-first", 40)), "现在是谁？")
+
+        assert result.answer == "查询完成"
+        library.list_persons.assert_called_once_with()
+        omni.assert_awaited_once()
+        assert f"已确认成员线索：{name}[bbox=" in omni.await_args.args[0]["user_content"]
 
     @pytest.mark.parametrize("change", ["no-position", "recheck", "suppressed", "pending"])
     async def test_library_name_does_not_bypass_visual_identity_gates(self, entry, change):

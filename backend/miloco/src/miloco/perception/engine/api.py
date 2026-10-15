@@ -17,6 +17,7 @@ from typing import TYPE_CHECKING, Any
 import numpy as np
 from numpy.typing import NDArray
 
+from miloco.perception.engine.identity.names import build_name_lookup
 from miloco.perception.engine.identity.tier_u import cam_id_from_device_id
 from miloco.perception.engine_base import BasePerceptionEngine
 from miloco.perception.types import (
@@ -1207,13 +1208,13 @@ class PerceptionEngine(BasePerceptionEngine):
         name_lookup: dict[str, str] = {}
         if self._identity_lib is not None:
             try:
-                name_lookup = {
-                    ref.person_id: ref.name
-                    for ref in self._identity_lib.list_persons()
-                    if ref.name and ref.name.strip()
-                }
-            except Exception:  # noqa: BLE001
-                logger.warning("Query name lookup failed; continuing without member names")
+                name_lookup = build_name_lookup(self._identity_lib.list_persons())
+            except Exception as exc:  # noqa: BLE001
+                # 不附带异常消息或堆栈，避免泄露身份库数据。
+                logger.warning(
+                    "Query name lookup failed; error_type=%s; continuing without member names",
+                    type(exc).__name__,
+                )
 
         try:
             results = await run_query_pipeline(
