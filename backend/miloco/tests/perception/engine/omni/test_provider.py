@@ -158,13 +158,13 @@ class TestKimiAdapter:
         with pytest.raises(ValueError, match="Kimi.*does not support audio"):
             self.adapter.build_audio_block("BBBB", _AUDIO_MEDIA)
 
-    def test_kimi_k2_6_forces_supported_sampling_parameters(self):
+    def test_kimi_k2_6_omits_non_modifiable_sampling_parameters(self):
         body = self.adapter.build_request_body(
             _MESSAGES, model="kimi-k2.6",
             max_tokens=512, temperature=0.1, top_p=1.0, stream=False,
         )
-        assert body["temperature"] == 1.0
-        assert body["top_p"] == 0.95
+        assert "temperature" not in body
+        assert "top_p" not in body
         assert "thinking" not in body
 
     def test_other_kimi_models_passthrough_sampling(self):
@@ -183,6 +183,8 @@ class TestKimiAdapter:
         )
         assert body["stream"] is True
         assert body["stream_options"] == {"include_usage": True}
+        assert "temperature" not in body
+        assert "top_p" not in body
         assert "thinking" not in body
 
 
@@ -250,7 +252,7 @@ class TestKimiAdapterWireShape:
             })
 
     def test_wire_body_pairs_media_blocks_with_normalized_sampling(self):
-        """多模态与采样归一必须同时成立：媒体块就位 + k2.6 采样合法 + thinking 已删。"""
+        """多模态与 K2.6 默认采样必须同时成立：媒体块就位且受管字段省略。"""
         body = self._wire_body({
             "system_prompt": "你是助手",
             "user_content": "看这段视频",
@@ -258,8 +260,8 @@ class TestKimiAdapterWireShape:
             "media_info": _VIDEO_MEDIA,
             "crops": [],
         })
-        assert body["temperature"] == 1.0
-        assert body["top_p"] == 0.95
+        assert "temperature" not in body
+        assert "top_p" not in body
         assert "thinking" not in body
         # 多模态走 OpenAI 兼容族 endpoint，不该被转成 Gemini 原生协议
         assert "contents" not in body

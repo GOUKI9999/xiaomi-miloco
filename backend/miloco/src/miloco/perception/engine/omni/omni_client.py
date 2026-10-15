@@ -191,9 +191,8 @@ def _maybe_reset_breaker_on_config_change(resolved: OmniConfig) -> None:
 def _trace_inference_params(body: dict[str, Any], config: OmniConfig) -> dict[str, Any]:
     """取实际发出的采样参数用于 trace 上报（三条 omni 调用路径共用）。
 
-    adapter 可能改写采样参数（KimiAdapter 对 kimi-k2.6 强制 temperature=1 /
-    top_p=0.95），此时 config 值与 wire 值不同，trace 必须记 wire 值才是真实
-    推理条件；故优先读 body，缺键才回退 config。
+    adapter 可能改写或省略采样参数。显式出现在 body 中时 trace 记录
+    wire 值；provider 管理默认值或采用嵌套协议时，缺键回退 config 值。
 
     三条路径（``call_omni`` / ``call_omni_stream`` / ``_call_omni_messages``）同构
     重复这份 dict，抽成本函数消除「加字段要改三处、漏一处即静默不一致」的隐患。

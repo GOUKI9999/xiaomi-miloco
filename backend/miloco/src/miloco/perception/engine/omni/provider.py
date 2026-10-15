@@ -170,9 +170,9 @@ class MiMoAdapter(OpenAICompatAdapter):
 class KimiAdapter(MiMoAdapter):
     """Moonshot Kimi OpenAI-compatible adapter.
 
-    kimi-k2.6 currently accepts only temperature=1 and top_p=0.95.
-    Keep the generic Miloco settings for other providers, but normalize these
-    two fields for this model so both probe and runtime calls use valid values.
+    kimi-k2.6 manages its sampling defaults server-side and documents these
+    fields as non-modifiable.  Omit them for that model while preserving the
+    configured values for other Kimi models.
     """
 
     def build_video_block(self, video_base64: str, media: LocalMediaInfo) -> dict[str, Any]:
@@ -196,9 +196,6 @@ class KimiAdapter(MiMoAdapter):
         top_p: float,
         stream: bool = False,
     ) -> dict[str, Any]:
-        if "kimi-k2.6" in model.lower():
-            temperature = 1.0
-            top_p = 0.95
         body = super().build_request_body(
             messages,
             model=model,
@@ -207,8 +204,12 @@ class KimiAdapter(MiMoAdapter):
             top_p=top_p,
             stream=stream,
         )
-        # `thinking` is a MiMo-specific extension.  Kimi interprets an explicit
-        # disabled value as a different mode with incompatible sampling limits.
+        if "kimi-k2.6" in model.lower():
+            body.pop("temperature", None)
+            body.pop("top_p", None)
+        # Kimi supports `thinking`, but an explicit disabled value selects a
+        # non-thinking mode with different sampling constraints.  Omit it so
+        # Kimi uses its default thinking mode.
         body.pop("thinking", None)
         return body
 
