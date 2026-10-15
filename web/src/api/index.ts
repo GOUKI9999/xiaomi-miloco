@@ -9,6 +9,7 @@
 import * as realImpl from "./real";
 import type { BackendPropSpec } from "./real";
 import { apiFetch } from "./client";
+import { decodeGraphResponse } from "@/lib/graphDecode";
 import type {
   ActivityEvent,
   Device,
@@ -52,6 +53,8 @@ import type {
   OmniModelsResult,
   UpgradeCheck,
   UpgradeStatus,
+  GraphProtocolWarning,
+  GraphResponse,
 } from "@/lib/types";
 export type { ScopeHome };
 export type { BackendPropSpec };
@@ -621,6 +624,21 @@ export async function dismissUpgrade(version: string): Promise<void> {
 
 // ── 性能 tab（observability）────────────────────────────
 // backend observability/router.py 不走 Normal 包装,直接返回原始 JSON。
+
+export interface PerceptionFlowResult {
+  graph: GraphResponse;
+  warnings: GraphProtocolWarning[];
+}
+
+export async function getPerceptionFlow(
+  deviceId?: string,
+): Promise<PerceptionFlowResult> {
+  const decoded = decodeGraphResponse(
+    await impl.realGetPerceptionFlow(deviceId),
+  );
+  if (!decoded.ok) throw new Error(decoded.error);
+  return { graph: decoded.graph, warnings: decoded.warnings };
+}
 
 const PERF_WINDOW_MS: Record<PerfWindow, number> = {
   "1h": 60 * 60_000,
