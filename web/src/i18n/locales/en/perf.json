@@ -72,8 +72,8 @@
     "colAudioP50": "audio P50",
 
     "kpiEmptyTrace": "No trace data in the selected window.",
-    "kpiCycle": "Processed tasks",
-    "kpiShouldProcess": "Received",
+    "kpiCycle": "Processed cycles",
+    "kpiShouldProcess": "Windows received",
     "kpiGateFilterRate": "No deep analysis needed",
     "kpiGateFilterRateHint": "Unchanged input skipped (Gate filter rate)",
     "kpiDropRate": "Not processed in real time",

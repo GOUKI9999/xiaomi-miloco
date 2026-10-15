@@ -72,8 +72,8 @@
     "colAudioP50": "audio P50",
 
     "kpiEmptyTrace": "所选窗口内暂无 trace 数据。",
-    "kpiCycle": "已处理任务",
-    "kpiShouldProcess": "收到任务",
+    "kpiCycle": "已处理轮次",
+    "kpiShouldProcess": "收到窗口",
     "kpiGateFilterRate": "无需深度分析",
     "kpiGateFilterRateHint": "跳过无明显变化的画面（Gate 过滤率）",
     "kpiDropRate": "未进入实时处理",

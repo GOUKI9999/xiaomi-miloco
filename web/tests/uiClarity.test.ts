@@ -42,8 +42,10 @@ describe("性能总览文案", () => {
   >;
 
   it("首层 KPI 使用普通用户能理解的名称", () => {
-    expect(perf.kpiCycle).toBe("已处理任务");
-    expect(perf.kpiShouldProcess).toBe("收到任务");
+    expect(perf.kpiCycle).toBe("已处理轮次");
+    expect(perf.kpiShouldProcess).toBe("收到窗口");
+    expect(enPerf.kpiCycle).toBe("Processed cycles");
+    expect(enPerf.kpiShouldProcess).toBe("Windows received");
     expect(perf.kpiGateFilterRate).toBe("无需深度分析");
     expect(perf.kpiDropRate).toBe("未进入实时处理");
     expect(perf.kpiOmniErrorRate).toBe("AI 分析失败率");
