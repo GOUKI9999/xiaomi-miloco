@@ -503,14 +503,22 @@ def _write_meta(trace_dir: Path, day: str, query: str) -> None:
 
 
 @pytest.mark.anyio
-async def test_read_trace_meta_matches_today_and_yesterday(tmp_path: Path):
-    """当天与昨天（跨零点的 turn）的 meta 都要能反查到。"""
-    from datetime import datetime, timedelta
+async def test_read_trace_meta_matches_today_and_yesterday(tmp_path: Path, monkeypatch):
+    """UTC 当天与昨天的 meta 都要能反查到。"""
+    import datetime as dt
 
     from miloco_plugin_pkg.hermes_adapter.adapter import Adapter
 
-    _write_meta(tmp_path, datetime.now().strftime("%Y%m%d"), "今天的问题")
-    _write_meta(tmp_path, (datetime.now() - timedelta(days=1)).strftime("%Y%m%d"), "昨天的问题")
+    now = dt.datetime(2026, 10, 15, 2, tzinfo=dt.timezone.utc)
+
+    class FixedDateTime(dt.datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return now.astimezone(tz)
+
+    monkeypatch.setattr(dt, "datetime", FixedDateTime)
+    _write_meta(tmp_path, "20261015", "今天的问题")
+    _write_meta(tmp_path, "20261014", "昨天的问题")
 
     a = Adapter(trace_dir=tmp_path)
     a._pending_texts["run-today"] = "今天的问题"
@@ -521,8 +529,66 @@ async def test_read_trace_meta_matches_today_and_yesterday(tmp_path: Path):
 
 
 @pytest.mark.anyio
+@pytest.mark.parametrize(
+    "instant,reader_zone,writer_zone,expected_day",
+    [
+        ("2026-10-15T16:30:00+00:00", "UTC", "Asia/Shanghai", "20261016"),
+        ("2026-10-15T10:30:00+00:00", "Etc/GMT+12", "Pacific/Kiritimati", "20261016"),
+        ("2026-10-15T10:30:00+00:00", "Pacific/Kiritimati", "Etc/GMT+12", "20261014"),
+    ],
+)
+async def test_read_trace_meta_across_process_timezones(
+    tmp_path: Path, monkeypatch, instant, reader_zone, writer_zone, expected_day,
+):
+    import datetime as dt
+    from zoneinfo import ZoneInfo
+
+    from miloco_plugin_pkg import trace
+    from miloco_plugin_pkg.hermes_adapter.adapter import Adapter
+
+    now = dt.datetime.fromisoformat(instant)
+
+    class ReaderDate(dt.date):
+        @classmethod
+        def today(cls):
+            return now.astimezone(ZoneInfo(reader_zone)).date()
+
+    class ReaderDateTime(dt.datetime):
+        @classmethod
+        def now(cls, tz=None):
+            if tz is not None:
+                return now.astimezone(tz)
+            return now.astimezone(ZoneInfo(reader_zone)).replace(tzinfo=None)
+
+    class WriterDateTime(dt.datetime):
+        @classmethod
+        def now(cls, tz=None):
+            if tz is not None:
+                return now.astimezone(tz)
+            return now.astimezone(ZoneInfo(writer_zone)).replace(tzinfo=None)
+
+    monkeypatch.setenv("MILOCO_HOME", str(tmp_path))
+    monkeypatch.setattr(dt, "date", ReaderDate)
+    monkeypatch.setattr(dt, "datetime", ReaderDateTime)
+    monkeypatch.setattr(trace, "datetime", WriterDateTime)
+    state = trace._TurnState(int(now.timestamp() * 1000))
+    state.query = "timezone probe"
+    trace._flush_to_disk("miloco:timezone:rule", state, True)
+    trace_dir = tmp_path / "trace" / "agent"
+    assert list((trace_dir / expected_day).glob("*.meta.json"))
+
+    adapter = Adapter(trace_dir=trace_dir)
+    adapter._pending_texts["run-timezone"] = state.query
+    meta = await adapter.read_trace_meta("run-timezone")
+    assert meta is not None
+    assert meta.query == "timezone probe"
+    assert meta.success is True
+    assert "run-timezone" not in adapter._pending_texts
+
+
+@pytest.mark.anyio
 async def test_read_trace_meta_ignores_old_day_dirs(tmp_path: Path):
-    """只扫最近两天的目录：meta 按天累积不清理，poller 高频全树 stat 会拖垮 SBC 的 IO。"""
+    """历史目录不参与高频轮询。"""
     from datetime import datetime, timedelta
 
     from miloco_plugin_pkg.hermes_adapter.adapter import Adapter

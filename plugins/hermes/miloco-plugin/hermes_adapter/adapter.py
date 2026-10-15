@@ -457,16 +457,15 @@ class Adapter:
     # ---- read_trace_meta ----------------------------------------------
 
     def _recent_meta_files(self) -> list[Path]:
-        """当天 + 昨天（跨零点的 turn）目录下的 meta 文件。
+        """以 UTC 日期为中心扫描相邻日期，兼容 gateway 与 backend 时区不同。
 
-        trace 目录按 YYYYMMDD 分天且没有保留期，全树扫描会随天数线性变慢，
-        而 poller 只可能读到刚落盘的那一批。
+        目录按 gateway 本地日期命名；全树扫描会随历史天数增长。
         """
         import datetime as _dt
 
-        today = _dt.date.today()
+        today = _dt.datetime.now(_dt.timezone.utc).date()
         files: list[Path] = []
-        for day in (today, today - _dt.timedelta(days=1)):
+        for day in (today, today - _dt.timedelta(days=1), today + _dt.timedelta(days=1)):
             day_dir = self._trace_dir / day.strftime("%Y%m%d")
             if day_dir.is_dir():
                 files.extend(day_dir.glob("*.meta.json"))

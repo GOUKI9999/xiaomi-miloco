@@ -324,6 +324,30 @@ def test_trace_hooks_today_has_files(tmp_path: Path, monkeypatch):
     assert out["newest_meta"] == "sess-1__test.meta.json"
 
 
+def test_trace_hooks_survives_meta_eviction(tmp_path: Path, monkeypatch):
+    from datetime import datetime
+
+    monkeypatch.setenv("MILOCO_HOME", str(tmp_path))
+    today = tmp_path / "trace" / "agent" / datetime.now().strftime("%Y%m%d")
+    today.mkdir(parents=True)
+    evicted = today / "evicted.meta.json"
+    retained = today / "retained.meta.json"
+    evicted.write_text("{}", encoding="utf-8")
+    retained.write_text("{}", encoding="utf-8")
+    original_stat = Path.stat
+
+    def stat_after_eviction(path, *args, **kwargs):
+        if path == evicted:
+            path.unlink(missing_ok=True)
+        return original_stat(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "stat", stat_after_eviction)
+    result = ts._check_trace_hooks()
+    assert result["ok"] is True
+    assert result["newest_meta"] == retained.name
+    assert result["meta_files_today"] == 1
+
+
 # ─── test_push ───────────────────────────────────────────────────────────
 
 
