@@ -170,11 +170,17 @@ async def _write_action_ledger(
     source: str = "cli",
     source_id: str | None = None,
     home_id: str | None = None,
+    phase: str | None = None,
+    trigger_event_id: str | None = None,
 ) -> None:
     """落一行 action_ledger + 打一条 INFO 结果日志。**fail-open**:
 
     ``source`` 区分触发源:``cli``(control_device 路径,含 manual CLI 与 agent-via-CLI,
     后者由 trace_id 区分)/ ``rule``(RuleRunner 直控,``source_id`` 写 rule_id)。
+
+    ``phase`` / ``trigger_event_id`` 是链路两列:前者标这条动作属于触发支还是
+    退出支,后者指向触发它的事件行。只有规则直控路径知道这两样,人工 / agent
+    直控与场景触发留空。
 
     整体裹 try/except,任何异常只 warning,绝不影响调用方的控制结果。
     device_name / room 从内存 device cache 解析(便宜),解析失败留 None。
@@ -250,6 +256,8 @@ async def _write_action_ledger(
                     # 不记这一维，事后就分不清「设备真的没响应」和「当时授权已
                     # 失效、根本没发」。
                     auth_state=_auth_state_of(miot_proxy),
+                    phase=phase,
+                    trigger_event_id=trigger_event_id,
                 )
             )
 
@@ -308,13 +316,16 @@ async def _trigger_scene(
     *,
     source: str = "cli",
     source_id: str | None = None,
+    phase: str | None = None,
+    trigger_event_id: str | None = None,
 ) -> bool:
     """触发一个米家手动场景并落台账。
 
     模块级而非 MiotService 方法:RuleRunner 只持有 miot_proxy,直控路径要走同一
     份家庭白名单校验和同一份台账口径(和 ``_write_action_ledger`` 一样的复用方
     式)。``source``/``source_id`` 让规则触发的场景在台账里能回指到具体 rule,
-    不再和人工 CLI 混成一堆。
+    不再和人工 CLI 混成一堆;``phase``/``trigger_event_id`` 同理,由规则直控
+    路径带上、人工触发留空。
     """
     scenes: dict = {}
     # 异常路径也要能看到"当时想触发什么"(失败审计完整性)——scene_name
@@ -378,6 +389,8 @@ async def _trigger_scene(
             source=source,
             source_id=source_id,
             home_id=getattr(scenes[scene_id], "home_id", None),
+            phase=phase,
+            trigger_event_id=trigger_event_id,
         )
         return ok
     except (ResourceNotFoundException, ValidationException) as e:
@@ -396,6 +409,8 @@ async def _trigger_scene(
             source=source,
             source_id=source_id,
             home_id=getattr(scenes.get(scene_id), "home_id", None),
+            phase=phase,
+            trigger_event_id=trigger_event_id,
         )
         raise
     except Exception as e:
@@ -415,6 +430,8 @@ async def _trigger_scene(
             source_id=source_id,
             # scenes 取列表阶段就炸时为空 dict → .get 兜底 None
             home_id=getattr(scenes.get(scene_id), "home_id", None),
+            phase=phase,
+            trigger_event_id=trigger_event_id,
         )
         raise MiotServiceException(f"Failed to trigger scene: {str(e)}") from e
 

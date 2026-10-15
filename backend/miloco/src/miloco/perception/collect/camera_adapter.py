@@ -569,6 +569,9 @@ class CameraDeviceAdapter(BaseDeviceAdapter):
                 overflow_count=ovf_cnt,
                 max_buffer_depth=max_depth,
                 last_overflow_action=last_action,
+                last_drain_observed_at=ready.last_drain_observed_at,
+                last_drain_ready_depth_before=ready.last_drain_ready_depth_before,
+                last_drain_ready_depth_after=ready.last_drain_ready_depth_after,
             )
         else:
             collect_ms = get_settings().perception.collect.window_size * 1000
@@ -639,6 +642,9 @@ class CameraDeviceAdapter(BaseDeviceAdapter):
         overflow_count: int = 0,
         max_buffer_depth: int = 0,
         last_overflow_action: str | None = None,
+        last_drain_observed_at: int | None = None,
+        last_drain_ready_depth_before: int | None = None,
+        last_drain_ready_depth_after: int | None = None,
     ) -> DeviceData | None:
         """Build DeviceData from decoded frame track fragments.
 
@@ -685,6 +691,9 @@ class CameraDeviceAdapter(BaseDeviceAdapter):
             overflow_count=overflow_count,
             max_buffer_depth=max_buffer_depth,
             last_overflow_action=last_overflow_action,
+            last_drain_observed_at=last_drain_observed_at,
+            last_drain_ready_depth_before=last_drain_ready_depth_before,
+            last_drain_ready_depth_after=last_drain_ready_depth_after,
         )
 
     def get_connected_devices(self) -> dict[str, PerceptionDevice]:
