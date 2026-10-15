@@ -1203,6 +1203,18 @@ class PerceptionEngine(BasePerceptionEngine):
             if cap:
                 per_room_last_caption[room_name] = cap
 
+        # 每次查询共用一份姓名快照；读库失败仍可按画面回答，不借其他文本补名。
+        name_lookup: dict[str, str] = {}
+        if self._identity_lib is not None:
+            try:
+                name_lookup = {
+                    ref.person_id: ref.name
+                    for ref in self._identity_lib.list_persons()
+                    if ref.name and ref.name.strip()
+                }
+            except Exception:  # noqa: BLE001
+                logger.warning("Query name lookup failed; continuing without member names")
+
         try:
             results = await run_query_pipeline(
                 batch,
@@ -1212,6 +1224,7 @@ class PerceptionEngine(BasePerceptionEngine):
                 get_identity_engine=self._get_or_create_identity_engine,
                 last_captions=per_room_last_caption,
                 frame_index_offset=self._global_frame_index,
+                label_lookup=name_lookup,
             )
         except Exception as e:
             logger.error("Query pipeline failed: %s", e, exc_info=True)

@@ -46,11 +46,11 @@ from .constants import (
     _HISTORY_HEADER,
     _OUTPUT_MODE_FREE,
     _OUTPUT_MODE_JSON,
+    _PERSON_PRESENCE,
     _PRINCIPLE,
     _PRINCIPLE_AUDIO,
     _PRINCIPLE_VIDEO_NO_AUDIO,
     _PRINCIPLE_VIDEO_NO_SPEECH,
-    _QUERY_PERSON_GROUNDING,
     _ROLE,
     _ROLE_AUDIO,
     _USER_REF_BOUNDARY,
@@ -162,6 +162,19 @@ def build_batch_stream_prompt(
 ) -> dict:
     """Build prompt payload for streaming omni call (multi-device, speeches first)."""
     return _build_payload(identity_packets, context, stream=True, label_lookup=label_lookup)
+
+
+_QUERY_PERSON_GROUNDING = (
+    "# 人物在场与称呼\n"
+    + _PERSON_PRESENCE
+    + "- 当前画面中谁在场、在做什么，只据本轮提供的视频判断；检测定位线索、上一窗场景参考、家庭档案和问题里的人名都不证明本轮有人。\n"
+    "- 只有画面确认给出的 bbox 对应真人、且该条为已确认成员线索时，才可沿用对应姓名。"
+    "bbox 标注该设备视频最后一帧的位置，坐标归一化到 [0, 1000]（左上 0,0；右下 1000,1000）。\n"
+    "- 确认有人但无法对应姓名时用“某人 / 陌生人”；身份标签若只是 ID，不把 ID 当人名输出，"
+    "不从家庭档案、历史描述或问题里给未确认身份的目标补姓名。\n"
+    "- 背影、侧身、局部、遮挡或模糊的真人仍算有人；分不清是人还是物时说明“无法确认”，不得据此断言无人。\n"
+    "- 本轮未提供有效视频的设备不能用于确认当前人员；只回答提供画面的范围，不把其他机位的检测结果当作可见事实。"
+)
 
 
 def build_query_prompt(

@@ -780,6 +780,7 @@ async def run_query_pipeline(
     get_identity_engine: Callable[[str, str], "IdentityEngine | None"] | None = None,
     last_captions: dict[str, str] | None = None,
     frame_index_offset: int = 0,
+    label_lookup: dict[str, str] | None = None,
 ) -> dict[str, QueryOutput]:
     """Active query pipeline: skip Gate, run Identity, Omni with query prompt.
 
@@ -872,6 +873,7 @@ async def run_query_pipeline(
                 identity_packets=room_identity_packets,
                 query=query,
                 last_caption=captions.get(room_name),
+                label_lookup=label_lookup,
             )
             raw_response = await call_omni(
                 payload, resolve_live_omni_config(config.omni), type="on_demand"
