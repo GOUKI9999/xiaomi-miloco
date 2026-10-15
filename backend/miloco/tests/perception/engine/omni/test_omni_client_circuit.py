@@ -14,6 +14,7 @@ from miloco.perception.engine.omni.error_classifier import (
     ClassifiedError,
     ErrorCategory,
 )
+from miloco.perception.engine.omni.provider import build_request_headers, get_adapter
 
 
 class _FakeResp:
@@ -41,7 +42,19 @@ class _FakeResp:
             )
 
 
-def _fake_async_client(resp: _FakeResp | None = None, *, exc: Exception | None = None):
+def _fake_async_client(
+    resp: _FakeResp | None = None,
+    *,
+    exc: Exception | None = None,
+    sent: list[dict] | None = None,
+):
+    """``sent`` 非None 时把每次 post 收到的 kwargs 追加进去(headers 传输层断言用)。
+
+    原来 ``post(*a, **k)`` 直接吞掉 kwargs,所以「call_omni 发出的头」从来没被测过——
+    call_omni 手写一份 headers 还是复用 build_request_headers,现有测试一样绿。传
+    ``sent`` 就能把真正上线的 headers 抓出来断言,不改变 fake 的其余行为。
+    """
+
     class _C:
         def __init__(self, *a, **k):
             pass
@@ -55,6 +68,8 @@ def _fake_async_client(resp: _FakeResp | None = None, *, exc: Exception | None =
         async def post(self, *a, **k):
             if exc:
                 raise exc
+            if sent is not None:
+                sent.append({"url": a[0] if a else k.get("url"), **k})
             return resp
 
     return _C
@@ -67,10 +82,10 @@ def _reset_cb():
     reset_omni_circuit_breaker_for_tests()
 
 
-def _cfg() -> OmniConfig:
+def _cfg(base_url: str = "https://x/v1") -> OmniConfig:
     return OmniConfig(
         model="m",
-        base_url="https://x/v1",
+        base_url=base_url,
         api_key="sk-1",
         temperature=0,
         top_p=1,
@@ -416,3 +431,69 @@ async def test_call_omni_forced_stream_500_records_failure(monkeypatch):
     snap = get_omni_circuit_breaker().snapshot()
     assert snap.state == "warn"
     assert snap.code == "http_error"
+
+
+# ─── call_omni 出站 headers(默认非流式路径的传输层不变量) ──────────────────
+#
+# 不变量:call_omni 默认路径(``body["stream"]`` falsy → 走 client.post)真正发到线上的
+# headers,必须逐项等于 build_request_headers() 的产物。
+#
+# 为什么必须在传输层测:omni_client 没有共享的 post() 辅助、没有 session 对象、没有
+# client 工厂 —— httpx.AsyncClient 在 call_omni 内部就地构造,headers 也就地拼好后
+# 直接传给 client.post。所以「运行时到底发了什么」只能在 client.post 的入参上看,
+# 测纯函数 build_request_headers() 只能证明它自己对自己是对的。
+#
+# 覆盖的是默认运行时路径(realtime / 感知循环驱动),而不是 forced-stream 分支:
+# forced-stream 由 ``body.get("stream", False)`` 决定并转给 _collect_stream_response,
+# 与这里的非流式出口是两个不同的调用点,单独钉住(本文件后半段已有forced-stream 熔断
+# 用例)。非流式是绝大多数 adapter 的常态,也是 OpenCode Go 拒收缺 session 头时最先
+# 崩的那条路。
+
+
+async def test_call_omni_sends_same_headers_as_build_request_headers(monkeypatch):
+    """OpenCode Go endpoint:出站 headers 逐项等于 build_request_headers() 的产物。
+
+    断言**整份字典相等**而不是「含有 x-opencode-session」:子集断言只能守住「少发」,
+    守不住「多发」—— 运行时给所有 endpoint 都塞一个 session 头、或多带一个
+    Content-Type,子集断言一样绿。而这两种漂移都是真实的:多发会让非 OpenCode Go
+    endpoint 带上本不该有的路由头,少发则直接被 OpenCode Go 拒收。相等两头都守。
+    """
+    sent: list[dict] = []
+    monkeypatch.setattr(
+        omni_client.httpx,
+        "AsyncClient",
+        _fake_async_client(resp=_FakeResp(200, {"choices": [], "usage": {}}), sent=sent),
+    )
+    base_url = "https://opencode.ai/zen/go/v1"
+
+    await omni_client.call_omni(_payload(), _cfg(base_url=base_url))
+
+    assert len(sent) == 1
+    runtime_headers = build_request_headers(get_adapter("m"), base_url, "sk-1")
+    assert sent[0]["headers"] == runtime_headers
+    # 显式钉住本 case 的意义:缺这一头 OpenCode Go 即拒收,「相等」的前提是它真在里面。
+    assert sent[0]["headers"]["x-opencode-session"].startswith("ses_")
+
+
+async def test_call_omni_omits_session_header_for_non_opencode_endpoint(monkeypatch):
+    """非 OpenCode Go endpoint:出站不含 x-opencode-session。
+
+    反向守「别顺手给所有 endpoint 都加头」—— 正确形态是「跟 build_request_headers
+    一样」,不是「总是带 session」。运行时对普通 endpoint 不发,发了就是把进程级
+    路由 ID 泄给无关第三方,也是新的分叉。
+    """
+    sent: list[dict] = []
+    monkeypatch.setattr(
+        omni_client.httpx,
+        "AsyncClient",
+        _fake_async_client(resp=_FakeResp(200, {"choices": [], "usage": {}}), sent=sent),
+    )
+    base_url = "https://api.openai.com/v1"
+
+    await omni_client.call_omni(_payload(), _cfg(base_url=base_url))
+
+    assert len(sent) == 1
+    assert "x-opencode-session" not in sent[0]["headers"]
+    assert sent[0]["headers"] == build_request_headers(
+        get_adapter("m"), base_url, "sk-1"
+    )
