@@ -50,6 +50,7 @@ from .constants import (
     _PRINCIPLE_AUDIO,
     _PRINCIPLE_VIDEO_NO_AUDIO,
     _PRINCIPLE_VIDEO_NO_SPEECH,
+    _QUERY_PERSON_GROUNDING,
     _ROLE,
     _ROLE_AUDIO,
     _USER_REF_BOUNDARY,
@@ -173,6 +174,7 @@ def build_query_prompt(
     parts = [
         _ROLE,
         _OUTPUT_MODE_FREE,
+        _QUERY_PERSON_GROUNDING,
         _COMMONSENSE,
     ]
     home_profile = get_home_profile_prefix()
@@ -180,13 +182,13 @@ def build_query_prompt(
         parts.append(home_profile)
     # query 不接 crop(v1 范围外);走 _effective_panorama_short_edge() 兜掉历史 config.json 里
     # 可能残留的 0(早期哨兵),否则 _encode_video_mp4 会算出 scale=0 崩掉按需查询。
-    video_b64, media_info = _encode_batch_video(
+    video_b64, media_info, video_packet_index = _encode_batch_video_with_source(
         identity_packets, short_edge=_effective_panorama_short_edge()
     )
     if not video_b64:
-        # query 路径只有 video 一个媒体块,拼不出就是纯文本问模型"现在怎么样",而 prompt 里
-        # 还注入了上一窗的 last_caption。零帧已由引擎入口的 _drop_frameless_snapshots 挡在
-        # 外面,走到这里说明编码本身失败。event 名与 fused 两条路由一致。
+        video_packet_index = None
+        # 无有效视频时，不注入检测身份标签或上一窗描述，以免它们替代当前画面。
+        # 保留 warning，便于定位编码失败或绕过入口零帧过滤的调用。
         logger.warning(
             "event=fused_no_media_block route=query reason=empty_video room=%s, "
             "本窗口未拼出 video 块、走 text-only",
@@ -194,7 +196,10 @@ def build_query_prompt(
         )
     return {
         "system_prompt": "\n\n".join(parts),
-        "user_content": _build_query_user_content(identity_packets, query, last_caption, label_lookup),
+        "user_content": _build_query_user_content(
+            identity_packets, query, last_caption, label_lookup,
+            video_packet_index=video_packet_index,
+        ),
         "video_base64": video_b64,
         "media_info": media_info,
         "crops": [],
@@ -545,10 +550,7 @@ def build_system_prompt(
 ) -> str:
     """按场景装配 system prompt。
 
-    结构：``角色 → 输出模式 → # 任务 → # 输出格式(schema) → # 字段说明 → # 提醒判定
-    → # 通用常识 → # 输出实例 → [家庭档案?]``。schema / 字段说明 / 实例 / 任务行均按
-    ``scene`` 选取（audio 场景剥 caption/identity；有身份候选才带 identity 与实例 A），
-    同场景前缀稳定，利于 omni 服务端 prefix cache。
+    模态相关内容按 ``scene`` 选取；通用约束前置，低频上下文置尾，便于复用共享前缀。
 
     流程不再单列「工作流程」段——各任务（含 suggestions 的触发与 urgency 判定）的细则
     全部内联进对应「# 字段说明」的 ``## 字段`` 块。
@@ -1731,11 +1733,20 @@ def _encode_batch_video(
     audio route 由 _build_payload 短路，不会进入本函数。
     返回 ``(base64_str, media_info)``。
     """
-    for ep in edge_packets:
+    b64, media_info, _ = _encode_batch_video_with_source(edge_packets, short_edge)
+    return b64, media_info
+
+
+def _encode_batch_video_with_source(
+    edge_packets: list[IdentityPacket],
+    short_edge: int = _VIDEO_SHORT_EDGE,
+) -> tuple[str | None, LocalMediaInfo | None, int | None]:
+    """返回实际编码设备的索引，让查询定位线索与视频共用来源。"""
+    for index, ep in enumerate(edge_packets):
         b64, media_info = _encode_video(ep, short_edge=short_edge)
         if b64 is not None:
-            return b64, media_info
-    return None, None
+            return b64, media_info, index
+    return None, None, None
 
 
 def _encode_batch_crops(edge_packets: list[IdentityPacket]) -> list[dict[str, str]]:
@@ -2063,24 +2074,41 @@ def _build_query_user_content(
     query: str,
     last_caption: str | None,
     label_lookup: "dict[str, str] | None" = None,
+    *,
+    video_packet_index: int | None = None,
 ) -> str:
     parts: list[str] = []
 
+    if video_packet_index is None:
+        parts.append("本轮未提供有效视频，无法确认当前人员或场景。")
     for i, ep in enumerate(edge_packets):
         if len(edge_packets) > 1:
             parts.append(f"--- 设备 {i + 1} ---")
+        if i != video_packet_index:
+            parts.append("本轮未提供该设备视频，不据其检测结果判断当前人物。")
+            continue
+        parts.append("本轮视频来自此设备。")
         if not ep.targets:
-            parts.append("检测结果：未检测到目标")
+            parts.append("检测定位线索：未检测到目标（不代表画面无人）")
         else:
-            parts.append("检测结果：")
+            parts.append("检测定位线索（不代表当前有人）：")
             for t in ep.targets:
-                parts.append(_format_target(t, label_lookup))
+                if (
+                    t.bbox_xyxy_norm is not None
+                    and _is_confirmed_member_pid(t.person_id)
+                    and not t.needs_omni_verify
+                    and not t.suppress_as_prior
+                ):
+                    parts.append("已确认成员线索：" + _render_roster_entry(t, label_lookup))
+                else:
+                    parts.append("目标（不提供可沿用的身份标签）")
         parts.append(f"场景状态：{ep.scene_motion.value}")
         parts.append(f"音频：{ep.audio_analysis.type.value}（能量: {ep.audio_analysis.energy_level:.3f}）")
         parts.append("")
 
-    if last_caption:
-        parts.append(f"当前场景参考：{last_caption}")
+    # 调用方的历史描述对应首设备；编码选到其他设备时不借用其历史。
+    if last_caption and video_packet_index == 0:
+        parts.append(f"上一窗场景参考（仅历史，不证明本轮事实）：{last_caption}")
 
     parts.append(f"\n用户问题：{query}")
     return "\n".join(parts)

@@ -284,6 +284,156 @@ class TestBuildQueryPrompt:
         assert "study-room" not in payload["system_prompt"]
 
 
+class TestQueryPersonGrounding:
+    """查询的人名、定位与历史线索须服从实际提供的画面。"""
+
+    @staticmethod
+    def _packet(pid="member", bbox=(100, 100, 400, 900), *, verify=False, suppress=False, color=60):
+        ep = _mock_edge_packet()
+        ep.targets = [IdentityTarget(
+            type=ObjectType.HUMAN_WITH_FACE, person_id=pid, track_id=7,
+            needs_omni_verify=verify, suppress_as_prior=suppress,
+            box_info=[], bbox_xyxy_norm=bbox,
+        )]
+        ep.all_frames = [np.full((100, 100, 3), color, dtype=np.uint8)]
+        return ep
+
+    @staticmethod
+    def _assert_policy(payload):
+        sp = payload["system_prompt"]
+        assert "直接输出自然语言答案" in sp
+        policy = sp.split("# 人物在场与称呼\n", 1)[1].split("# 通用常识", 1)[0]
+        assert "名册姓名 / bbox 是定位线索，不代表当前有人" in policy
+        assert "椅子、家具、衣物及人体误检框均不算人" in policy
+        assert "只据本轮提供的视频判断" in policy
+        assert "家庭档案和问题里的人名都不证明本轮有人" in policy
+        assert "只有画面确认给出的 bbox 对应真人、且该条为已确认成员线索时，才可沿用对应姓名" in policy
+        assert "视频最后一帧的位置，坐标归一化到 [0, 1000]" in policy
+        assert "确认有人但无法对应姓名时用“某人 / 陌生人”" in policy
+        assert "不把 ID 当人名输出" in policy
+        assert "不从家庭档案、历史描述或问题里给未确认身份的目标补姓名" in policy
+        assert "背影、侧身、局部、遮挡或模糊的真人仍算有人" in policy
+        assert "分不清是人还是物时说明“无法确认”，不得据此断言无人" in policy
+        assert "本轮未提供有效视频的设备不能用于确认当前人员" in policy
+        assert "不把其他机位的检测结果当作可见事实" in policy
+        assert "identities" not in sp
+        assert "caption" not in sp
+        assert "matched_rules" not in sp
+        assert payload["crops"] == []
+
+    def _build(self, packets, last_caption=None):
+        with (
+            patch("miloco.perception.engine.omni.prompt_builder.get_home_profile_prefix", return_value=""),
+            patch("miloco.perception.engine.omni.prompt_builder._effective_panorama_short_edge", return_value=128),
+        ):
+            payload = build_query_prompt(
+                packets, "当前画面里是谁？", last_caption,
+                {"member": "当前成员", "other": "其他机位成员"},
+            )
+        self._assert_policy(payload)
+        return payload
+
+    @pytest.mark.parametrize("pid,bbox,verify,suppress,authorized", [
+        ("member", (100, 100, 400, 900), False, False, True),
+        ("member", None, False, False, False),
+        ("member", (100, 100, 400, 900), True, False, False),
+        ("member", (100, 100, 400, 900), False, True, False),
+        ("pending", (100, 100, 400, 900), False, False, False),
+        ("pending:member", (100, 100, 400, 900), False, False, False),
+        ("none", (100, 100, 400, 900), False, False, False),
+        ("", (100, 100, 400, 900), False, False, False),
+        ("unknown", (100, 100, 400, 900), False, False, False),
+        ("unknown_1", (100, 100, 400, 900), False, False, False),
+        ("unknown-scope-1", (100, 100, 400, 900), False, False, False),
+    ])
+    def test_name_requires_current_position_and_stable_identity(self, pid, bbox, verify, suppress, authorized):
+        ep = self._packet(pid, bbox, verify=verify, suppress=suppress)
+        payload = self._build([ep])
+        text = payload["user_content"]
+        assert payload["video_base64"]
+        assert "检测定位线索（不代表当前有人）" in text
+        assert ("当前成员" in text) is authorized
+        assert ("已确认成员线索：当前成员[bbox=(100, 100, 400, 900)]" in text) is authorized
+        assert ("不提供可沿用的身份标签" in text) is (not authorized)
+        assert "pending" not in text
+        assert "unknown" not in text
+        assert ep.targets[0].person_id == pid
+
+    @staticmethod
+    def _video_color(payload):
+        import base64
+        import io
+
+        import av
+
+        with av.open(io.BytesIO(base64.b64decode(payload["video_base64"]))) as video:
+            frames = list(video.decode(video=0))
+        assert frames
+        return float(np.mean(frames[-1].to_ndarray(format="bgr24")))
+
+    @pytest.mark.parametrize("first_has_frames", [True, False])
+    def test_only_encoded_camera_can_supply_names_and_history(self, first_has_frames):
+        first = self._packet(color=40)
+        second = self._packet("other", color=210)
+        if not first_has_frames:
+            first.all_frames = []
+        payload = self._build([first, second], "旧场景中的历史姓名")
+        text = payload["user_content"]
+        assert ("当前成员" in text) is first_has_frames
+        assert ("其他机位成员" in text) is (not first_has_frames)
+        assert text.count("已确认成员线索：") == 1
+        assert "本轮未提供该设备视频，不据其检测结果判断当前人物" in text
+        assert ("上一窗场景参考（仅历史，不证明本轮事实）：旧场景中的历史姓名" in text) is first_has_frames
+        assert ("旧场景中的历史姓名" in text) is first_has_frames
+        assert abs(self._video_color(payload) - (40 if first_has_frames else 210)) < 8
+
+    def test_source_follows_successful_encoding_not_frame_presence(self):
+        import miloco.perception.engine.omni.prompt_builder as builder
+
+        first = self._packet(color=40)
+        second = self._packet("other", color=210)
+        real_encode = builder._encode_video
+
+        def reject_first(packet, short_edge):
+            return (None, None) if packet is first else real_encode(packet, short_edge=short_edge)
+
+        with patch.object(builder, "_encode_video", side_effect=reject_first):
+            payload = self._build([first, second], "首镜头的历史姓名")
+        assert "当前成员" not in payload["user_content"]
+        assert "其他机位成员" in payload["user_content"]
+        assert "首镜头的历史姓名" not in payload["user_content"]
+        assert abs(self._video_color(payload) - 210) < 8
+
+    @pytest.mark.parametrize("has_packets", [False, True])
+    def test_no_video_does_not_supply_names_or_history(self, has_packets):
+        ep = self._packet()
+        ep.all_frames = []
+        payload = self._build([ep] if has_packets else [], "历史成员仍坐着")
+        assert payload["video_base64"] is None
+        text = payload["user_content"]
+        assert "本轮未提供有效视频，无法确认当前人员或场景" in text
+        assert "当前成员" not in text
+        assert "历史成员仍坐着" not in text
+        assert "已确认成员线索" not in text
+
+    def test_no_detections_does_not_assert_empty_scene(self):
+        ep = self._packet()
+        ep.targets = []
+        payload = self._build([ep])
+        assert payload["video_base64"]
+        assert "未检测到目标（不代表画面无人）" in payload["user_content"]
+
+    def test_empty_video_result_does_not_authorize_identity_metadata(self):
+        import miloco.perception.engine.omni.prompt_builder as builder
+
+        with patch.object(builder, "_encode_video", return_value=("", None)):
+            payload = self._build([self._packet()], "历史成员仍坐着")
+        assert not payload["video_base64"]
+        assert "本轮未提供有效视频" in payload["user_content"]
+        assert "当前成员" not in payload["user_content"]
+        assert "历史成员仍坐着" not in payload["user_content"]
+
+
 class TestDeviceHeaderRoster:
     """_build_device_header：名册按身份分桶（已识别人物 / 陌生人），含归一化位置，
     pending/未识别剔除，candidate_tids（本窗重审）剔除以去身份先验。"""
@@ -578,13 +728,12 @@ class TestNoMediaBlockWarning:
     def test_query_route_warns_when_video_unencodable(self, caplog):
         """query 路径拼不出 video 块 → 打 warning。
 
-        query 只有 video 一个媒体块，拼不出就是纯文本问模型「现在怎么样」，而 prompt 里
-        还带着上一窗的 last_caption —— 用户直接读到没有本窗画面依据的现场描述。
+        query 拼不出有效视频时须保留可观测 warning，人物线索的隔离由查询护栏另测。
         """
         from miloco.perception.engine.omni.prompt_builder import build_query_prompt
 
         ep = _mock_edge_packet()
-        ep.all_frames = []  # _encode_batch_video 拿不到帧 → (None, None)
+        ep.all_frames = []  # 没有可编码的视频帧
 
         with caplog.at_level("WARNING"):
             payload = build_query_prompt([ep], "厨房现在怎么样")

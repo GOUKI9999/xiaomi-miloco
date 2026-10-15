@@ -155,11 +155,11 @@ Omni 层（`engine/omni/omni.py`）调用视觉语言模型（MiMo API，OpenAI 
 
 **为什么用 DeepSORT**：纯 IoU 跟踪在多人遮挡、检测抖动时 track 容易死亡重建，导致同一人被分配多个 track_id，身份状态频繁重置。DeepSORT 引入 ReID 特征关联，跨帧关联更鲁棒，减少 IdentityEngine 反复发送重复识别请求。
 
-**per-device Omni 设计**：每个摄像头独立调一次 Omni，而非多摄像头合并。合并调用时，prompt 只携带首个摄像头的视频，其他摄像头的 track 无对应视觉信息，识别准确率低。
+**实时感知的 per-device Omni 设计**：每个摄像头独立调一次 Omni，而非多摄像头合并。合并调用时，prompt 只携带首个摄像头的视频，其他摄像头的 track 无对应视觉信息，识别准确率低。
 
 **Fused 模式**：将身份识别合并到主 Omni 调用中，省掉额外的识别请求。gallery 采用"全或无"语义：任一候选成员的图像合成失败，整 gallery 放弃，避免少一个人时 Omni 错认。
 
-**主动查询路径（on-demand）**：主动查询入口从实时流缓冲 peek 数据后跳过 Gate 直接走 Identity + Omni，不影响实时流水线。每次查询自动写入 `on_demand_log` 表（query/answer/sources/latency），并复用 `OmniEventArtifacts` + `save_event_artifacts` 把 clip 和 omni_trace 落到 `snapshots/{log_id}/`；omni 未响应时只落 trace、跳过 clip。clip 始终为 mp4（`build_query_prompt` 不走 audio-only 路径）。前端 Activity 页通过子 Tab 浏览查询日志、播放 clip、提交反馈（反馈打包见 [事件反馈](event-feedback.md)）。
+**主动查询路径（on-demand）**：主动查询入口从实时流缓冲 peek 数据后跳过 Gate 直接走 Identity + Omni，不影响实时流水线。查询以实际编码的单一机位为视觉范围，仅提供该机位当前定位可用、身份稳定的成员线索；姓名与 bbox 仍须由画面确认对应真人后才可沿用。缺少定位、身份待确认或旧名被抑制的目标不提供可沿用姓名；画面有人但姓名无依据时用泛称，分不清人或物时说明无法确认。上一窗描述仅作历史参考；视频改选其他机位时舍弃首机位历史，无有效视频时不注入检测身份标签或上一窗描述。每次查询自动写入 `on_demand_log` 表（query/answer/sources/latency），并复用 `OmniEventArtifacts` + `save_event_artifacts` 把 clip 和 omni_trace 落到 `snapshots/{log_id}/`；omni 未响应时只落 trace、跳过 clip。clip 始终为 mp4（`build_query_prompt` 不走 audio-only 路径）。前端 Activity 页通过子 Tab 浏览查询日志、播放 clip、提交反馈（反馈打包见 [事件反馈](event-feedback.md)）。
 
 **Suggestion 去重**：`PerceptionEngine` 对建议做去重抑制，同类建议短期内只报一次，避免 Agent 被重复触发。去重用句向量语义相似度（`EventEmbedder`，`engine/omni/dedup_embedder.py`，bge-small-zh）而非精确文本匹配——措辞略有差异的同类建议也能识别为重复；embedder 初始化失败时降级为精确文本匹配。
 
