@@ -8,6 +8,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+import pytest
+
 HERMES_DIR = Path(__file__).resolve().parent.parent
 RUNTIME_HELPER = HERMES_DIR / "tests" / "_resolve_runtime_env.sh"
 INSTALL_SCRIPT = HERMES_DIR / "install-hermes.sh"
@@ -116,3 +118,62 @@ def test_shell_rc_round_trips_metacharacters(tmp_path: Path):
     )
 
     assert loaded.stdout == value
+
+
+def _supervisor_conf_python() -> str:
+    text = INSTALL_SCRIPT.read_text(encoding="utf-8")
+    section = text.split("# 改 supervisor conf", 1)[1].split(
+        "# supervisor reread", 1
+    )[0]
+    match = re.search(
+        r'"\$PYTHON" - "\$SUPERVISORD_CONF" "\$MILOCO_HOME" <<\'PY\'\n(.*?)\nPY',
+        section,
+        flags=re.DOTALL,
+    )
+    assert match, "找不到 supervisord.conf 持久化的 Python heredoc"
+    return match.group(1)
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "/data/line\nbreak",
+        "/data/both'\"quotes",
+        "/data/comment #truncated",
+        "/data/comment ;truncated",
+    ],
+)
+def test_supervisor_conf_rejects_unrepresentable_home(tmp_path: Path, value: str):
+    conf = tmp_path / "supervisord.conf"
+    original = 'environment=MILOCO_HOME="/old"\n'
+    conf.write_text(original, encoding="utf-8")
+
+    result = subprocess.run(
+        [sys.executable, "-", str(conf), value],
+        input=_supervisor_conf_python(),
+        text=True,
+        capture_output=True,
+    )
+
+    assert result.returncode != 0
+    assert conf.read_text(encoding="utf-8") == original
+
+
+def test_supervisor_conf_round_trips_supported_metacharacters(
+    tmp_path: Path,
+):
+    conf = tmp_path / "supervisord.conf"
+    conf.write_text('environment=MILOCO_HOME="/old"\n', encoding="utf-8")
+    value = r'/data/100% "quoted"\path'
+
+    subprocess.run(
+        [sys.executable, "-", str(conf), value],
+        input=_supervisor_conf_python(),
+        text=True,
+        check=True,
+        capture_output=True,
+    )
+
+    assert f"MILOCO_HOME='{value.replace('%', '%%')}'" in conf.read_text(
+        encoding="utf-8"
+    )

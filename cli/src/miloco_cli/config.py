@@ -77,7 +77,11 @@ def _runtime_env_candidates() -> list[Path]:
 
 
 def read_runtime_env() -> dict[str, str]:
-    """读取默认指针，并将可选 profile 覆盖到默认值之上。"""
+    """读取默认指针，并将可选 profile 覆盖到默认值之上。
+
+    Linux supervisord 会接收这里解析出的全部键；macOS LaunchAgent 仅透传
+    ``MILOCO_*`` 及代理/CA 白名单键。跨平台 profile 应优先使用 ``MILOCO_*``。
+    """
     merged: dict[str, str] = {}
     for path in reversed(_runtime_env_candidates()):
         merged.update(_read_env_file(path))

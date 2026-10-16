@@ -14,7 +14,7 @@ metadata:
 ## 一行安装
 
 ```bash
-curl -LsSf https://github.com/XiaoMi/xiaomi-miloco/releases/latest/download/install.sh | bash -s -- --agent-prepare
+curl -LsSf https://github.com/XiaoMi/xiaomi-miloco/releases/latest/download/install.sh | bash -s -- --agent-prepare --agent-platform=hermes
 curl -LsSf https://github.com/XiaoMi/xiaomi-miloco/releases/latest/download/install.sh | bash -s -- --agent-finish --agent-platform=hermes
 hermes gateway restart
 ```

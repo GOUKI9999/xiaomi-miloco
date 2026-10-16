@@ -210,6 +210,24 @@ def test_resolve_install_home_prefers_selected_profile(
     assert installer._resolve_install_home("hermes") == Path("/data/profile")
 
 
+def test_resolve_install_home_partial_profile_inherits_platform(
+    monkeypatch, installer, tmp_path
+):
+    _fake_home(monkeypatch, installer, tmp_path)
+    default_pointer = tmp_path / ".config" / "miloco" / "default.env"
+    default_pointer.parent.mkdir(parents=True)
+    default_pointer.write_text(
+        "MILOCO_HOME=/data/default\nMILOCO_AGENT_PLATFORM=hermes\n",
+        encoding="utf-8",
+    )
+    profile = tmp_path / "profiles" / "partial.env"
+    profile.parent.mkdir()
+    profile.write_text("MILOCO_HOME=/data/profile\n", encoding="utf-8")
+    monkeypatch.setenv("MILOCO_RUNTIME_ENV", str(profile))
+
+    assert installer._resolve_install_home("hermes") == Path("/data/profile")
+
+
 def test_resolve_install_home_prefers_explicit_env(
     monkeypatch, installer, tmp_path
 ):
@@ -226,6 +244,42 @@ def test_resolve_install_home_prefers_explicit_env(
     assert installer._resolve_install_home("hermes") == (
         tmp_path / "explicit-miloco"
     )
+
+
+def test_warn_runtime_pointer_overwrite_is_localized(
+    monkeypatch, installer, tmp_path, capsys
+):
+    _fake_home(monkeypatch, installer, tmp_path)
+    pointer = tmp_path / ".config" / "miloco" / "default.env"
+    pointer.parent.mkdir(parents=True)
+    pointer.write_text(
+        "MILOCO_HOME=/data/hermes\nMILOCO_AGENT_PLATFORM=hermes\n",
+        encoding="utf-8",
+    )
+    i18n = installer.I18n("en", Path(installer.__file__).parent)
+
+    installer._warn_runtime_pointer_overwrite("openclaw", i18n)
+
+    warning = capsys.readouterr().err
+    assert "currently targets hermes" in warning
+    assert "MILOCO_RUNTIME_ENV" in warning
+
+
+def test_warn_runtime_pointer_overwrite_skips_same_platform(
+    monkeypatch, installer, tmp_path, capsys
+):
+    _fake_home(monkeypatch, installer, tmp_path)
+    pointer = tmp_path / ".config" / "miloco" / "default.env"
+    pointer.parent.mkdir(parents=True)
+    pointer.write_text(
+        "MILOCO_HOME=/data/hermes\nMILOCO_AGENT_PLATFORM=hermes\n",
+        encoding="utf-8",
+    )
+    i18n = installer.I18n("en", Path(installer.__file__).parent)
+
+    installer._warn_runtime_pointer_overwrite("hermes", i18n)
+
+    assert capsys.readouterr().err == ""
 
 
 def test_resolve_uninstall_home_from_pointer_without_runtime(

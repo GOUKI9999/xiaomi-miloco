@@ -602,6 +602,12 @@ if [ -f "$SUPERVISORD_CONF" ]; then
 import re, sys
 path, new_home = sys.argv[1], sys.argv[2]
 text = open(path, encoding='utf-8').read()
+if "\n" in new_home or "\r" in new_home:
+    raise SystemExit("MILOCO_HOME 不能包含换行符")
+if "'" in new_home and '"' in new_home:
+    raise SystemExit("MILOCO_HOME 不能同时包含单引号和双引号")
+if re.search(r"\s[#;]", new_home):
+    raise SystemExit("MILOCO_HOME 不能在空白字符后包含 # 或 ;")
 escaped = new_home.replace('%', '%%')
 if "'" not in escaped and ('"' in escaped or '\\' in escaped):
     rendered = f"MILOCO_HOME='{escaped}'"

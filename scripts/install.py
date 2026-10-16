@@ -8,17 +8,17 @@
 # [tool.uv]
 # exclude-newer = "2026-04-30"
 # ///
-"""Miloco 安装器——Python 核心逻辑。
+"""Miloco 安装器的 Python 核心逻辑。
 
-Handles the full installation flow:
-  Phase 1: Environment check
-  Phase 2: Package install + 平台进程管理器 (Linux supervisord / macOS 签名启动器)
-           (web 静态资源由 miloco wheel 自带)
-  Phase 3: Initialize service (engine warm-up; 仅临时拉起，退出时自动 stop)
-  Phase 4: Mi Home account binding
-  Phase 5: Omni model configuration
-  Phase 6: Perception model download
-  Phase 7: OpenClaw plugin installation (optional)
+完整处理以下安装流程：
+  阶段 1：环境检查
+  阶段 2：安装软件包和平台进程管理器（Linux supervisord / macOS 签名启动器；
+          web 静态资源由 miloco wheel 自带）
+  阶段 3：初始化服务（引擎预热；仅临时启动，退出时自动停止）
+  阶段 4：绑定米家账号
+  阶段 5：配置 Omni 模型
+  阶段 6：下载感知模型
+  阶段 7：安装 Agent 插件（可选）
 """
 
 from __future__ import annotations
@@ -2127,18 +2127,44 @@ def _resolve_install_home(agent_platform: str) -> Path:
     """解析本次安装使用的数据目录，并保留同平台已持久化的自定义目录。
 
     显式 ``MILOCO_HOME`` 最优先；否则依次读取 ``MILOCO_RUNTIME_ENV`` 指定的
-    profile 和默认指针。指针的平台必须与本次选择一致，避免切换 agent 平台时
-    误复用另一平台的数据目录。没有匹配指针时才回退平台默认目录。
+    profile 和默认指针。profile 缺少平台字段时从低优先级候选补齐，与 CLI 和
+    shell header 的按键合并语义一致；补齐后平台仍须与本次选择一致，避免切换
+    agent 平台时误复用另一平台的数据目录。没有匹配指针时才回退平台默认目录。
     """
     if env_home := os.environ.get("MILOCO_HOME"):
         return Path(env_home).expanduser()
-    for path in _runtime_pointer_candidates():
-        values = _read_runtime_pointer(path)
-        if values.get("MILOCO_AGENT_PLATFORM") != agent_platform:
+    candidates = [
+        _read_runtime_pointer(path) for path in _runtime_pointer_candidates()
+    ]
+    for index, values in enumerate(candidates):
+        persisted_home = values.get("MILOCO_HOME")
+        if not persisted_home:
             continue
-        if persisted_home := values.get("MILOCO_HOME"):
+        platform = values.get("MILOCO_AGENT_PLATFORM", "")
+        if not platform:
+            for lower_priority in candidates[index + 1 :]:
+                platform = lower_priority.get("MILOCO_AGENT_PLATFORM", "")
+                if platform:
+                    break
+        if platform == agent_platform:
             return Path(persisted_home).expanduser()
     return _default_miloco_home(agent_platform)
+
+
+def _warn_runtime_pointer_overwrite(agent_platform: str, i18n: I18n) -> None:
+    """默认指针将切换平台时提示使用独立 profile，避免旧目录静默失联。"""
+    existing = _read_runtime_pointer(_default_runtime_pointer())
+    existing_platform = existing.get("MILOCO_AGENT_PLATFORM", "")
+    if existing_platform and existing_platform != agent_platform:
+        warning = i18n.t(
+            "platform.pointer_overwrite_warning",
+            existing_platform,
+            agent_platform,
+        )
+        print(
+            f"[install] {warning}",
+            file=sys.stderr,
+        )
 
 
 def _write_runtime_pointer(miloco_home: Path, agent_platform: str) -> Path:
@@ -2234,6 +2260,7 @@ def main() -> None:
     # 关键：导出到 environ，让所有子进程 (miloco-cli / supervisord / backend / 打包 wheel
     # 起的 miloco.main) 继承正确的 MILOCO_HOME，否则 backend fallback 到 ~/.openclaw/miloco。
     os.environ["MILOCO_HOME"] = str(miloco_home)
+    _warn_runtime_pointer_overwrite(agent_platform, ui.i18n)
     _write_runtime_pointer(miloco_home, agent_platform)
 
     # Agent mode: --agent-prepare or --agent-finish implies non-interactive agent flow
