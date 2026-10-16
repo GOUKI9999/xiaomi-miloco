@@ -328,10 +328,6 @@ def _migrate_v5_action_link(conn: sqlite3.Connection) -> None:
     )
 
 
-# 步进迁移注册表:{target_version: fn}。fn 以 additive DDL 为主,须幂等
-# (v5 例外:另含一次老行回填,同样幂等)。
-
-
 def _migrate_v6_action_auth_state(conn: sqlite3.Connection) -> None:
     """v5 → v6:给 action_ledger 补下发时的米家授权状态列 auth_state(幂等)。
 
@@ -349,6 +345,10 @@ def _migrate_v6_action_auth_state(conn: sqlite3.Connection) -> None:
     cols = {r[1] for r in conn.execute("PRAGMA table_info(action_ledger)")}
     if "auth_state" not in cols:
         conn.execute("ALTER TABLE action_ledger ADD COLUMN auth_state TEXT")
+
+
+# 步进迁移注册表:{target_version: fn}。fn 以 additive DDL 为主,须幂等
+# (v5 例外:另含一次老行回填,同样幂等)。
 _MIGRATIONS = {
     2: _migrate_v2_action_ledger,
     3: _migrate_v3_action_source,

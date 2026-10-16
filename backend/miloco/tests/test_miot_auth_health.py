@@ -1228,3 +1228,77 @@ async def test_the_retry_loop_stops_rotating_once_a_rebind_landed():
     )
     assert proxy._oauth_info.refresh_token == "rebound_rt", "刚绑好的那枚必须原样留着"
 
+
+# ─────────────── 状态接口下发的授权字段 ───────────────
+
+#: 状态接口必须带出去的授权字段。消费端（网页状态条、体检）一律 ``.get()`` 兜底
+#: ——漏铺一个键、或键名改了，后端不报错、不打日志、也不 500，只是界面上的失效
+#: 徽标与体检结论悄悄消失；这几个键名在 backend 侧没有别的落点，只能在这里钉住。
+AUTH_FIELD_KEYS = (
+    "auth_state",
+    "auth_degraded_since",
+    "auth_error_code",
+    "auth_last_success",
+)
+
+
+async def _bind_status(proxy, *, token_valid: bool, bound: bool) -> dict:
+    """驱动一次状态接口的取数。
+
+    服务用 ``__new__`` 造、只挂代理：真构造函数要起 LRUStore，与这条下发路径无关
+    （同一手法见 test_miot_auth_cutoff）。令牌校验与用户信息都桩掉——要验的是字段
+    怎么铺出去，不是它们怎么问回来。
+    """
+    from miloco.miot.service import MiotService
+
+    proxy.check_token_valid = AsyncMock(return_value=token_valid)
+    proxy.get_user_info = AsyncMock(return_value={"uid": "u1"} if bound else None)
+    svc = MiotService.__new__(MiotService)
+    svc._miot_proxy = proxy
+    return await svc.get_miot_bind_status()
+
+
+@pytest.mark.asyncio
+async def test_bind_status_carries_auth_fields_when_bound():
+    """已绑定那一支：四个字段带全，取值跟着健康度走，正常态不留降级痕迹。
+
+    「失效之后界面还显示一切正常」正是这个 PR 要消灭的那件事，而消灭它的唯一数据
+    通路就是这几个字段——前端徽标与体检判定都只认键名，钉在取值上才拦得住漂移。
+    """
+    proxy = _make_proxy(_FakeKV())
+
+    status = await _bind_status(proxy, token_valid=True, bound=True)
+    assert set(AUTH_FIELD_KEYS) <= set(status), "正常态那一支漏铺了授权字段"
+    assert status["auth_state"] == "ok"
+    assert status["auth_degraded_since"] is None, "正常态不该留着降级时刻"
+    assert status["auth_error_code"] is None, "正常态不该留着失败码"
+
+    degraded, _ = proxy.auth_health.mark_failure(
+        permanent=True,
+        code=MIoTErrorCode.CODE_OAUTH_INVALID_REFRESH_TOKEN.value,
+        message="invalid refresh token",
+    )
+    proxy._auth_health = degraded
+
+    status = await _bind_status(proxy, token_valid=True, bound=True)
+    assert status["auth_state"] == "degraded"
+    assert status["auth_degraded_since"] is not None, "不给时刻，界面说不出「自何时起」"
+    assert (
+        status["auth_error_code"] == MIoTErrorCode.CODE_OAUTH_INVALID_REFRESH_TOKEN.value
+    )
+
+
+@pytest.mark.asyncio
+async def test_bind_status_carries_auth_fields_when_token_check_fails():
+    """令牌验不过那一支也要带全——它走的是另一个 return，字段是各铺各的。
+
+    界面此时显示「未绑定」，而「授权失效」与「没绑」要靠这几个字段分开说：缺了
+    它们，一次失效要么被读成没绑，要么干脆什么都不显示。
+    """
+    proxy = _make_proxy(_FakeKV())
+
+    status = await _bind_status(proxy, token_valid=False, bound=False)
+    assert status["is_bound"] is False
+    assert set(AUTH_FIELD_KEYS) <= set(status), "未绑定那一支漏铺了授权字段"
+    assert status["auth_state"] == "ok"
+

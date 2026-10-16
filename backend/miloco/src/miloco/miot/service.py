@@ -354,6 +354,11 @@ async def _trigger_scene(
             error=_refusal_ledger_reason(miot_proxy),
             source=source, source_id=source_id,
             home_id=_degraded_scene_home(miot_proxy, scene_id),
+            # 链路两列与同函数其余三处写入同一口径。被拒的行同样要挂得回触发它的
+            # 事件：漏传时 source 写着 rule、两列却是 NULL，而折叠视图只在两列有值
+            # 时才认父子，这条会被兜底读成「没有触发源」（人手直控 / 动态槽）——
+            # 规则触发的事实恰好在这一档上被抹掉。
+            phase=phase, trigger_event_id=trigger_event_id,
         )
         # 措辞取代理层那一处：它把「从未绑定 / 刚解绑」与「绑着但凭据废了」分开
         # 说，这里自己拼一份的话，没绑定的机器上会让住户去「重新绑定」一个他没绑
