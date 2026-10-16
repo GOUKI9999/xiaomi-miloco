@@ -154,6 +154,80 @@ def test_write_runtime_pointer_quotes_paths_and_preserves_unknown_lines(
     assert oct(pointer.stat().st_mode & 0o777) == "0o600"
 
 
+def test_resolve_install_home_preserves_same_platform_pointer(
+    monkeypatch, installer, tmp_path
+):
+    _fake_home(monkeypatch, installer, tmp_path)
+    custom_home = tmp_path / "custom miloco"
+    pointer = tmp_path / ".config" / "miloco" / "default.env"
+    pointer.parent.mkdir(parents=True)
+    pointer.write_text(
+        f"MILOCO_HOME='{custom_home}'\nMILOCO_AGENT_PLATFORM=hermes\n",
+        encoding="utf-8",
+    )
+
+    resolved = installer._resolve_install_home("hermes")
+    installer._write_runtime_pointer(resolved, "hermes")
+
+    assert resolved == custom_home
+    assert f"MILOCO_HOME='{custom_home}'" in pointer.read_text(encoding="utf-8")
+
+
+def test_resolve_install_home_ignores_pointer_for_other_platform(
+    monkeypatch, installer, tmp_path
+):
+    _fake_home(monkeypatch, installer, tmp_path)
+    pointer = tmp_path / ".config" / "miloco" / "default.env"
+    pointer.parent.mkdir(parents=True)
+    pointer.write_text(
+        "MILOCO_HOME=/data/openclaw\nMILOCO_AGENT_PLATFORM=openclaw\n",
+        encoding="utf-8",
+    )
+
+    assert installer._resolve_install_home("hermes") == (
+        tmp_path / ".hermes" / "miloco"
+    )
+
+
+def test_resolve_install_home_prefers_selected_profile(
+    monkeypatch, installer, tmp_path
+):
+    _fake_home(monkeypatch, installer, tmp_path)
+    default_pointer = tmp_path / ".config" / "miloco" / "default.env"
+    default_pointer.parent.mkdir(parents=True)
+    default_pointer.write_text(
+        "MILOCO_HOME=/data/default\nMILOCO_AGENT_PLATFORM=hermes\n",
+        encoding="utf-8",
+    )
+    profile = tmp_path / "profiles" / "custom.env"
+    profile.parent.mkdir()
+    profile.write_text(
+        "MILOCO_HOME=/data/profile\nMILOCO_AGENT_PLATFORM=hermes\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("MILOCO_RUNTIME_ENV", str(profile))
+
+    assert installer._resolve_install_home("hermes") == Path("/data/profile")
+
+
+def test_resolve_install_home_prefers_explicit_env(
+    monkeypatch, installer, tmp_path
+):
+    _fake_home(monkeypatch, installer, tmp_path)
+    pointer = tmp_path / ".config" / "miloco" / "default.env"
+    pointer.parent.mkdir(parents=True)
+    pointer.write_text(
+        "MILOCO_HOME=/data/persisted\nMILOCO_AGENT_PLATFORM=hermes\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("MILOCO_HOME", "~/explicit-miloco")
+
+    assert installer._resolve_install_home("hermes") == (
+        tmp_path / "explicit-miloco"
+    )
+
+
 def test_resolve_uninstall_home_from_pointer_without_runtime(
     monkeypatch, installer, tmp_path
 ):

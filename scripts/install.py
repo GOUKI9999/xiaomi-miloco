@@ -2123,6 +2123,24 @@ def _default_miloco_home(agent_platform: str) -> Path:
     return Path.home() / ".openclaw" / "miloco"
 
 
+def _resolve_install_home(agent_platform: str) -> Path:
+    """解析本次安装使用的数据目录，并保留同平台已持久化的自定义目录。
+
+    显式 ``MILOCO_HOME`` 最优先；否则依次读取 ``MILOCO_RUNTIME_ENV`` 指定的
+    profile 和默认指针。指针的平台必须与本次选择一致，避免切换 agent 平台时
+    误复用另一平台的数据目录。没有匹配指针时才回退平台默认目录。
+    """
+    if env_home := os.environ.get("MILOCO_HOME"):
+        return Path(env_home).expanduser()
+    for path in _runtime_pointer_candidates():
+        values = _read_runtime_pointer(path)
+        if values.get("MILOCO_AGENT_PLATFORM") != agent_platform:
+            continue
+        if persisted_home := values.get("MILOCO_HOME"):
+            return Path(persisted_home).expanduser()
+    return _default_miloco_home(agent_platform)
+
+
 def _write_runtime_pointer(miloco_home: Path, agent_platform: str) -> Path:
     """写入与 CLI 配置及 Hermes 安装脚本共用的 runtime 指针格式。"""
     runtime_dir = _default_runtime_pointer().parent
@@ -2210,9 +2228,7 @@ def main() -> None:
         return
 
     agent_platform = _decide_agent_platform(args, plat, ui)
-    miloco_home = Path(
-        os.environ.get("MILOCO_HOME") or _default_miloco_home(agent_platform)
-    )
+    miloco_home = _resolve_install_home(agent_platform)
     miloco_home.mkdir(parents=True, exist_ok=True)
     _warn_legacy_hermes_home(miloco_home, agent_platform, ui.i18n)
     # 关键：导出到 environ，让所有子进程 (miloco-cli / supervisord / backend / 打包 wheel
