@@ -66,7 +66,7 @@ from miloco.schedule.router import router as schedule_router
 from miloco.schedule.runner import get_runner as get_schedule_runner
 from miloco.task.router import router as task_router
 from miloco.task_record.router import router as task_record_router
-from miloco.utils.common import escape_for_js_string
+from miloco.utils.common import escape_for_js_string, safe_log
 from miloco.utils.paths import miloco_home
 
 load_dotenv()
@@ -480,6 +480,12 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
         except asyncio.CancelledError:
             # 这个 CancelledError 是上一行 cancel() 自己引发的，不是外面在取消我们
             pass
+    # iot 源排在停容器之前退订: 反了的话容器会往一个已停的消费方投递, 而 subscribe
+    # 的 docstring 提醒过「退订不保证返回之后不再被回调」。
+    service = get_manager().rule_service
+    iot_source = service.iot_source if service is not None else None
+    if iot_source is not None:
+        await iot_source.stop()
     get_manager().deinit_iot_push()
     get_manager().state_store.stop()
 
@@ -721,7 +727,10 @@ async def spa_handler(full_path: str, request: Request):
             # 真 path-traversal(..%2Fetc/passwd 等)→ 不在 static_dir 内 → 404。
             # warning 级 log 让运维事后审计能发现扫描器;截断 200 字符防灌爆 log,
             # %r repr 转义防 log injection。
-            logger.warning("spa_handler path-traversal blocked: %r", full_path[:200])
+            logger.warning(
+                "spa_handler path-traversal blocked: %r",
+                safe_log(full_path[:200]),
+            )
             return Response(status_code=404, content="404 Not Found")
         if real_file.is_file():
             # Cache-Control:vite 输出 /assets/*.{js,css,woff2} 都带 hash,内容

@@ -13,6 +13,7 @@ from fastapi import APIRouter, Depends, Query
 from miloco.manager import get_manager
 from miloco.middleware import verify_token
 from miloco.middleware.exceptions import BusinessException
+from miloco.rule.iot_source import source_not_running
 from miloco.rule.schema import (
     Rule,
     RuleDirection,
@@ -21,6 +22,7 @@ from miloco.rule.schema import (
     RuleUpdate,
 )
 from miloco.schema.common_schema import NormalResponse
+from miloco.utils.common import safe_log
 from miloco.utils.time_utils import parse_iso_ms, since_to_ms
 
 logger = logging.getLogger(__name__)
@@ -55,7 +57,7 @@ async def create_rule(rule: Rule, current_user: str = Depends(verify_token)):
     Response data includes V3 fields needed by miloco-cli stdout:
     rule_id / name / task_id / direction / mode / lifecycle.
     """
-    logger.info("Create rule - User: %s, Name: %s", current_user, rule.name)
+    logger.info("Create rule - User: %s, Name: %s", safe_log(current_user), safe_log(rule.name))
     rule_id = await manager.rule_service.create_rule(rule)
     return NormalResponse(
         code=0,
@@ -90,9 +92,9 @@ async def get_all_rules(
     """
     logger.info(
         "Get all rules - User: %s, enabled_only: %s, include_milestone: %s",
-        current_user,
-        enabled_only,
-        include_milestone,
+        safe_log(current_user),
+        safe_log(enabled_only),
+        safe_log(include_milestone),
     )
     # 「启用」是派生量: 用户意图 AND task 未停用。直接读 enabled 列会把停用 task
     # 名下的规则报成启用, 用户排查"规则为什么不触发"时正好被这个答案带偏。
@@ -113,6 +115,34 @@ async def get_all_rules(
 
 
 # ---- Logs (must be before /{rule_id} to avoid path conflict) ----
+
+
+def build_iot_diagnostics(iot_source) -> dict:
+    """iot 源的自述。源没接上来时给一份「没在跑」而不是抛。
+
+    那个分支生产 HTTP 路径打不到：``rule_service`` 在 lifespan 的 ``initialize()`` 里
+    就建好，而端口是启动段跑完才 listen。留着是为了这个函数能脱离 Manager 单测；两个
+    分支同形由 ``source_not_running`` 保证。
+    """
+    if iot_source is None:
+        return source_not_running("iot 源没有启动")
+    return iot_source.diagnostics()
+
+
+@router.get(
+    "/iot/diagnostics",
+    summary="IoT trigger source diagnostics",
+    response_model=NormalResponse,
+)
+async def get_iot_diagnostics(current_user: str = Depends(verify_token)):
+    """每条 iot 条件项现在是真是假还是未就绪、为什么，以及消费协程还活着吗。
+
+    **debug 级日志**：读诊断不该在诊断对象的日志里留痕。
+    """
+    logger.debug("IoT diagnostics API called, user=%s", safe_log(current_user))
+    service = get_manager().rule_service
+    data = build_iot_diagnostics(service.iot_source if service is not None else None)
+    return NormalResponse(code=0, message="ok", data=data)
 
 
 @router.get("/logs", summary="Get Rule Logs", response_model=NormalResponse)
@@ -148,12 +178,12 @@ async def get_logs(
     after_ts = _resolve_after_ts(after, since)
     before_ts = parse_iso_ms(before, "before") if before is not None else None
     logger.info(
-        "Get rule logs - User: %s, limit: %d, after_ts: %s, before_ts: %s, kind: %s",
-        current_user,
-        limit,
-        after_ts,
-        before_ts,
-        kind,
+        "Get rule logs - User: %s, limit: %s, after_ts: %s, before_ts: %s, kind: %s",
+        safe_log(current_user),
+        safe_log(limit),
+        safe_log(after_ts),
+        safe_log(before_ts),
+        safe_log(kind),
     )
     logs, total = await manager.rule_service.get_logs(
         limit, after_ts=after_ts, before_ts=before_ts, kind=kind
@@ -171,7 +201,11 @@ async def cleanup_logs(
     current_user: str = Depends(verify_token),
 ):
     """Delete rule logs older than keep_days"""
-    logger.info("Cleanup rule logs - User: %s, keep_days: %d", current_user, keep_days)
+    logger.info(
+        "Cleanup rule logs - User: %s, keep_days: %s",
+        safe_log(current_user),
+        safe_log(keep_days),
+    )
     deleted = await manager.rule_service.cleanup_logs(keep_days)
     return NormalResponse(
         code=0,
@@ -195,7 +229,7 @@ async def trigger_rule(
 
     Called externally (e.g. by the perception engine) when conditions are met.
     """
-    logger.info("Trigger rule - User: %s, ID: %s", current_user, rule_id)
+    logger.info("Trigger rule - User: %s, ID: %s", safe_log(current_user), safe_log(rule_id))
     result = await manager.rule_service.trigger_rule(rule_id, request.context)
     if result is None:
         raise BusinessException(f"Rule '{rule_id}' not found or disabled")
@@ -208,7 +242,7 @@ async def trigger_rule(
 @router.get("/{rule_id}", summary="Get Rule", response_model=NormalResponse)
 async def get_rule(rule_id: str, current_user: str = Depends(verify_token)):
     """Get a single rule by ID"""
-    logger.info("Get rule - User: %s, ID: %s", current_user, rule_id)
+    logger.info("Get rule - User: %s, ID: %s", safe_log(current_user), safe_log(rule_id))
     rule = await manager.rule_service.get_rule(rule_id)
     return NormalResponse(code=0, message="Rule retrieved", data=rule)
 
@@ -218,7 +252,7 @@ async def update_rule(
     rule_id: str, rule: Rule, current_user: str = Depends(verify_token)
 ):
     """Full update of a rule"""
-    logger.info("Update rule - User: %s, ID: %s", current_user, rule_id)
+    logger.info("Update rule - User: %s, ID: %s", safe_log(current_user), safe_log(rule_id))
     rule.id = rule_id
     await manager.rule_service.update_rule(rule)
     return NormalResponse(code=0, message="Rule updated successfully", data=None)
@@ -231,7 +265,7 @@ async def patch_rule(
     rule_id: str, update: RuleUpdate, current_user: str = Depends(verify_token)
 ):
     """Partial update — only provided fields are changed"""
-    logger.info("Patch rule - User: %s, ID: %s", current_user, rule_id)
+    logger.info("Patch rule - User: %s, ID: %s", safe_log(current_user), safe_log(rule_id))
     await manager.rule_service.patch_rule(rule_id, update)
     return NormalResponse(code=0, message="Rule updated successfully", data=None)
 
@@ -239,7 +273,7 @@ async def patch_rule(
 @router.delete("/{rule_id}", summary="Delete Rule", response_model=NormalResponse)
 async def delete_rule(rule_id: str, current_user: str = Depends(verify_token)):
     """Delete a rule"""
-    logger.info("Delete rule - User: %s, ID: %s", current_user, rule_id)
+    logger.info("Delete rule - User: %s, ID: %s", safe_log(current_user), safe_log(rule_id))
     success = await manager.rule_service.delete_rule(rule_id)
     if not success:
         raise BusinessException("Rule deletion failed")
@@ -274,13 +308,14 @@ async def get_logs_by_rule(
     after_ts = _resolve_after_ts(after, since)
     before_ts = parse_iso_ms(before, "before") if before is not None else None
     logger.info(
-        "Get rule logs - User: %s, rule_id: %s, limit: %d, after_ts: %s, before_ts: %s, kind: %s",
-        current_user,
-        rule_id,
-        limit,
-        after_ts,
-        before_ts,
-        kind,
+        "Get rule logs - User: %s, rule_id: %s, limit: %s, after_ts: %s, "
+        "before_ts: %s, kind: %s",
+        safe_log(current_user),
+        safe_log(rule_id),
+        safe_log(limit),
+        safe_log(after_ts),
+        safe_log(before_ts),
+        safe_log(kind),
     )
     logs, total = await manager.rule_service.get_logs_by_rule_id(
         rule_id, limit, after_ts=after_ts, before_ts=before_ts, kind=kind

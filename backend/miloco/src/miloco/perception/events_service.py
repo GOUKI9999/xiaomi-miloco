@@ -35,6 +35,8 @@ from miloco.utils.paths import miloco_home
 if TYPE_CHECKING:
     from miloco.database.meaningful_events_dao import MeaningfulEventDao
 
+from miloco.utils.common import safe_log
+
 logger = logging.getLogger(__name__)
 
 SnapshotStatus = Literal["found", "gone", "not_found"]
@@ -51,19 +53,6 @@ _REF_FILENAME = "ref.jpg"
 # 事件级 omni trace(gzip JSON).Smart Crop 的 crop 坐标挂在其 calls[].crop 下,
 # read_crop_meta 从这里读 —— 不为画框另加 sidecar 文件.
 _TRACE_FILENAME = "omni_trace.json.gz"
-
-
-def _safe_log(value: object) -> str:
-    """写日志前去掉 CR/LF,防 log injection(CodeQL py/log-injection).同 schedule/router._safe_log.
-
-    凡来自 URL path / query / 配置 / 模型输出的值,写进日志前都该过一遍 —— 即便调用点
-    当下有校验保证注不进换行,那是**调用方校验**给的安全,不是这行日志自己的;校验哪天
-    放宽,伪造整行就会直接落进日志,而这种回归不会有任何测试变红.
-
-    注意保留 `.replace("\\n", ...)` 的字面量形态:CodeQL 只认第一个实参是字面量
-    "\\n" / "\\r\\n" 的 replace 为 sanitizer,改成正则或变量会重新触发告警.
-    """
-    return str(value).replace("\r", "").replace("\n", " ")
 
 
 def probe_has_ref(snapshot_root: Path, event_id: str, device_ids: list[str]) -> bool:
@@ -116,6 +105,18 @@ class EventsService:
         snapshot_root = get_snapshot_root()
         feedback_index = self.build_feedback_index()
         return [self._row_to_event(row, snapshot_root, feedback_index) for row in rows]
+
+    async def get_event(self, event_id: str) -> MeaningfulEvent | None:
+        """按主键取单条,给「反查动作的宿主事件」那条路用。
+
+        与列表口径的差别只有一处、且是刻意的:**不带时间窗**。要反查的场景恰恰是
+        「这条事件已经翻出当前窗口了」,再拿窗口去套它等于把唯一需要它的那条路堵死。
+        取不到返回 None,由调用方决定怎么说——那不是故障。
+        """
+        row = self._dao.get_by_id(event_id)
+        if row is None:
+            return None
+        return self._row_to_event(row, get_snapshot_root(), self.build_feedback_index())
 
     async def locate_clip(
         self, event_id: str, device_id: str
@@ -235,18 +236,20 @@ class EventsService:
                     # 这两个值来自 URL path.走到这里它们其实已过两道校验(_dao.get_by_id
                     # 查得到 + device_id 在 row["device_ids"] 内),即必然等于后端自己生成的
                     # UUID / 设备号,当下注不进换行 —— 但那是调用方校验给的安全,不是这行
-                    # 日志自己的,所以照样过 _safe_log。
+                    # 日志自己的,所以照样过 safe_log。
                     logger.warning(
                         "read_crop_meta bad crop meta event_id=%s device_id=%s: %s",
-                        _safe_log(event_id),
-                        _safe_log(device_id),
-                        e,
+                        safe_log(event_id),
+                        safe_log(device_id),
+                        safe_log(e),
                     )
                     return (self._no_box_status(event_id, device_id), None)
         except Exception as e:  # noqa: BLE001
             # path 里拼着 event_id,与上面那条同源 —— CodeQL 的 taint 没追进 Path 拼接
             # 只报了上面两处,但只清洗被点名的那处、留下这处,防线就是漏的。
-            logger.warning("read_crop_meta failed to parse trace %s: %s", _safe_log(path), e)
+            logger.warning(
+                "read_crop_meta failed to parse trace %s: %s", safe_log(path), safe_log(e)
+            )
             return (self._no_box_status(event_id, device_id), None)
         return (self._no_box_status(event_id, device_id), None)
 

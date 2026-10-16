@@ -22,12 +22,12 @@ from __future__ import annotations
 
 import json
 import logging
-import os
 import shutil
 import subprocess
 from pathlib import Path
 from typing import Any, Dict, List, Optional
-from datetime import datetime
+
+from .paths import hermes_home
 
 logger = logging.getLogger(__name__)
 
@@ -52,13 +52,6 @@ BIND_HINT_EXAMPLE: Dict[str, str] = {
 _STATE_FILENAME = "state.json"
 
 
-def _hermes_home() -> Path:
-    """返回当前 Hermes 数据目录，支持 ``HERMES_HOME=~/...``。"""
-    return Path(
-        os.environ.get("HERMES_HOME") or (Path.home() / ".hermes")
-    ).expanduser()
-
-
 def _load_channel_directory() -> dict:
     """读取 Hermes ``channel_directory.json`` 的平台可达 channel 列表。
 
@@ -72,7 +65,7 @@ def _load_channel_directory() -> dict:
             return result
     except Exception:
         pass
-    path = _hermes_home() / "channel_directory.json"
+    path = hermes_home() / "channel_directory.json"
     try:
         return json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
@@ -165,7 +158,7 @@ def _state_path(ctx: Any) -> Path:
         return Path(base) / _STATE_FILENAME
     # install-hermes.sh 把 plugin 装到 $HERMES_HOME/plugins/miloco/miloco-plugin/，
     # state.json 也写这。这是 source of truth。
-    return _hermes_home() / "plugins" / "miloco" / "miloco-plugin" / _STATE_FILENAME
+    return hermes_home() / "plugins" / "miloco" / "miloco-plugin" / _STATE_FILENAME
 
 
 def load_state(ctx: Any) -> Dict[str, Any]:

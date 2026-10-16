@@ -16,11 +16,12 @@
 
 一个 task 可以挂多条规则，每条规则用 `direction` 说明它的条件成立时对 task 意味着什么。
 
-| direction | 条件成立时 | 用在哪                                              |
-| --------- | ---------- | --------------------------------------------------- |
-| `enter`   | 该进入了   | 单次触发，不关注何时退出                            |
-| `exit`    | 该退出了   | 退出条件与进入条件互不相关时（比 V 手势进、挥手出） |
-| `session` | 会话进行中 | 进入与退出互为反面时（有人在→保持，人走了→关）      |
+| direction | 条件成立时 | 用在哪                                                                   |
+| --------- | ---------- | ------------------------------------------------------------------------ |
+| `enter`   | 该进入了   | 单次触发，不关注何时退出                                                 |
+| `exit`    | 该退出了   | 退出条件与进入条件互不相关时（比 V 手势进、挥手出）                      |
+| `session` | 会话进行中 | 进入与退出互为反面时（有人在→保持，人走了→关）                           |
+| `guard`   | 允许进入   | 命题里还有一个必须同时成立的背景状态时（门锁开着）；自己不触发、不配动作 |
 
 - 进入与退出可以由**两条不相关的规则**各自负责，不必互为反面
 - 多条 `enter` 挂同一个 task 是 OR：任一条成立就进入，动作只执行一次
@@ -29,7 +30,7 @@
 - **DYNAMIC**：规则只写意图描述，触发时交给 Agent 结合当时上下文决定具体操作
 - **动作挂在 task 上**：进入 / 退出 / 达标三个槽，`miloco-cli task set-actions` 配。单方向规则也可以在建规则时直接带动作，由方向决定它落哪个槽
 - **生命周期**：permanent（永久存在）和 temporary（Agent 判断终止条件后自删）两种
-- **duration 扩展**：任何方向都支持可选的滑动窗口累计触发——设置后条件需在窗口内达到指定比例才触发，而非单帧 True 即触发
+- **duration 扩展**：触发方向都支持可选的滑动窗口累计触发（`guard` 不支持）——设置后条件需在窗口内达到指定比例才触发，而非单帧 True 即触发
 
 ### 典型场景
 
@@ -78,6 +79,10 @@
   达标（TARGET_FIRED）走同一条链，只是 ① 层不是画面而是记账：record 源按"还差多少"
   排一个定时器，到点重新读账、够了就喂真。"今天通知过没有"由条件本身的值承载 ——
   已经是真就产不出新边沿，跨日归零把它翻假，第二天达标才是新的假→真。
+
+另一条入口：设备属性变化（iot 源）。状态容器里 iot/device/*/prop/* 或 status/online
+一变，IotSource（rule/iot_source.py）按 (did, iid) 索引出引用了这条属性的规则，只把那
+几条放进待算集合重新求值 —— 不走感知那条帧级链路，但汇入上面同一个 ①②③④。
 ```
 
 ### 核心模块
@@ -87,10 +92,13 @@
 | `RuleService`        | `rule/service.py`             | 规则 CRUD + 一致性校验：执行路径矩阵、lifecycle、query 措辞、idempotent/cooldown 配对、task 名下规则组合的合法性、task 存在性与规则重名，均在 create/update 流程强制校验；达标规则由它按 task 配置代建与撤销 |
 | `RuleRunner`         | `rule/runner.py`              | ①②③ 层：per-(rule_id, source_did) 布尔聚合 + 抗抖 + duration 滑窗 + 边沿 diff + 方向映射；STATIC 直调 MiotProxy，DYNAMIC 走 dispatch_event                                                                   |
 | `RecordSource`       | `rule/record_source.py`       | 达标这个源：把"当日累计够没够"算成条件项的布尔，自己按剩余量排定时器                                                                                                                                         |
+| `IotSource`          | `rule/iot_source.py`          | 设备属性这个源：把一条 MIoT 属性的当前值判成条件项的布尔。订阅[设备状态容器](device-state-store.md)，按 (did, iid) 索引只重算受影响的规则；重连后按 iid 从云端补拉它关心的那几条属性                         |
 | `TaskStateMachine`   | `task/state_machine.py`       | ④ 层：per-task 的 runtime_state、幂等消费（多条规则进只执行一次）、方向映射的唯一落点 `slot_for_edge`                                                                                                        |
 | `TerminateEvaluator` | `rule/terminate_evaluator.py` | temporary 规则的后台评估服务；其到期删除实际由 Agent 经 `miloco-terminate-task` 完成                                                                                                                         |
 
 规则 schema 定义见 `rule/schema.py`（`Rule` / `RuleAction` / `RuleDirection` / `RuleEvent` / `RuleLifecycle`）。`RuleMode` 是被 `RuleDirection` 取代的旧字段，expand-contract 阶段 A 期间仍在表上，读侧一律走 `Rule.resolved_direction`。
+
+**条件项的来源（`source_type`）有三条**：`omni`（画面，走感知链路）/ `record`（记账达标）/ `iot`（设备属性）。`RuleRunner` 按它分发到不同的源实现；创建时对不认识的取值直接拒，不静默当 omni。
 
 ### 关键设计决策
 
@@ -104,7 +112,7 @@
 
 **帧级抗抖**：主要针对 True→False 的疑似漏识——单帧翻转不立即采信，需连续确认才认定状态改变，避免 VLM 单帧漏识/幻觉导致状态反复抖动。这一机制不同于退出防抖（后者是确认已退出后的延迟执行）。
 
-**duration 滑动窗口**：任何方向都支持可选的 `duration_seconds` + `duration_ratio` 配置。启用后，RuleRunner 维护 per-rule 滑窗，记录窗口内各帧的 True/False 比例，达标才触发。单方向规则触发后清窗口，支持周期 fire；`session` 以达标作为进入的前置门槛，进行期间不重复 fire。`duration_ratio` 未显式设置时由配置段的默认值回填（见 `settings.yaml::rule` / `settings.py` 的 `RuleSettings`）。
+**duration 滑动窗口**：触发方向都支持可选的 `duration_seconds` + `duration_ratio` 配置（`guard` 不支持）。启用后，RuleRunner 维护 per-rule 滑窗，记录窗口内各帧的 True/False 比例，达标才触发。单方向规则触发后清窗口，支持周期 fire；`session` 以达标作为进入的前置门槛，进行期间不重复 fire。`duration_ratio` 未显式设置时由配置段的默认值回填（见 `settings.yaml::rule` / `settings.py` 的 `RuleSettings`）。
 
 **累计达标通知**：给 task 配 `on_target_desc`（`task set-actions`），前提是它挂了 duration 型 record 且设了 target_minutes。达标规则**不由用户建**——task 的达标动作、活跃的时长记账、记账上的阈值三样齐备时服务端自动生成一条 `direction=milestone` 的规则，任一样消失就删掉。它不出现在 `rule list`（`--show-milestone` 可看）和 `task get` 里，用户主动建会被拒。做成派生物是因为装配是分步的，中间态必然有一半不成立，而派生量没有中间态。
 
@@ -113,6 +121,17 @@
 **STATIC 动作两重检查**：执行前做幂等检查（先查当前属性值，已达目标则跳过）和冷却检查（冷却窗口内跳过，适合 TTS 等不宜频繁触发的动作）。`idempotent=false` 的动作必须配 `cooldown_minutes`，service 层在 CRUD 时强制校验。
 
 **STATIC 动作三种形态**：`iid` 决定形态——`prop.<siid>.<piid>` 走属性直控（带 `value`），`action.<siid>.<aiid>` 走 method call（带 `params`，如 TTS），`scene` 触发米家场景（`did` 位置放 scene_id，无 `value`/`params`）。场景读不到当前值，无法做幂等比对，所以强制 `idempotent=false` + `cooldown_minutes`，去重只靠冷却；冷却键是 `(did, iid)`，同一条规则里的多个场景互不干扰。场景执行复用 `MiotService` 的家庭白名单校验和场景台账，与 CLI 手动触发落同一形状，仅 `source` 标成 `rule`、`source_id` 写 rule_id。
+
+**冷却时间戳的落地判据是「指令是否可能已执行」，不是「是否成功」**：
+
+| 动作结果                                                                   | 台账 success | 落冷却 | 为什么                                                                                                                                                                                                                      |
+| -------------------------------------------------------------------------- | ------------ | ------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| 成功                                                                       | true         | 是     | —                                                                                                                                                                                                                           |
+| 结果未知（`-10006` 超时 / `-10041` 回包结构不认识 / `-10040` 回包非 JSON） | **false**    | **是** | 这三个码的前提是请求已到过本地网关、指令**可能已执行**；不落冷却的话人还在动、规则几秒后再触发就会把「窗帘 +10%」又执行一遍，把 SDK 层刻意避开的双发重新引入（见 [设备控制](device-control.md#控制优先走本地中枢云端兜底)） |
+| 空返回 / `None` / 不可判定                                                 | false        | **否** | 请求未必发出去过，误落冷却会压掉用户接下来的真实动作                                                                                                                                                                        |
+| 设备明确拒绝（普通 spec 失败码）                                           | false        | 否     | 确定没执行，压掉后续重试没有收益                                                                                                                                                                                            |
+
+判定函数是 `result_codes.is_result_unknown`。注意「结果未知」仍然算失败——用户必须知道这次没拿到确认，冷却只是关掉重复执行的窗口。
 
 **query 措辞校验**：`RuleService` 在创建和更新规则时拒绝以"检测到"/"识别到"/"感知到"等断言性词汇开头的 query。这类措辞被注入 Omni prompt 后，VLM 会把 query 当成已发生事实而非待判断条件，导致连续误触发。query 应改写为进行时状态描述（如"有人坐在书房桌前"而非"检测到有人进入书房"）。
 

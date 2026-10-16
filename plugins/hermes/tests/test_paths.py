@@ -13,6 +13,20 @@ from __future__ import annotations
 from pathlib import Path
 
 
+def test_hermes_home_expands_tilde(monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", "~/my-hermes")
+    from miloco_plugin_pkg import paths
+
+    assert paths.hermes_home() == Path.home() / "my-hermes"
+
+
+def test_hermes_home_falls_back_to_user_home(monkeypatch):
+    monkeypatch.delenv("HERMES_HOME", raising=False)
+    from miloco_plugin_pkg import paths
+
+    assert paths.hermes_home() == Path.home() / ".hermes"
+
+
 def test_miloco_home_uses_env_override(monkeypatch, tmp_path):
     """MILOCO_HOME 设了就用它，不看默认值。"""
     monkeypatch.setenv("MILOCO_HOME", str(tmp_path))

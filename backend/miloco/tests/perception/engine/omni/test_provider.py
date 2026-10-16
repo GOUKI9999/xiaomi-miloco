@@ -7,6 +7,7 @@ from miloco.perception.engine.omni.provider import (
     MiMoAdapter,
     OpenAICompatAdapter,
     QwenOmniAdapter,
+    build_request_headers,
     get_adapter,
 )
 
@@ -21,9 +22,38 @@ _AUDIO_MEDIA = LocalMediaInfo(
 _MESSAGES = [{"role": "user", "content": "test"}]
 
 
+class TestBuildRequestHeaders:
+    adapter = MiMoAdapter()
+
+    def test_opencode_go_gets_stable_session_header(self):
+        first = build_request_headers(
+            self.adapter, "https://opencode.ai/zen/go/v1", "secret-key"
+        )
+        second = build_request_headers(
+            self.adapter, "https://opencode.ai/zen/go/v1/", "secret-key"
+        )
+
+        assert first["x-opencode-session"] == second["x-opencode-session"]
+        assert first["x-opencode-session"].startswith("ses_")
+        assert len(first["x-opencode-session"]) == 36
+        assert "secret-key" not in first["x-opencode-session"]
+        assert first["User-Agent"].startswith("xiaomi-miloco/")
+        assert first["Authorization"] == "Bearer secret-key"
+
+    def test_other_endpoints_do_not_get_opencode_header(self):
+        for base_url in (
+            "https://api.openai.com/v1",
+            "https://opencode.ai/zen/v1",
+            "https://opencode.ai.evil.example/zen/go/v1",
+            "http://opencode.ai/zen/go/v1",
+        ):
+            headers = build_request_headers(self.adapter, base_url, "secret-key")
+            assert "x-opencode-session" not in headers
+
+
 class TestGetAdapter:
     def test_mimo_default(self):
-        assert isinstance(get_adapter("xiaomi/mimo-v2.5"), MiMoAdapter)
+        assert isinstance(get_adapter("mimo-v2.6-flash"), MiMoAdapter)
 
     def test_mimo_unknown(self):
         assert isinstance(get_adapter("some-unknown-model"), MiMoAdapter)
@@ -48,12 +78,12 @@ class TestGetAdapter:
 
     def test_openai_compat_family(self):
         # MiMo / Qwen 都归 OpenAI 兼容族；Gemini 不是。
-        assert isinstance(get_adapter("xiaomi/mimo-v2.5"), OpenAICompatAdapter)
+        assert isinstance(get_adapter("mimo-v2.6-flash"), OpenAICompatAdapter)
         assert isinstance(get_adapter("qwen3.5-omni-flash"), OpenAICompatAdapter)
         assert not isinstance(get_adapter("gemini-3-flash-preview"), OpenAICompatAdapter)
 
     def test_singleton(self):
-        assert get_adapter("xiaomi/mimo-v2.5") is get_adapter("xiaomi/mimo-v2.5")
+        assert get_adapter("mimo-v2.6-flash") is get_adapter("mimo-v2.6-flash")
         assert get_adapter("qwen3.5-omni-flash") is get_adapter("qwen3.5-omni-plus")
         assert get_adapter("gemini-3-flash") is get_adapter("gemini-3-pro")
 
@@ -68,14 +98,16 @@ class TestMiMoAdapter:
         assert block["media_resolution"] == "max"
         assert block["video_url"]["url"].startswith("data:video/mp4;base64,")
 
-    def test_audio_block(self):
+    def test_audio_block_has_format(self):
+        """根因回归守护:audio 块缺 format 是 2026-07-29 422×3 → OPEN_CONFIG 停摆的起点。"""
         block = self.adapter.build_audio_block("BBBB", _AUDIO_MEDIA)
         assert block["type"] == "input_audio"
+        assert block["input_audio"]["format"] == "m4a"
         assert block["input_audio"]["data"].startswith("data:audio/m4a;base64,")
 
     def test_request_body_non_stream(self):
         body = self.adapter.build_request_body(
-            _MESSAGES, model="xiaomi/mimo-v2.5",
+            _MESSAGES, model="mimo-v2.6-flash",
             max_tokens=512, temperature=0.1, top_p=0.95, stream=False,
         )
         assert body["stream"] is False
@@ -84,7 +116,7 @@ class TestMiMoAdapter:
 
     def test_request_body_stream(self):
         body = self.adapter.build_request_body(
-            _MESSAGES, model="xiaomi/mimo-v2.5",
+            _MESSAGES, model="mimo-v2.6-flash",
             max_tokens=512, temperature=0.1, top_p=0.95, stream=True,
         )
         assert body["stream"] is True

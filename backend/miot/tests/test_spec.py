@@ -6,6 +6,7 @@ Unit test miot spec.
 """
 
 import logging
+import pathlib
 
 import pytest
 import yaml
@@ -14,6 +15,7 @@ from miot.spec import (
     MIoTSpecLiteActionParam,
     MIoTSpecParser,
     MIoTSpecTypeClass,
+    MIoTSpecTypeLevel,
     _urn_type_name,
 )
 from miot.storage import MIoTStorage
@@ -92,6 +94,75 @@ async def test_spec_type(test_cache_path: str):
     spec_type = MIoTSpecTypeClass(storage=miot_storage)
     await spec_type.init_async()
 
-    with open("./types_default.yaml", "w", encoding="utf-8") as f:
-        yaml.dump(spec_type.data.model_dump(by_alias=True), f, allow_unicode=True)
+    # 落到测试自己的缓存目录（.gitignore 里），别写进 cwd —— 跑一次测试就在仓库里
+    # 落一份几千行的生成物，`git add -A` 会误带进提交。
+    out = pathlib.Path(test_cache_path) / "types_default.yaml"
+    out.write_text(
+        yaml.dump(spec_type.data.model_dump(by_alias=True), allow_unicode=True),
+        encoding="utf-8",
+    )
+    _LOGGER.info("device_types dumped to %s", out)
     # _LOGGER.info('device_types: %s', spec_type.data.model_dump_json(by_alias=True))
+
+
+@pytest.mark.asyncio
+async def test_parse_lite_carries_notify(monkeypatch):
+    """access 里的 notify 要跟着进 lite 模型。
+
+    只 read 不 notify 的属性拿不到推送，消费方靠这一位区分「会自己更新」和「开机
+    写过一次就冻住」，构造处漏传时这一位恒假、两类属性长得一模一样。
+    """
+    from miot.spec import (
+        MIoTSpecDevice,
+        MIoTSpecProperty,
+        MIoTSpecService,
+    )
+
+    def _prop(iid: int, name: str, access: list[str]) -> MIoTSpecProperty:
+        return MIoTSpecProperty(
+            iid=iid,
+            name=name,
+            type=f"urn:miot-spec-v2:property:{name}:0000000{iid}:vendor:1",
+            description=name,
+            description_trans=name,
+            format="uint8",
+            access=access,
+        )
+
+    device = MIoTSpecDevice(
+        urn="urn:miot-spec-v2:device:lock:0000A00E:vendor:1",
+        name="lock",
+        description="lock",
+        description_trans="门锁",
+        services=[
+            MIoTSpecService(
+                iid=5,
+                name="door",
+                type="urn:miot-spec-v2:service:door:00007830:vendor:1",
+                description="door",
+                description_trans="门",
+                properties=[
+                    _prop(1, "door-status", ["notify"]),
+                    _prop(2, "battery", ["read"]),
+                ],
+            )
+        ],
+    )
+
+    parser = MIoTSpecParser.__new__(MIoTSpecParser)
+
+    async def _fake_parse(urn: str, skip_cache: bool = False):
+        return device
+
+    monkeypatch.setattr(parser, "parse_async", _fake_parse, raising=False)
+
+    # 与 miloco 侧同一组参数：三级都放宽到 UNKNOWN，否则模板未命中的属性被整批滤掉
+    lite = await parser.parse_lite_async(
+        urn=device.urn,
+        spec_service_level=MIoTSpecTypeLevel.UNKNOWN,
+        spec_property_level=MIoTSpecTypeLevel.UNKNOWN,
+        spec_action_level=MIoTSpecTypeLevel.UNKNOWN,
+    )
+
+    assert lite["prop.0.5.1"].notify is True
+    assert lite["prop.0.5.2"].notify is False

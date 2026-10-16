@@ -25,6 +25,11 @@ def _expand_tilde(p: str) -> Path:
     return Path(p)
 
 
+def hermes_home() -> Path:
+    """返回 Hermes runtime 根目录：``$HERMES_HOME`` → ``~/.hermes``。"""
+    return _expand_tilde(os.environ.get("HERMES_HOME") or "~/.hermes")
+
+
 def miloco_home() -> Path:
     """返回 ``$MILOCO_HOME``，未设置则跟随 ``$HERMES_HOME/miloco``，再未设置则 ``~/.hermes/miloco``。
 
@@ -34,10 +39,7 @@ def miloco_home() -> Path:
     env = os.environ.get("MILOCO_HOME", "")
     if env:
         return _expand_tilde(env)
-    hermes_home = os.environ.get("HERMES_HOME", "")
-    if hermes_home:
-        return _expand_tilde(hermes_home) / "miloco"
-    return Path.home() / ".hermes" / "miloco"
+    return hermes_home() / "miloco"
 
 
 def miloco_config_file() -> Path:

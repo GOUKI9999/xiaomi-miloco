@@ -9,26 +9,37 @@
  * 时间筛选:datetime-local 双输入(自 / 至),非法值守(NaN 不更新 state).
  */
 
-import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { Fragment, useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { useTranslation } from "react-i18next";
 import {
   eventClipUrl,
   eventCropMeta,
   eventRefUrl,
   listActivity,
+  listDeviceSpecs,
   listOnDemandLogs,
   onDemandClipUrl,
   revealDir,
   submitEventFeedback,
   submitOnDemandFeedback,
   subscribeEvents,
+  type BackendPropSpec,
 } from "@/api";
 import {
   humanizeRulesInText,
   splitHumanizedSections,
   type TriggerStatusKind,
 } from "@/lib/eventText";
+import {
+  buildFoldRows,
+  foldCounts,
+  feedLowerBound,
+  inlinedBranches,
+  type FoldBranch,
+} from "@/lib/feedFold";
+import { smartTimeLabel } from "@/lib/relativeTime";
 import type { ActivityEvent, EventCropMeta, HomeId, OnDemandLogEntry } from "@/lib/types";
+import { useFoldEnabled, useFoldStrength } from "@/hooks/useFoldStrength";
 
 /** Lightbox 内容类型:clip 走 <video>,Smart Crop 参考帧走 <img>. */
 type LightboxKind = "video" | "image";
@@ -38,6 +49,17 @@ import {
   fetchActions,
   type BackendActionRow,
 } from "./ActionsFeed";
+import {
+  BranchRow,
+  CHIP_CLASS,
+  FoldBadge,
+  FoldChipPill,
+  FoldMembers,
+  FoldToggle,
+  StrengthToggle,
+  firstMemberIdOf,
+  hostRegionOf,
+} from "./FeedFold";
 import { TimeLabel } from "./TimeLabel";
 import { toast } from "./Toast";
 
@@ -72,56 +94,92 @@ const EMPTY_OD_LOGS: OnDemandLogEntry[] = [];
 // SSE 事件常成串到达(一次 agent 控制伴随多条事件),每条都全量重拉 500 行动作太重。
 // 合并突发:末条到达后 ~1.5s 才拉一次(trailing debounce)。mount / homeId 切换仍即时拉。
 const SSE_ACTIONS_DEBOUNCE_MS = 1500;
+/** 定位过去之后高亮闪一下的时长。够看清"就是这行",又不至于让人等它消失。 */
+const FLASH_MS = 1400;
 
-/** 单流合并后的行:事件 or 动作(tagged union),供渲染层分派 ActivityRow / ActionRow。 */
-export type FeedRow =
-  | { kind: "event"; ts: number; event: ActivityEvent }
-  | { kind: "action"; ts: number; action: BackendActionRow };
+/** 滚过去之后把焦点交给谁。
+ *  - `member`:展开面里的第一条动作——键盘用户不必再从展开面顶上自己找一遍。
+ *  - `control`:该行的开合控件(收起后展开面整个消失,焦点必须有个去处,否则掉回 body)。 */
+type FocusTarget = { kind: "member"; key: string } | { kind: "control"; key: string };
 
-/** 事件流 + 动作流合并成单条时间倒序流。纯函数,导出供 tests 守 window + 交错顺序。
+/** 一次「滚过去 / 交焦点 / 闪一下」的待办。
  *
- *  窗口规则(spec):动作一次拉全(limit=500),但只交错**落在当前展示事件时间窗内**的
- *  动作,外加**比最新展示事件更新**的动作。合起来即:保留所有 ts >= 最旧展示事件 ts 的
- *  动作(既覆盖"窗内",也覆盖"比最新更新"——后者 ts 天然 >= 最旧)。展示事件为空时
- *  (events 关 / 事件列表空)动作不设下界,全部展示。
+ *  为什么是待办而不是当场做:目标行与展开面都是**这次渲染之后**才存在的节点 ——
+ *  点开的那一刻去 querySelector,拿到的是 null。记下意图,由 effect 在提交后消费一次。 */
+type PendingMove = {
+  /** 滚进视口的目标:支行的 key、承载它的那一行的 id,或展开面 id(展开面比行精确:
+   *  一行可能有十几屏高)。 */
+  scroll: string;
+  /** 高亮闪一下的行 id。省略则不闪(收起/展开后的焦点交还不该闪,那不是"跳转")。 */
+  flash?: string;
+  focus?: FocusTarget;
+  block: ScrollLogicalPosition;
+};
+
+/** 展开面在不在视口里。徽标的三态(未展开 / 已展开且看得见 / 已展开但滚走了)靠它分,
+ *  判据只能是"眼睛看不看得见",不是"展开没展开"——人滚开了以后,那一枚徽标就该退回
+ *  定位语义,否则点一下是收起一个自己看不见的东西,画面毫无变化。 */
+function isInViewport(el: Element): boolean {
+  const r = el.getBoundingClientRect();
+  return r.top < window.innerHeight && r.bottom > 0;
+}
+
+/** 一次事件取数的三种语义。见 fetchPage。 */
+export type FetchMode = "replace" | "append" | "refresh";
+
+/** `refresh` 专用:第 0 页与手里最新的事件**接不接得上**。
  *
- *  同 ts 时事件排在动作前(事件是"发生了什么"、动作是"因此做了什么",因果上事件在先)。
- */
-export function mergeFeedRows(
-  events: ActivityEvent[],
-  actions: BackendActionRow[],
-  showEvents: boolean,
-  showActions: boolean,
-  sinceMs?: number,
-  beforeMs?: number,
-): FeedRow[] {
-  const rows: FeedRow[] = [];
-  if (showEvents) {
-    for (const e of events) rows.push({ kind: "event", ts: e.timestamp, event: e });
-  }
-  if (showActions) {
-    // 动作的时间窗与事件同段:显式筛选段(sinceMs/beforeMs)优先——它是权威下/上界,
-    // 即使没有事件也生效(修:事件为空时动作曾无下界、混入范围外历史动作)。未设筛选段时
-    // (全量视图)回落"最旧展示事件 ts"的分页启发式,裁掉尚未翻到的更早动作。
-    const lower =
-      sinceMs ??
-      (showEvents && events.length > 0
-        ? Math.min(...events.map((e) => e.timestamp))
-        : -Infinity);
-    const upper = beforeMs ?? Infinity;
-    for (const a of actions) {
-      if (a.timestamp >= lower && a.timestamp <= upper) {
-        rows.push({ kind: "action", ts: a.timestamp, action: a });
-      }
-    }
-  }
-  // ts DESC;同 ts 事件优先(event 在 action 前)。
-  rows.sort((x, y) => {
-    if (y.ts !== x.ts) return y.ts - x.ts;
-    if (x.kind === y.kind) return 0;
-    return x.kind === "event" ? -1 : 1;
-  });
-  return rows;
+ *  接不上(`fresh` 的最旧一条仍比 `prev` 的最新一条更新)= 断线期间新增超过一页、
+ *  中间空出一段。接得上则第 0 页与已有数据重叠,说明这段断开没漏掉东西。
+ *
+ *  `prev` 为空(手里没有可比对的)时当接不上——保守侧:底下有没有更早的仍是未知。 */
+export function hasGapAbove(prev: ActivityEvent[], fresh: ActivityEvent[]): boolean {
+  if (fresh.length === 0) return false;
+  if (prev.length === 0) return true;
+  return Math.min(...fresh.map((e) => e.timestamp)) > Math.max(...prev.map((e) => e.timestamp));
+}
+
+/** 取数成功后 `hasMore` 怎么变。抽成纯函数是因为这个标记**身兼两职**——
+ *  既决定「查看更早」按钮显不显,也决定 feedLowerBound 要不要压事件地平线——
+ *  写错一次就会把动作地平线整个关掉,退回那堵只有动作的墙。
+ *
+ *  - `replace` / `append`:满页即可能还有更早,短页即到底。分页的权威答案。
+ *  - `refresh`(SSE 重连补漏):**只升不降,且抬升要求真的接不上**。两个方向都会出事:
+ *    让它把短页给出的"已到底"打成 false,一次重连就能让「查看更早」永久消失、
+ *    地平线失效,而列表中间还留着空洞;反过来让满页无条件抬成 true,一次与数据无关
+ *    的重连就能把"已到底"推翻,让已经加载完整的窗口重新压上地平线——窗内更早的动作
+ *    被裁掉,还挂着"更早的事件与动作尚未加载",而事件其实一条不缺。
+ *    第 0 页满页只说明"上面至少还有一页",答不了"我手里这批的下面还有没有";
+ *    它能抬升的唯一理由是第 0 页与手里数据之间空了段(hasGapAbove)。 */
+export function nextHasMore(
+  mode: FetchMode,
+  prevHasMore: boolean,
+  freshCount: number,
+  gapAbove = false,
+): boolean {
+  const full = freshCount === PAGE_SIZE;
+  return mode === "refresh" ? prevHasMore || (full && gapAbove) : full;
+}
+
+/** 取数成功后 `offset` 怎么变 —— 只进不退。
+ *  refresh 拉的永远是第 0 页,若直接写 pageOffset+len,已翻到第 4 页的用户会被打回
+ *  offset=50,下次「查看更早」重拉已有页。 */
+export function nextOffset(prevOffset: number, pageOffset: number, freshCount: number): number {
+  return Math.max(prevOffset, pageOffset + freshCount);
+}
+
+/** 取数成功后 `events` 怎么变 —— `replace` 硬替换,`append` / `refresh` 都 merge
+ *  (按 id 去重 + 按 ts 重排)。
+ *
+ *  `refresh` 走 merge 是本 PR 的病灶本身:老代码这里走的是 replace 分支,一次重连
+ *  就把用户翻了几页的事件打回第 0 页。抽成纯函数是为了让这条分派有红灯 ——
+ *  写反时测试变红,而不是像老代码那样带着绿灯上线。 */
+export function nextEvents(
+  mode: FetchMode,
+  prev: ActivityEvent[],
+  fresh: ActivityEvent[],
+): ActivityEvent[] {
+  return mode === "replace" ? fresh : mergeAndSort(prev, fresh);
 }
 
 /** 合并两段 event 列表:by id dedup(后到的字段优先)+ timestamp DESC 排序.
@@ -192,8 +250,19 @@ export function ActivityFeed({
   const [offset, setOffset] = useState(0);
   /** 后端最近一次 GET 是否还满 PAGE_SIZE(可能还有更早) */
   const [hasMore, setHasMore] = useState(false);
+  /** 组件内取数失败(带筛选的那条请求)的消息。App 层的 eventsError 覆盖不到这里:
+   *  它反映的是**不带筛选**的那次请求。失败后列表会被清空,只有瞬时 toast 的话,
+   *  失败后的画面(事件 0 条 + 动作照旧)与"这个时间段没数据"肉眼难分,故留成 state
+   *  由 banner 常驻,并自带重试入口。null = 本次取数没有失败。 */
+  const [fetchError, setFetchError] = useState<string | null>(null);
   /** Promise generation token — stale fetch resolve 时丢弃(N1) */
   const fetchGenRef = useRef(0);
+  /** 是否有取数在途。refresh(重连补漏)凭此决定跳过 —— 理由见 fetchPage 入口守卫。 */
+  const fetchInFlightRef = useRef(false);
+  /** `events` 的最新值,fetch resolve 时读。闭包里的 `events` 是**发请求那一刻**的快照,
+   *  resolve 时可能已被 SSE prepend 过;判"第 0 页与手里数据接不接得上"必须用最新值——
+   *  拿旧快照比,会把其实重叠的两段误判成空洞,反过来把地平线误开。 */
+  const eventsRef = useRef<ActivityEvent[]>([]);
   /** 全屏播放器(点开看大):null 关闭.kind 决定用 <video> 还是 <img>(参考帧是 JPEG);
    *  crop 由参考帧卡透上来(它已经拉过坐标),放大后继续画框、不重复请求. */
   const [lightbox, setLightbox] = useState<{
@@ -207,9 +276,29 @@ export function ActivityFeed({
   const [showActions, setShowActions] = useState(true);
   const [actions, setActions] = useState<BackendActionRow[]>([]);
 
+  /** 设备规格表:did → (iid → spec)。动作行拿它把台账的 iid / value_json 读成人话
+   *  (见 lib/actionText)。与动作流解耦:取不到就不翻,动作行退回原始键。 */
+  const [deviceSpecs, setDeviceSpecs] = useState<
+    Map<string, Record<string, BackendPropSpec>>
+  >(new Map());
+
   /** 动作拉取的 generation token(N1 同款,镜像事件流的 fetchGenRef):首屏先发的
    *  无 home 过滤请求 / 切家前旧请求若晚返回,不得覆盖已按新 home 过滤的结果。 */
   const actionsGenRef = useRef(0);
+
+  // ── 折叠:动作并进它的触发事件(规则见 lib/feedFold)──
+  /** 折叠强度。存在本机、不跟随账号——代价与默认强档的理由见 useFoldStrength。 */
+  const { strength, setStrength } = useFoldStrength();
+  /** 折叠开不开。关掉 = 未折叠态:动作各自成行、各锚在自己的时刻上。**关掉不清空档位**,
+   *  两个键分开存就是为了翻一遍再打开还是原来那档(见 useFoldEnabled)。 */
+  const { folded, setFolded } = useFoldEnabled();
+  /** 就地展开着的支(按支的 key)。**不持久化**:展开面是"我现在要核对这几条",
+   *  离开再回来重新点一次比带着一屏张开的口子回来更符合预期。 */
+  const [openKeys, setOpenKeys] = useState<Set<string>>(new Set());
+  /** 刚被定位到的那一行,闪一圈高亮。 */
+  const [flashKey, setFlashKey] = useState<string | null>(null);
+  /** 待消费的滚动/焦点动作,见 PendingMove。 */
+  const [pending, setPending] = useState<PendingMove | null>(null);
 
   /** 动作重拉:mount / homeId 切换 / 时间窗变化 / 手动 reload 时调,失败静默(不阻断事件流)。
    *  带上当前应用的时间窗(appliedSince/appliedBefore),让动作与事件同段,不混入范围外记录;
@@ -249,6 +338,20 @@ export function ActivityFeed({
     reloadActions();
   }, [reloadActions, homeId]);
 
+  // 设备规格:切家后重取(规格表是 home 级的)。失败静默——动作行自己会退回原始键,
+  // 这条依赖断掉不该让日志页报错或空转。
+  useEffect(() => {
+    let alive = true;
+    listDeviceSpecs(homeId)
+      .then((m) => {
+        if (alive) setDeviceSpecs(m);
+      })
+      .catch(() => {});
+    return () => {
+      alive = false;
+    };
+  }, [homeId]);
+
   const filterActive = appliedSince !== undefined || appliedBefore !== undefined;
 
   // N3: filter input 抖动 debounce 300ms 后才应用 → 触发 fetch + SSE 重建
@@ -260,14 +363,51 @@ export function ActivityFeed({
     return () => clearTimeout(t);
   }, [since, before]);
 
-  /** 统一拉取(filter / 翻页 / SSE 重连 reload 共用),fetchGen 守 stale overwrite. */
+  /** 统一拉取(filter / 翻页 / SSE 重连 reload 共用),fetchGen 守 stale overwrite.
+   *
+   *  三种模式必须分开,不能只靠一个 append 布尔:
+   *  - `replace` 筛选段 / 切家变了,旧列表整体作废 → 硬替换。
+   *  - `append`  「查看更早」翻页 → merge 进已有列表,offset 前进。
+   *  - `refresh` SSE 重连补漏 → **也必须 merge**。老代码这里走的是 replace 分支,
+   *    于是用户翻了四页攒到 200 条事件,网络抖一下 / 笔记本睡醒 / 后端重启,
+   *    列表就被 setEvents(fresh) 打回 50 条;而 500 条动作走的是另一条取数路径、
+   *    毫发无损 —— 字面意义上的"刚才还在的事件不见了",且不报错不留痕。
+   *
+   *  失败路径同样按模式分,不是统一一句"失败了":`replace` 列表与分页深度一起作废、
+   *  并留下常驻 banner(可重试),`append` 保留列表与按钮、只出声,`refresh` 静默(重连
+   *  补漏失败不动任何状态,等下一次重连的补漏 —— SSE 无重放,推送不会替它补)。
+   *
+   *  refresh 还有一条独有规则:任何取数在途时它**直接跳过**,不抢占代际令牌(理由见入口守卫)。 */
   const fetchPage = (opts: {
-    append?: boolean;
+    mode?: FetchMode;
     pageOffset?: number;
   }) => {
+    const mode = opts.mode ?? "replace";
+    // refresh 是尽力而为的后台补漏,不参与代际令牌竞争:任何取数在途时直接跳过。
+    // 否则它的 `++fetchGenRef.current` 会把**代表用户意图的那次取数**判成陈旧丢掉——
+    // 丢的不只是结果:replace 的列表替换与失败上报一起作废(新筛选的取数没落地、
+    // 该有的报错也没出现,用户只看到一次毫无反馈的切换),append 的翻页结果被吞掉;
+    // 而 refresh 自己照常 merge,把**新**筛选的第 0 页倒进**旧**筛选的列表里
+    // (事件在合流处不做窗口二次过滤),offset 还停在旧视图的深度上,之后翻页静默跳过一段。
+    // 跳过不丢数据:replace 本来就拉同一窗口的第 0 页,与 refresh 想拿的是同一份;
+    // 与 append 撞上时丢的是一次补漏 —— 且这段**不会自己回来**:SSE 是纯直播流、不重放
+    // (后端 events_router 的 subscribe_sse 收的是订阅之后的广播,没有 Last-Event-ID / 补发),
+    // 断线窗口内的事件不会被"后续推送"补发;能补回的只有下一次重连的补漏(且那些事件
+    // 仍落在第 0 页 50 条以内)或下一次 replace(时间范围变化 / 切家)。
+    // (已知代价:listActivity 没有超时,请求若悬挂不 settle,旗子会一直立着、补漏不触发,
+    //  直到用户下一次亲手触发 replace / append 落地才收旗。悬挂期间症状**不一定可见**:
+    //  组件内 loading 的渲染出口只有两处(空列表居中的"加载中"、以及需 showLoadMore
+    //  成立的「查看更早」按钮),banner 的加载文案由 App 层 eventsLoading 驱动、与组件内
+    //  悬挂无关 —— 窗口 hasMore=false 且列表非空时画面看不出异常,唯一后果是补漏停摆。
+    //  属既有毛病(取数无超时),不在本次范围。)
+    if (mode === "refresh" && fetchInFlightRef.current) return Promise.resolve();
     const gen = ++fetchGenRef.current;
+    fetchInFlightRef.current = true;
     const pageOffset = opts.pageOffset ?? 0;
     setLoading(true);
+    // 只有 replace 在开跑时清掉上次的失败:它是"当前视图从头再来一遍",旧失败已不代表现在;
+    // append / refresh 是后台动作,清掉会让一次静默失败的 refresh 抹掉用户还没看的报错。
+    if (mode === "replace") setFetchError(null);
     return listActivity(homeId, {
       since: appliedSince,
       before: appliedBefore,
@@ -276,42 +416,72 @@ export function ActivityFeed({
     })
       .then((fresh) => {
         if (gen !== fetchGenRef.current) return; // N1: stale,丢弃
-        if (opts.append) {
-          // append 期间 SSE 可能已经 prepend 新事件,简单 [...prev, ...fresh]
-          // 会让"更早的 fresh"夹在"SSE 推的更晚事件"中间 → 视觉乱序.
-          // mergeAndSort 按 id dedup + 按 timestamp DESC 重排兜底,得到稳定顺序.
-          setEvents((prev) => mergeAndSort(prev, fresh));
-          setOffset(pageOffset + fresh.length);
-        } else {
-          setEvents(fresh);
-          setOffset(fresh.length);
-        }
-        setHasMore(fresh.length === PAGE_SIZE);
+        // merge 的两种模式(append / refresh)其期间 SSE 都可能已经 prepend 新事件,
+        // 简单 [...prev, ...fresh] 会让"更早的 fresh"夹在"SSE 推的更晚事件"中间 →
+        // 视觉乱序。mergeAndSort 按 id dedup + 按 timestamp DESC 重排兜底,得到稳定顺序。
+        setEvents((prev) => nextEvents(mode, prev, fresh));
+        setFetchError(null);
+        if (mode === "replace") setOffset(fresh.length);
+        else setOffset((prev) => nextOffset(prev, pageOffset, fresh.length));
+        // 判据要读**最新**列表(eventsRef),不是这次渲染闭包里的快照 —— 理由见 eventsRef 声明处。
+        const gapAbove = hasGapAbove(eventsRef.current, fresh);
+        setHasMore((prev) => nextHasMore(mode, prev, fresh.length, gapAbove));
       })
-      .catch(() => {
+      .catch((e: unknown) => {
         if (gen !== fetchGenRef.current) return;
-        if (!opts.append) setEvents([]);
-        setHasMore(false);
+        // **不动 hasMore**。请求失败不回答"还有没有更早"这个问题,而 hasMore 同时
+        // 是动作地平线的闸:把它打成 false,一次失败的「查看更早」就会把地平线关掉,
+        // 底下重新涌出那堵只有动作的墙,而且按钮同时消失、无法重试。保持原值 →
+        // 按钮还在、地平线还在,用户可以再点一次。
+        if (mode === "replace") {
+          // 列表整体作废,分页深度必须跟着作废:offset 的契约是"已 loaded 历史段长",
+          // 列表清空后旧深度就是谎报。不清零的话下一次重连的 refresh 会把旧深度钉死
+          // (nextOffset 只进不退),再点「查看更早」就从旧深度起拉,中间那段被静默跳过
+          // —— 又一种"事件悄悄不见"。清空与归零必须成对出现。
+          setEvents([]);
+          setOffset(0);
+          // 失败要留下比 toast 活得久的痕迹:失败后的画面(事件 0 条 + 动作仍在)与
+          // "这段时间没数据"肉眼难分,而 toast 3.5s 就散,用户回头再看已无从分辨,
+          // 也没有重试入口。改挂常驻 banner(自带重试),与 App 层取数失败同一处显示。
+          setFetchError(e instanceof Error ? e.message : String(e));
+        }
+        // append 失败要出声:静默失败的点击会被读成"没有更早的了"。
+        if (mode === "append") toast(t("activity.loadMoreFailed"), "warn");
       })
       .finally(() => {
         if (gen !== fetchGenRef.current) return;
+        // 只由**最新**那次取数收旗:被取代的那次在这里提前返回,旗子归最新那次管
+        // (它在自己的 finally 里收),否则一次过期请求的落地就会让补漏重新挤进在途窗口。
+        fetchInFlightRef.current = false;
         setLoading(false);
       });
   };
 
+  // eventsRef 恒指向最新列表(见其声明处:refresh 判空洞不能拿闭包快照比)。
+  useEffect(() => {
+    eventsRef.current = events;
+  }, [events]);
+
   // M5/N2: prop 变(homeId 切换 / 父组件 reload)时同步 — 仅当 filter 未激活。
   // 直接 setEvents(initial) 立即给出全量视图。注意:这会 clobber 快照→resolve 之间
   // SSE 刚推的事件;清 filter 那次过渡有 SSE 重订阅补偿,但已处于 !filterActive 时的
-  // 同 home retry 不触发重订阅——此窗口极窄且 SSE 后续推送会自愈(pre-existing)。
-  // 先 ++fetchGenRef 作废在途 filtered fetch,并手动 setLoading(false)
-  // (被作废的 fetch 其 finally 的 gen 守卫会 no-op,不会替我们收 loading)。
+  // 同 home retry 不触发重订阅——此窗口极窄,但被 clobber 的那几条不会自己回来
+  // (SSE 无重放,后续推送送的是**新**事件),要等下一次 replace / 重连补漏才可能覆盖(pre-existing)。
+  // 先 ++fetchGenRef 作废在途 filtered fetch,并手动 setLoading(false) / 降在途旗
+  // (被作废的 fetch 其 finally 的 gen 守卫会 no-op,既不会替我们收 loading,也不会替我们收旗)。
+  // 这一代**没有对应的 fetch**,没人替它收尾 —— 漏了降旗,旗子就永久卡 true,
+  // 之后每次 SSE 重连的补漏都被在途守卫静默跳过(而跳过路径不碰旗),本 PR 要修的
+  // "事件悄悄不见"又回来了,且全量视图不翻页时没有任何自愈路径。
   useEffect(() => {
     if (!filterActive) {
       ++fetchGenRef.current; // 作废可能仍在途的 filtered fetch
+      fetchInFlightRef.current = false; // 被作废那代不会替我们收旗(同上)
       setLoading(false);
       setEvents(initial);
       setOffset(initial.length);
       setHasMore(initial.length === PAGE_SIZE);
+      // 清掉筛选视图留下的失败:这一屏的数据来自 App 层的 initial,与那条失败的请求无关。
+      setFetchError(null);
     }
     // filterActive 时 ignore initial 变化 — 由 filter useEffect 主导
   }, [initial, homeId, filterActive]);
@@ -319,7 +489,7 @@ export function ActivityFeed({
   // filter 变化时主动拉取(homeId 也走这里)
   useEffect(() => {
     if (!filterActive) return; // 未筛选时由 prop sync useEffect 接管
-    fetchPage({ pageOffset: 0 });
+    fetchPage({ mode: "replace", pageOffset: 0 });
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [appliedSince, appliedBefore, homeId]);
 
@@ -335,11 +505,26 @@ export function ActivityFeed({
       return true;
     };
 
-    // 重连成功 / 首次 open 时拉一次,补回断开期间错过的事件(spec B13).
-    // 走 fetchPage 享 gen 保护;不会 overwrite SSE prepend 的更新事件 — fetchPage 拉到
-    // 的列表会和 SSE merge 的 in-memory 版本一致(后端是 SoT).
+    // 真·断线重连时拉一次,补回断开期间错过的事件(spec B13)。走 fetchPage 享 gen 保护;
+    // mode=refresh 保证是 merge 而非替换,已翻的页不会被一次重连抹掉。
+    //
+    // **只有同一个 EventSource 实例自己断线重连才走到这里**,不是字面意义上的"首次 open
+    // 也拉一次":realSubscribeEvents 吞掉每个实例的首次 open(firstOpenSeen,S3——避免与
+    // 挂载时的首次拉取重复),而挂载 / 切筛选 / 切家都会新建实例,首次 open 一律被吞。
+    // 切后台再切回来同样不触发:onVisibility 的 stop()/start() 是**新建** EventSource,
+    // 它的首次 open 也被吞 —— 于是页面隐藏期间产生的事件既没有推送、回来也不回填
+    // (缺口大小与 PAGE_SIZE 无关),只有筛选变化 / 切家触发的 replace 从头重列才可能覆盖到。
+    //
+    // 残留缺口(与上面那条不同):断线期间新增多于 PAGE_SIZE 条时,第 0 页与手里旧数据
+    // 之间会空出一段 —— hasGapAbove 认出来并把 hasMore 抬为 true,不把有洞的列表标成
+    // "已到底"。按 offset 语义,这段洞只有落在当前 offset **以下**的部分能靠「查看更早」
+    // 补回来(append 从 offset 往下拉,offset 落在洞里的话接下来几轮就补上它);落在
+    // offset **以上**的那段没有任何路径取得到(refresh 只拉第 0 页、SSE 只推重连之后的
+    // 新事件、offset 只进不退、不再覆盖走过的区间),要等筛选变化 / 切家触发的 replace
+    // 从头重列才可能覆盖到。
+    // 补不回的那段在界面上也无从表达:列表照 ts 排序、两个片段直接相邻,看不出中间缺了东西。
     const reload = () => {
-      fetchPage({ pageOffset: 0 });
+      fetchPage({ mode: "refresh", pageOffset: 0 });
     };
 
     const start = () => {
@@ -404,25 +589,226 @@ export function ActivityFeed({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [appliedSince, appliedBefore, homeId, debouncedReloadActions]);
 
-  /** 触发翻页:offset += PAGE_SIZE,append 模式 */
+  /** 触发翻页:offset += PAGE_SIZE,append 模式。
+   *  翻页同时把事件地平线往下推,合流里被地平线裁掉的那段动作随之显出来。 */
   const loadMore = () => {
     if (loading || !hasMore) return;
-    fetchPage({ append: true, pageOffset: offset });
+    fetchPage({ mode: "append", pageOffset: offset });
   };
 
-  // 事件 + 动作合并成单条时间倒序流(见 mergeFeedRows 的窗口规则);带上当前应用的时间窗,
-  // 让动作与事件同段约束(即使无事件也按 since/before 卡界)。
-  const feedRows = useMemo(
+  // 事件 + 动作装配成一条时间倒序流:**三种画法**——未折叠(动作各自成行)、弱档(支自己占
+  // 一行)、强档(支并进宿主的事件行)。窗口规则、分组、并列次序全在 lib/feedFold。
+  const rows = useMemo(
     () =>
-      mergeFeedRows(
-        events, actions, showEvents, showActions, appliedSince, appliedBefore,
-      ),
-    [events, actions, showEvents, showActions, appliedSince, appliedBefore],
+      buildFoldRows({
+        events,
+        actions,
+        showEvents,
+        showActions,
+        strength,
+        folded,
+        sinceMs: appliedSince,
+        beforeMs: appliedBefore,
+        hasMoreEvents: hasMore,
+      }),
+    [
+      events,
+      actions,
+      showEvents,
+      showActions,
+      strength,
+      folded,
+      appliedSince,
+      appliedBefore,
+      hasMore,
+    ],
   );
+
+  /** 宿主事件的取用表:支行要画宿主标题、算退出延迟,都得按 id 回查。 */
+  const eventById = useMemo(() => new Map(events.map((e) => [e.id, e])), [events]);
 
   const noneChecked = !showEvents && !showActions;
   // "查看更早" 仅在展示事件时有意义(动作已一次拉全 500,无分页)。
   const showLoadMore = showEvents && hasMore && events.length > 0;
+
+  /** banner 的失败态:**两条失败来源取同一条**(组件内带筛选的优先),文案与重试按钮都跟着
+   *  它走。两处置顶顺序一旦相反(文字跟 App 层、按钮重发组件内的),双失败时点「重试」会像
+   *  没反应 —— 第一次点只清掉 fetchError,文案纹丝不动,得再点一次。 */
+  const bannerError = fetchError ?? eventsError?.message ?? null;
+  /** 事件 banner 的重试入口,与 bannerError 同源:fetchError → 重发带筛选的那次请求
+   *  (App.tsx 的 `listActivity(homeId)` 不带筛选,修不了筛选视图的失败);否则用 App 层
+   *  传下来的。**按钮的门槛是 `bannerError &&`** —— 加载态 bannerError 为空,于是不会出现
+   *  "正在加载"旁边挂一个「重试」(App 恒传 onRetryEvents,只判函数在不在等于没判)。 */
+  const bannerRetry = fetchError
+    ? () => fetchPage({ mode: "replace", pageOffset: 0 })
+    : onRetryEvents;
+
+  // 计数按流拆开。老代码用合并后的行数显"已加载 312 条+",那个 + 挂在谁身上完全看不出来
+  // ——恰恰是被截断的事件流被描述成完整的。
+  //
+  // 数的是**数据**不是行:强档把一批动作折进徽标、一条行都不占,弱档把同一批动作拆成
+  // 好几行,两种画法下"已加载多少条动作"必须是同一个数,否则切一下档位计数就变,而那批
+  // 数据一个字节都没动。foldCounts 按支 key 去重(弱档下一支同时出现在事件行与自己的
+  // 支行里),别数两遍。
+  const counts = useMemo(() => foldCounts(rows), [rows]);
+  const shownEvents = counts.events;
+  const shownActions = counts.actions;
+
+  // 动作为什么可能不全,有两个互相独立的原因,提示语不能混为一谈:
+  //  - clippedByHorizon:已取回但被事件地平线压在下面,翻页就能显出来。
+  //  - truncatedByLimit:500 上限确实卡住了——仅当最旧一条已取动作仍**高于**展示
+  //    下界时才成立;地平线卡在 500 之上时上限并不生效,此时提示"仅显示最近 500 条"
+  //    会把用户引到错误的原因上。
+  const { actionsClipped, actionsTruncated } = useMemo(() => {
+    if (!showActions) return { actionsClipped: false, actionsTruncated: false };
+    const lower = feedLowerBound(events, showEvents, appliedSince, hasMore);
+    const clipped = actions.some((a) => a.timestamp < lower);
+    const truncated =
+      actions.length >= ACTIONS_LIMIT &&
+      Math.min(...actions.map((a) => a.timestamp)) > lower;
+    return { actionsClipped: clipped || truncated, actionsTruncated: truncated };
+  }, [actions, showActions, events, showEvents, appliedSince, hasMore]);
+
+  // 两条流各自带自己的 "+",不再用合并总数糊弄过去。
+  const loadedDetail = [
+    showEvents && t("activity.countEvents", { n: shownEvents, more: showLoadMore ? "+" : "" }),
+    showActions && t("activity.countActions", { n: shownActions, more: actionsClipped ? "+" : "" }),
+  ]
+    .filter(Boolean)
+    .join(" · ");
+
+  /* ── 折叠的四处动作 ─────────────────────────────────────────
+     都走「先改 state,再由 effect 消费一次 DOM 动作」这条路(理由见 PendingMove)。 */
+
+  /** 就地展开一片支。展开面可能有好几屏高,所以滚的是**展开面**而不是行;焦点直接落到
+   *  第一条动作上(用户点它多半就是要看那几条),同时把承载它的那一行闪一下作为回执。 */
+  const openBranch = useCallback((key: string, regionId: string, rowId: string) => {
+    setOpenKeys((prev) => new Set(prev).add(key));
+    setPending({
+      scroll: regionId,
+      flash: rowId,
+      focus: { kind: "member", key },
+      block: "center",
+    });
+  }, []);
+
+  /** 收起一片支,并把焦点交还它的开合控件。不闪:焦点交还不是跳转,闪一下反而像发生了别的。
+   *
+   *  `hostKey` 是承载这一片的**那一行**的 id。强档下支不占行(装配层直接跳过),`id=key`
+   *  没有元素承载,于是收起后 `getElementById` 必然落空:视口一步不动,而几屏高的成员表
+   *  整段消失,用户眼前换成原本排在它下方的行,刚收起的事件行留在上方几屏之外;焦点则
+   *  落到事件行那枚徽标上,还带着 `preventScroll`——读屏焦点与可见内容因此脱节。
+   *  收起消不掉承载它的那一行,所以拿它当落点。弱档与无宿主支不传:支行行体自己带着
+   *  `id=key`,落点本来就是它。 */
+  const closeBranch = useCallback((key: string, hostKey?: string) => {
+    setOpenKeys((prev) => {
+      if (!prev.has(key)) return prev;
+      const next = new Set(prev);
+      next.delete(key);
+      return next;
+    });
+    setPending({
+      scroll: hostKey ?? key,
+      focus: { kind: "control", key },
+      block: "nearest",
+    });
+  }, []);
+
+  /** 支行上的开合:展开面就在这一行里,滚它、也闪这一行。 */
+  const toggleBranch = useCallback(
+    (key: string) => {
+      if (openKeys.has(key)) closeBranch(key);
+      else openBranch(key, key, key);
+    },
+    [openKeys, openBranch, closeBranch],
+  );
+
+  /** 跳到某一行并闪一下。弱档的徽标、以及"已展开但滚出视口"的徽标都走这里。 */
+  const locate = useCallback((scrollId: string, flashId: string = scrollId) => {
+    setPending({ scroll: scrollId, flash: flashId, block: "center" });
+  }, []);
+
+  /** 事件行上那枚徽标被激活。同一个控件在两种情形下是两件事,判据只能是"看得见吗":
+   *  弱档恒为定位;强档未展开则就地展开,已展开且展开面还在视口里则收起,已展开但滚走了
+   *  则把它滚回来 —— 那时点一下是收起一个自己看不见的东西,画面毫无变化。 */
+  const activateBadge = useCallback(
+    (branch: FoldBranch, hostKey: string) => {
+      if (strength !== "strong") {
+        locate(branch.key);
+        return;
+      }
+      if (!openKeys.has(branch.key)) {
+        openBranch(branch.key, hostRegionOf(branch.key), hostKey);
+        return;
+      }
+      const region = document.getElementById(hostRegionOf(branch.key));
+      if (region && isInViewport(region)) closeBranch(branch.key, hostKey);
+      else locate(hostRegionOf(branch.key), hostKey);
+    },
+    [strength, openKeys, locate, openBranch, closeBranch],
+  );
+
+  /** 「触发事件未加载」那枚 chip:去后端单查这条事件,把结果说出来 —— **只说话,不动窗口**。
+   *  查到了也不把它抓进列表:把它放进来就得连带它周围的事件与动作,那是翻页 / 换时间范围
+   *  的事,而窗口是用户亲手选的;这枚 chip 回答的只是"它到底在哪"。 */
+  const lookupHost = useCallback(
+    (eventId: string) => {
+      listActivity(homeId, { eventId })
+        .then((found) => {
+          const ev = found[0];
+          if (ev) toast(t("actions.lookupFound", { time: smartTimeLabel(ev.timestamp) }), "info");
+          else toast(t("actions.lookupGone"), "warn");
+        })
+        .catch(() => toast(t("actions.lookupFailed"), "warn"));
+    },
+    [homeId, t],
+  );
+
+  // 消费待办:目标节点此时才存在。滚 + 交焦点 + 记下要高亮的那行。
+  useEffect(() => {
+    if (!pending) return;
+    document.getElementById(pending.scroll)?.scrollIntoView({
+      block: pending.block,
+      behavior: "smooth",
+    });
+    if (pending.focus) {
+      const el =
+        pending.focus.kind === "member"
+          ? document.getElementById(firstMemberIdOf(pending.focus.key))
+          : // 支行自己的 chevron 优先;没有(强档的展开面挂在事件行下)就退回那枚徽标。
+            (document.querySelector<HTMLElement>(`[data-toggle="${pending.focus.key}"]`) ??
+             document.querySelector<HTMLElement>(`[data-jump="${pending.focus.key}"]`));
+      // preventScroll:滚动的落点已经由上面那次 scrollIntoView 定了,焦点再滚一次会打架。
+      el?.focus({ preventScroll: true });
+    }
+    if (pending.flash) setFlashKey(pending.flash);
+    setPending(null);
+  }, [pending]);
+
+  // 高亮自己退场。
+  useEffect(() => {
+    if (!flashKey) return;
+    const timer = setTimeout(() => setFlashKey(null), FLASH_MS);
+    return () => clearTimeout(timer);
+  }, [flashKey]);
+
+  // Esc 收起焦点所在的那片展开面。守卫是"焦点真落在某片展开面里"而不是"有展开面":
+  // 全屏播放器 / 反馈表单也吃 Esc,不设这道闸,关掉它们会顺带收掉一片支。
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key !== "Escape") return;
+      const active = document.activeElement;
+      if (!(active instanceof HTMLElement)) return;
+      // 宿主行从**展开面**上溯,不从焦点元素上溯:展开后焦点正落在第一条成员上,而成员行
+      // 自己也带 id(`<key>-m0`),按焦点上溯会抓到它——一个随成员表一起卸载的节点,
+      // 落点照样落空。展开面是它所在那一行的直系后代,从它上溯才稳。
+      const region = active.closest<HTMLElement>("[data-region]");
+      const key = region?.dataset.region;
+      if (region && key) closeBranch(key, region.closest<HTMLElement>("li[id]")?.id);
+    };
+    document.addEventListener("keydown", onKey);
+    return () => document.removeEventListener("keydown", onKey);
+  }, [closeBranch]);
 
   return (
     <section
@@ -437,7 +823,9 @@ export function ActivityFeed({
           {t("activity.title")}
           <span className="text-caption-mono text-text-tertiary font-normal">
             {activeTab === "events"
-              ? t("activity.loadedCount", { n: feedRows.length, more: showLoadMore ? "+" : "" })
+              ? /* 两个 checkbox 都关时 loadedDetail 为空,整段不渲染——否则标题旁
+                   会挂一个没有宾语的"已加载"。 */
+                loadedDetail && t("activity.loaded", { detail: loadedDetail })
               : t("activity.odLoaded", { n: odCount, more: odHasMore ? "+" : "" })}
           </span>
         </h2>
@@ -461,6 +849,15 @@ export function ActivityFeed({
             />
             {t("actions.filterActions")}
           </label>
+          {/* 折叠开关 + 强度。与上面两个 checkbox 不是一回事:那两个决定"有哪些流",
+              这两枚决定"动作怎么画"——勾着事件、勾着动作,动作可以各自一行(关掉折叠),
+              也可以折进事件(开着折叠,再分两档)。三种画法都保留全部数据,所以它们放在
+              筛选旁边而不是筛选里面。
+              关掉折叠时强度控件**整个不渲染**:未折叠态没有"折叠强度"这回事,留着一个
+              不生效的控件就是在问一个当前不成立的问题(它的 aria-controls 也随之不写,
+              见 FeedFold 的 STRENGTH_CTL_ID)。 */}
+          <FoldToggle folded={folded} onChange={setFolded} />
+          {folded && <StrengthToggle strength={strength} onChange={setStrength} />}
           <TimeRangeFilter
             since={since}
             before={before}
@@ -488,18 +885,23 @@ export function ActivityFeed({
       {/* Events panel */}
       <div id="panel-events" role="tabpanel" aria-labelledby="tab-events" hidden={activeTab !== "events"}>
 
-      {/* 事件初始页加载中 / 失败:内联提示,不阻断下方合流(动作已独立加载)。 */}
-      {(eventsError || eventsLoading) && (
+      {/* 事件加载中 / 失败:内联提示,不阻断下方合流(动作已独立加载)。
+          三种出现原因——App 层不带筛选的请求失败(eventsError)、本组件带筛选的取数失败
+          (fetchError)、App 层请求进行中(eventsLoading)。失败压过加载:后者原先只有一条
+          3.5s 的 toast,失败后的画面(事件 0 条 + 动作照旧)与"这段时间没数据"肉眼难分,
+          回头再看已无从分辨,也没有重试入口 —— 故统一走这条常驻 banner。
+          文案与按钮都由 bannerError 决定(见其声明处),不含第二个判据。 */}
+      {(bannerError || eventsLoading) && (
         <div className="mx-5 mb-2 px-3 py-2 rounded-lg bg-bg-primary border border-border text-caption text-text-secondary flex items-center justify-between gap-2">
           <span>
-            {eventsError
-              ? t("activity.eventsBannerFailed", { msg: eventsError.message })
+            {bannerError
+              ? t("activity.eventsBannerFailed", { msg: bannerError })
               : t("activity.eventsBannerLoading")}
           </span>
-          {eventsError && onRetryEvents && (
+          {bannerError && bannerRetry && (
             <button
               type="button"
-              onClick={onRetryEvents}
+              onClick={bannerRetry}
               className="shrink-0 px-2 py-0.5 rounded border border-border text-text-primary hover:border-border-strong"
             >
               {t("activity.retry")}
@@ -512,11 +914,11 @@ export function ActivityFeed({
         <div className="text-body text-center py-10 text-text-secondary">
           {t("actions.emptyFilter")}
         </div>
-      ) : loading && showEvents && events.length === 0 && feedRows.length === 0 ? (
+      ) : loading && showEvents && events.length === 0 && rows.length === 0 ? (
         <div className="text-body text-center py-10 text-text-secondary">
           {t("activity.loading")}
         </div>
-      ) : feedRows.length === 0 ? (
+      ) : rows.length === 0 ? (
         <div className="text-body text-center py-10 text-text-secondary">
           {filterActive
             ? t("activity.emptyFiltered")
@@ -524,25 +926,115 @@ export function ActivityFeed({
         </div>
       ) : (
         <ul className="divide-y divide-border">
-          {feedRows.map((r) =>
-            r.kind === "event" ? (
-              <ActivityRow
-                key={`e:${r.event.id}`}
-                event={r.event}
-                onOpenLightbox={(src, kind, crop) => setLightbox({ src, kind, crop })}
-                feedbackSet={feedbackSet}
-                feedbackPacks={feedbackPacks}
-                onFeedbackSubmitted={(id, path, size) => {
-                  setFeedbackSet(prev => new Set(prev).add(id));
-                  setFeedbackPacks(prev => new Map(prev).set(id, { path, size }));
-                }}
+          {rows.map((r) => {
+            if (r.kind === "event") {
+              const badges = [
+                // 「范围外·作为宿主显示」排在徽标前面:它说的是这一行**为什么**在这儿,
+                // 是前提;徽标说的是它下面挂了什么。
+                ...(r.hostOutside
+                  ? [
+                      <span key="outside" className={CHIP_CLASS}>
+                        {t("actions.chipHostOutside")}
+                      </span>,
+                    ]
+                  : []),
+                ...r.branches.map((b) => (
+                  <FoldBadge
+                    key={b.key}
+                    branch={b}
+                    strength={strength}
+                    open={openKeys.has(b.key)}
+                    onActivate={() => activateBadge(b, r.key)}
+                  />
+                )),
+              ];
+              const opened = inlinedBranches(strength, r.branches, openKeys);
+              return (
+                <ActivityRow
+                  key={`e:${r.key}`}
+                  domId={r.key}
+                  flash={flashKey === r.key}
+                  event={r.event}
+                  // 空数组不传:传个空片段会让每张事件行都多出一条只占高度的空隙。
+                  badges={badges.length ? badges : undefined}
+                  inner={
+                    opened.length
+                      ? opened.map((b) => (
+                          // 展开面整片吃掉事件行的点击(整行是"看详情"),也靠 data-region
+                          // 让 Esc 认出"焦点正在这一片里"。
+                          <div
+                            key={b.key}
+                            id={hostRegionOf(b.key)}
+                            data-region={b.key}
+                            onClick={(e) => e.stopPropagation()}
+                          >
+                            <FoldMembers
+                              branch={b}
+                              specs={deviceSpecs}
+                              onToggle={() => closeBranch(b.key, r.key)}
+                            />
+                          </div>
+                        ))
+                      : undefined
+                  }
+                  onOpenLightbox={(src, kind, crop) => setLightbox({ src, kind, crop })}
+                  feedbackSet={feedbackSet}
+                  feedbackPacks={feedbackPacks}
+                  onFeedbackSubmitted={(id, path, size) => {
+                    setFeedbackSet(prev => new Set(prev).add(id));
+                    setFeedbackPacks(prev => new Map(prev).set(id, { path, size }));
+                  }}
+                />
+              );
+            }
+            if (r.kind === "branch") {
+              return (
+                <BranchRow
+                  key={`b:${r.key}`}
+                  branch={r.branch}
+                  hostEvent={r.branch.eventId ? eventById.get(r.branch.eventId) : undefined}
+                  hostRendered={r.hostRendered}
+                  showEvents={showEvents}
+                  open={openKeys.has(r.key)}
+                  flash={flashKey === r.key}
+                  specs={deviceSpecs}
+                  onToggle={() => toggleBranch(r.key)}
+                  onBack={locate}
+                  onLookupHost={lookupHost}
+                />
+              );
+            }
+            // 单条动作行。**两种来路共用这一个分支**:未折叠态下每条动作都走这儿,折叠态下
+            // 走这儿的只剩挂不上任何支的那几条(无触发源 / 早于链路记录)。两者的信息面本来
+            // 就是同一个,差别只在——未折叠态**多一枚回返角标**(指回宿主事件行),而那正是
+            // 折叠态由支行标题承担的那件事。宿主没加载时给的是那枚可点的「触发事件未加载」,
+            // 点了去问后端(同支行)。
+            const hostId = r.hostId;
+            return (
+              <ActionRow
+                key={`a:${r.key}`}
+                row={r.action}
+                t={t}
+                spec={deviceSpecs.get(r.action.did)}
+                chip={
+                  r.chip ? (
+                    <FoldChipPill
+                      chip={r.chip}
+                      onLookup={
+                        // 只有"有宿主、只是没翻到"那枚可点:去后端单查它在不在。
+                        r.chip === "hostMissing" && hostId ? () => lookupHost(hostId) : undefined
+                      }
+                    />
+                  ) : undefined
+                }
+                back={
+                  r.hostRendered && hostId ? { eventId: hostId, onBack: locate } : undefined
+                }
               />
-            ) : (
-              <ActionRow key={`a:${r.action.id}`} row={r.action} t={t} />
-            ),
-          )}
-          {/* 动作拉取达上限(500):最旧的动作被截断,底部给条弱提示告知只显最近 500 条。 */}
-          {showActions && actions.length === ACTIONS_LIMIT && (
+            );
+          })}
+          {/* 动作拉取达上限(500)**且该上限确实卡住了展示**时才提示 —— 见 actionsTruncated。 */}
+          {actionsTruncated && (
             <li className="px-5 py-2 text-caption text-text-tertiary text-center">
               {t("actions.limitHint")}
             </li>
@@ -551,7 +1043,13 @@ export function ActivityFeed({
       )}
 
       {showLoadMore && (
-        <div className="px-5 py-3 border-t border-border flex justify-center">
+        <div className="px-5 py-3 border-t border-border flex flex-col items-center gap-1">
+          {/* 列表到这里为止是**地平线**,不是"没有了"。老 UI 只为动作流写了截断提示、
+              事件流截断却一声不吭,用户读到的就是"事件消失了"。动作关掉时不能提动作
+              —— 那是在解释一条用户亲手隐藏的流。 */}
+          <span className="text-caption text-text-tertiary">
+            {showActions ? t("activity.horizonHint") : t("activity.horizonHintEventsOnly")}
+          </span>
           <button
             type="button"
             onClick={loadMore}
@@ -818,12 +1316,24 @@ function TriggerStatusBadge({ kind }: { kind: TriggerStatusKind }) {
 
 function ActivityRow({
   event,
+  badges,
+  inner,
+  flash,
+  domId,
   onOpenLightbox,
   feedbackSet,
   feedbackPacks,
   onFeedbackSubmitted,
 }: {
   event: ActivityEvent;
+  /** 宿主行上的相位徽标(强档才有;弱档的支自成一行,不挂在这儿)。 */
+  badges?: ReactNode;
+  /** 就地展开的成员表(强档)。收起时不渲染——见 components/FeedFold 头的不变量。 */
+  inner?: ReactNode;
+  /** 刚被定位到:闪一圈。 */
+  flash?: boolean;
+  /** 定位锚点用的行 id(支的徽标与 ↩ 都指向它)。 */
+  domId?: string;
   onOpenLightbox: (src: string, kind: LightboxKind, crop?: EventCropMeta | null) => void;
   feedbackSet: Set<string>;
   feedbackPacks: Map<string, { path: string; size: number }>;
@@ -861,9 +1371,13 @@ function ActivityRow({
 
   return (
     <li
+      id={domId}
+      tabIndex={domId ? -1 : undefined}
       onClick={() => { if (!window.getSelection()?.toString()) setExpanded((x) => !x); }}
       aria-expanded={expanded}
-      className="px-5 py-2.5 hover:bg-bg-tertiary transition-colors cursor-pointer"
+      className={`px-5 py-2.5 hover:bg-bg-tertiary transition-colors cursor-pointer${
+        flash ? " ring-2 ring-brand-ring" : ""
+      }`}
     >
       <div className="flex flex-col gap-1 sm:grid sm:grid-cols-[70px_1fr_auto] sm:gap-x-3 sm:gap-y-1 sm:items-baseline">
         <TimeLabel timestamp={event.timestamp} />
@@ -889,6 +1403,12 @@ function ActivityRow({
               </span>
             ))
           )}
+          {/* 徽标与展开面都留在正文这一列里:它们说的是"这件事引出了什么",跟着这一行读
+              才对;铺到整行宽会让它们看着像独立的一段。 */}
+          {badges && (
+            <div className="mt-1.5 flex items-center gap-1.5 flex-wrap">{badges}</div>
+          )}
+          {inner}
         </div>
         <span
           className="text-caption-mono text-text-tertiary whitespace-nowrap sm:order-last sm:justify-self-end"
