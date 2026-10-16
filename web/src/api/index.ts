@@ -7,7 +7,9 @@
  */
 
 import * as realImpl from "./real";
+import type { BackendPropSpec } from "./real";
 import { apiFetch } from "./client";
+import { decodeGraphResponse } from "@/lib/graphDecode";
 import type {
   ActivityEvent,
   Device,
@@ -51,8 +53,11 @@ import type {
   OmniModelsResult,
   UpgradeCheck,
   UpgradeStatus,
+  GraphProtocolWarning,
+  GraphResponse,
 } from "@/lib/types";
 export type { ScopeHome };
+export type { BackendPropSpec };
 
 const impl: typeof realImpl = realImpl;
 
@@ -318,6 +323,15 @@ export async function listDevices(homeId?: HomeId): Promise<Device[]> {
   return impl.realListDevices();
 }
 
+/** did → 该设备的 spec 表。日志页把台账里的 iid 翻成人话用。
+ *  与设备控制页共用同一个 /api/miot/home 取数与缓存，不额外拉每台设备的状态。 */
+export async function listDeviceSpecs(
+  homeId?: HomeId,
+): Promise<Map<string, Record<string, BackendPropSpec>>> {
+  if (!isPrimary(homeId)) return new Map();
+  return impl.realDeviceSpecs();
+}
+
 export async function controlDeviceProp(
   did: string,
   iid: string,
@@ -337,9 +351,11 @@ export async function triggerScene(id: string): Promise<void> {
 }
 
 // ── 活动 ──────────────────────────────────────────────────
+/** `opts.eventId` = 按主键单查一条事件(反查动作的宿主事件),命中即不看时间窗——
+ *  要反查的场景正是「这条事件已经翻出当前窗口了」。查不到返回空数组。 */
 export async function listActivity(
   homeId?: HomeId,
-  opts?: { since?: number; before?: number; limit?: number; offset?: number },
+  opts?: { since?: number; before?: number; limit?: number; offset?: number; eventId?: string },
 ): Promise<ActivityEvent[]> {
   if (!isPrimary(homeId)) return [];
   return impl.realListActivity(opts);
@@ -515,9 +531,17 @@ export async function getUsageStats(
   return impl.realGetUsageStats(period, binMinutes);
 }
 
-// 清空全部用量数据（实时表 + 日聚合，不可恢复）
-export async function clearUsageData(): Promise<void> {
-  return impl.realClearUsageData();
+// 清除用量数据（实时表 + 日聚合，不可恢复）。范围由 opts 决定，都不给才是全清。
+export async function clearUsageData(
+  opts: {
+    sinceMs?: number | null;
+    model?: string;
+    baseUrl?: string;
+    /** 界面显示的「连带删除哪一天」，让后端按界面说的那天删，见 real 层说明。 */
+    fromDate?: string | null;
+  } = {},
+): Promise<void> {
+  return impl.realClearUsageData(opts);
 }
 
 // ── omni 模型配置（「模型」页内读/写，多档案切换）────────────────
@@ -600,6 +624,21 @@ export async function dismissUpgrade(version: string): Promise<void> {
 
 // ── 性能 tab（observability）────────────────────────────
 // backend observability/router.py 不走 Normal 包装,直接返回原始 JSON。
+
+export interface PerceptionFlowResult {
+  graph: GraphResponse;
+  warnings: GraphProtocolWarning[];
+}
+
+export async function getPerceptionFlow(
+  deviceId?: string,
+): Promise<PerceptionFlowResult> {
+  const decoded = decodeGraphResponse(
+    await impl.realGetPerceptionFlow(deviceId),
+  );
+  if (!decoded.ok) throw new Error(decoded.error);
+  return { graph: decoded.graph, warnings: decoded.warnings };
+}
 
 const PERF_WINDOW_MS: Record<PerfWindow, number> = {
   "1h": 60 * 60_000,
@@ -760,7 +799,11 @@ export interface PerceptionConfig {
   smart_crop_enabled?: boolean;
   /** 发版级开关(backend crop_enhance.enabled)的只读投影,**PUT 不可写**。
    *  false = 当前这一版没打开该能力,用户开关即便为 true 也不裁 → 前端置灰 + 提示,
-   *  避免"开关开着但后端不裁"的静默失效。老后端不返此字段 → undefined,同样置灰。 */
+   *  避免"开关开着但**发版级闸**没开"的静默失效。老后端不返此字段 → undefined,同样置灰。
+   *  注意本字段与 smart_crop_enabled 只覆盖三闸里的**全局两闸**:两者都 true、开关既亮
+   *  又可点时,某个机位仍可能被 per-camera 闸(逐路 deny-list,`miloco-cli scope camera
+   *  crop-on/crop-off` 配)单独关掉而不裁。逐机位生效态本接口不透出,在
+   *  /api/miot/scope/cameras 每行的 crop_effective。 */
   smart_crop_available?: boolean;
   // 老 backend(<0.10.x)不返此字段,前端在读取处 ?? DEFAULTS.min_suggestion_urgency 回退。
   // 声明成可选是为了把这层运行时兼容语义显式化,别让未来维护者把 ?? 当成死代码删。

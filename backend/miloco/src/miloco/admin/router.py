@@ -30,8 +30,10 @@ from miloco.manager import get_manager
 from miloco.middleware import verify_token, verify_token_query_fallback
 from miloco.observability import debug as debug_mod
 from miloco.perception.engine.omni import probe as _probe
+from miloco.rule.schema import RuleDirection
 from miloco.schema.common_schema import NormalResponse
 from miloco.utils.agent_config import update_shared_config
+from miloco.utils.common import safe_log
 from miloco.utils.paths import miloco_home
 
 logger = logging.getLogger(name=__name__)
@@ -61,8 +63,20 @@ async def get_system_status(current_user: str = Depends(verify_token)):
     # SQLite status
     try:
         rule_service = manager.rule_service
-        total_rules = rule_service._repo.count_all()
-        enabled_rules = rule_service._repo.count_enabled()
+        # 与 GET /rules 同口径: 代建的达标规则用户看不见, 计进来会让这个数字比
+        # rule list 数出来的多, 而差额无从解释。两个数必须一起排 —— 只排启用数会
+        # 把差额挪到总数上, 面板读出来是"有一条规则被停用了", 而那条规则用户在任
+        # 何界面都找不到。
+        total_rules = sum(
+            1
+            for r in await rule_service.get_all_rules()
+            if r.resolved_direction is not RuleDirection.MILESTONE
+        )
+        enabled_rules = sum(
+            1
+            for r in await rule_service.get_effectively_enabled_rules()
+            if r.resolved_direction is not RuleDirection.MILESTONE
+        )
         sqlite_ok = True
     except Exception:
         total_rules = 0
@@ -230,12 +244,7 @@ def _write_dismissed(version: str) -> None:
     try:
         _dismiss_file().write_text(version.strip(), encoding="utf-8")
     except Exception as e:
-        logger.warning("failed to persist dismissed version %s: %s", _scrub_log(version), e)
-
-
-def _scrub_log(value: object) -> str:
-    """中和插入日志的外部值里的 CR/LF，防日志伪造/注入（CodeQL py/log-injection）。"""
-    return str(value).replace("\r", " ").replace("\n", " ")
+        logger.warning("failed to persist dismissed version %s: %s", safe_log(version), e)
 
 
 def _deploy_kind() -> str:
@@ -267,15 +276,15 @@ def _latest_is_newer(current: str, latest: str) -> bool:
         return Version(_norm_ver(latest)) > Version(_norm_ver(current))
     except Exception as e:
         # latest 源自 GitHub tag_name（外部可控），current 源自本地包版本——统一经
-        # _scrub_log 中和 CR/LF，与 upgrade_run/_write_dismissed 一致地闭合日志注入这一类。
-        # 异常 e 也必须 _scrub_log：packaging 的 InvalidVersion 会把原始（未净化的）版本串
+        # safe_log 中和 CR/LF，与 upgrade_run/_write_dismissed 一致地闭合日志注入这一类。
+        # 异常 e 也必须 safe_log：packaging 的 InvalidVersion 会把原始（未净化的）版本串
         # 原样嵌进消息（"Invalid version: '<latest>'"），直接打 e 等于把 latest 的 CR/LF
         # 从旁路重新带回日志、抵消上面对 latest 的净化——故一并中和。
         logger.info(
             "upgrade check: version compare failed (%s vs %s): %s",
-            _scrub_log(current),
-            _scrub_log(latest),
-            _scrub_log(e),
+            safe_log(current),
+            safe_log(latest),
+            safe_log(e),
         )
         return False
 
@@ -295,9 +304,9 @@ async def _fetch_latest_release() -> dict | None:
             return None
         return {"tag": tag, "html_url": j.get("html_url")}
     except Exception as e:  # 网络不可达 / 超时 / 解析失败 → 静默降级，不打扰用户
-        # e 亦经 _scrub_log：JSONDecodeError 等可能把响应体片段（外部数据）嵌进消息，
+        # e 亦经 safe_log：JSONDecodeError 等可能把响应体片段（外部数据）嵌进消息，
         # 与 _latest_is_newer 一致地闭合日志注入旁路。
-        logger.info("upgrade check: fetch latest release failed: %s", _scrub_log(e))
+        logger.info("upgrade check: fetch latest release failed: %s", safe_log(e))
         return None
 
 
@@ -504,7 +513,7 @@ async def upgrade_run(current_user: str = Depends(verify_token)):
         # 无进程 → 不会 racing）。
         if not launched:
             _upgrade_state["started_at"] = 0.0
-        logger.error("failed to launch upgrade process: %s", _scrub_log(e))
+        logger.error("failed to launch upgrade process: %s", safe_log(e))
         raise HTTPException(
             status_code=500, detail="failed to launch upgrade process"
         ) from e
@@ -610,7 +619,7 @@ async def get_token_usage(
 
 @router.get(
     "/token-usage/daily",
-    summary="Token Usage (daily rollup by date / model / type)",
+    summary="Token Usage (daily rollup by date / model / base_url / type)",
     response_model=NormalResponse,
 )
 async def get_token_usage_daily(
@@ -618,14 +627,33 @@ async def get_token_usage_daily(
     until: str | None = None,
     current_user: str = Depends(verify_token),
 ):
-    """Daily rollup rows (date / model / type) combining historical + today's live."""
-    rows = get_token_usage_repo().aggregate_daily(since, until)
-    return NormalResponse(code=0, message="ok", data={"rows": rows, "total": len(rows)})
+    """Daily rollup rows (date / model / base_url / type): the historical daily table
+    plus live aggregation of what has not been rolled up yet — today *and* the previous
+    _RETENTION_DAYS days. The week/month views read those recent days from here; they
+    are not in ``token_usage_daily`` at all.
+
+    模型身份是「模型名 + base_url」：同一个模型名挂在两个 endpoint 上会各返回一行。
+    """
+    repo = get_token_usage_repo()
+    rows = repo.aggregate_daily(since, until)
+    earliest, latest = repo.daily_date_range()
+    return NormalResponse(
+        code=0,
+        message="ok",
+        data={
+            "rows": rows,
+            "total": len(rows),
+            # 界面据此判断「清到某一天」会不会真的连带删掉日表里那一整天。
+            # 两头都要:见 TokenUsageRepo.daily_date_range 的说明。
+            "daily_earliest_date": earliest,
+            "daily_latest_date": latest,
+        },
+    )
 
 
 @router.get(
     "/token-usage/buckets",
-    summary="Token Usage (today, server-side bucketed by time / model / type)",
+    summary="Token Usage (today, bucketed by time / model / base_url / type)",
     response_model=NormalResponse,
 )
 async def get_token_usage_buckets(
@@ -640,18 +668,75 @@ async def get_token_usage_buckets(
     count, so it never hits the raw-event cap regardless of activity — preferred
     over /token-usage for the today timeline.
     """
-    rows = get_token_usage_repo().aggregate_buckets(since, until, bin_minutes)
-    return NormalResponse(code=0, message="ok", data={"rows": rows, "total": len(rows)})
+    repo = get_token_usage_repo()
+    rows = repo.aggregate_buckets(since, until, bin_minutes)
+    earliest, latest = repo.daily_date_range()
+    return NormalResponse(
+        code=0,
+        message="ok",
+        data={
+            "rows": rows,
+            "total": len(rows),
+            "daily_earliest_date": earliest,
+            "daily_latest_date": latest,
+        },
+    )
+
+
+class ClearTokenUsageBody(BaseModel):
+    """清空范围。四个字段都省略 = 全清。
+
+    ``model`` 与 ``base_url`` 必须同时给或同时不给——模型的唯一身份是这两者的组合，
+    只给模型名会跨掉它的所有 endpoint，那不是任何界面入口的语义。
+    ``base_url=""`` 是有意义的取值（schema v3 之前的老数据，来源未记录）。
+
+    ``from_date``（YYYY-MM-DD）是界面**已经显示给用户**的那个「连带删除哪一天」。
+    日表的 date 按本机时区写入，而界面那句话是浏览器按它自己的时区算的，两者能差
+    一天；给了它就以界面说的那天为准，做到「说了哪天就删哪天」。只接受与 since_ms
+    推算相差不超过一天的日期。
+    """
+
+    since_ms: int | None = None
+    model: str | None = None
+    base_url: str | None = None
+    from_date: str | None = None
 
 
 @router.post(
     "/token-usage/clear",
-    summary="清空全部 Token 用量(实时表 + 日聚合，不可恢复)",
+    summary="清空 Token 用量(实时表 + 日聚合，不可恢复；可限时间范围)",
     response_model=NormalResponse,
 )
-def clear_token_usage(current_user: str = Depends(verify_token)):
-    """删除 token_usage + token_usage_daily 全部行，返回各表删除条数。供重置统计用。"""
-    deleted = get_token_usage_repo().clear_all()
+def clear_token_usage(
+    body: ClearTokenUsageBody | None = None,
+    current_user: str = Depends(verify_token),
+):
+    """删除 token_usage + token_usage_daily 中符合条件的行（条件间为 AND）。
+
+    body 省略、或四个字段都为 null 时才是全清——**保持与老客户端的兼容**:此前这个
+    端点不收 body，旧前端发的空 POST 仍然表示「全清」，语义不变。``since_ms=null``
+    本身只表示不限时间；若同时给了 model + base_url，删的仍然只是这一个
+    「模型名 + endpoint」。
+
+    给 ``model`` + ``base_url`` 则只删这一个「模型名 + endpoint」的记录，其他模型与
+    同名模型的另一个 endpoint 都不受影响。
+
+    返回值里的 ``daily_from_date`` 说明日聚合表实际是从哪一天起被删的:日表只有
+    天粒度，跨天范围会连带删掉 since 之前、同一天里的记录（详见 repo 的说明）。
+    给了 ``from_date`` 时它就等于界面显示的那一天。
+    """
+    since_ms = body.since_ms if body else None
+    model = body.model if body else None
+    base_url = body.base_url if body else None
+    from_date = body.from_date if body else None
+    try:
+        deleted = get_token_usage_repo().clear_since(
+            since_ms, model, base_url, from_date
+        )
+    except ValueError as e:
+        # 只给一半的定点条件、或对不上的 from_date = 调用方 bug。
+        # 返回 400 而不是按「不限 endpoint」多删、或按自己的时区改删别的一天。
+        raise HTTPException(status_code=400, detail=str(e)) from e
     return NormalResponse(code=0, message="ok", data={"deleted": deleted})
 
 
@@ -1023,7 +1108,12 @@ async def put_omni_config(
     label = body.label.strip()
     if not label:
         raise HTTPException(status_code=400, detail="档案名不能为空")
-    base_url = body.base_url.strip()
+    # 去尾斜杠再落盘：本文件判「URL 变没变、旧 key 还能不能沿用」时比的就是 rstrip("/")
+    # 之后的值,探活那侧归一化同理。用量表自带 base_url 起,这行文本还是模型身份的一半——
+    # 写入口不归一化的话,住户重打一遍地址顺手改掉尾斜杠,凭证层认为 URL 没变、一次调用都
+    # 不会失败,而记账从此把同一个 endpoint 拆成两行、合计对半分,明细上「只清这一项」也
+    # 只清得掉其中一行。
+    base_url = body.base_url.strip().rstrip("/")
     model = body.model.strip()
     orig = (body.original_label or "").strip()
     profiles = _profiles_as_dicts()
@@ -1492,6 +1582,9 @@ class PerceptionConfigBody(BaseModel):
     window_size: int | None = Field(default=None, ge=1, le=60)
     # Smart Crop 用户开关。与 video_short_edge 正交:裁不裁看这个,多清晰看 video_short_edge。
     # 写进 perception.engine.crop_enhance.user_enabled;发版级开关 enabled 不由 API 写。
+    # 注意本开关（连同 enabled）只是**必要非充分**条件：还要该机位自己的 per-camera 闸也开
+    # （KV CAMERA_CROP_DENY_LIST_KEY，deny-list/默认开，`scope camera crop-on/crop-off` 逐路配），
+    # 三闸相与才裁。生效态看 /api/miot/scope/cameras 的 crop_effective。
     smart_crop_enabled: bool | None = None
     min_suggestion_urgency: Literal["low", "medium", "high"] | None = Field(
         default=None,
@@ -1540,7 +1633,11 @@ def _perception_config_payload() -> dict:
         "window_size": s.perception.collect.window_size,
         # 双闸分开暴露:smart_crop_enabled = 用户态(开关位置,取 user_enabled)vs
         # smart_crop_available = 决定开关能不能点(取发版级开关 enabled)。
-        # available=false 时前端置灰 + 提示「服务端尚未开放」,避免"开关开着但后端不裁"。
+        # available=false 时前端置灰 + 提示「服务端尚未开放」,避免"开关开着但**发版级闸**
+        # 没开"。注意本接口这两个字段只覆盖三闸里的**全局两闸**:即便都为 true、开关也亮着,
+        # 某个机位仍可能被 per-camera 闸单独关掉而不裁(见 PerceptionConfigBody.
+        # smart_crop_enabled 上方注释)。逐机位的生效态本接口不透出,看
+        # /api/miot/scope/cameras 的 crop_effective。
         # 注意 available 不只反映发版级开关:整份 crop_enhance 校验不过(数值字段写成字符串 /
         # min>max)时运行时整份退默认,这里跟着报 false —— 此时那句提示归因是偏的,真因看
         # 日志 event=crop_enhance_config_bad 的 reason。

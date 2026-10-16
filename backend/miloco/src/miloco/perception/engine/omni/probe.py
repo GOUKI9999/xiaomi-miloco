@@ -174,11 +174,12 @@ async def probe_reachable(base_url: str) -> dict | None:
 async def fetch_models(base_url: str, api_key: str) -> dict[str, Any]:
     """拉取 provider 模型列表(GET /models)。
 
-    模型下拉在「选定 model 之前」拉取,没有 model 可路由 adapter,故按 base_url 判 provider:
+    当前列表接口不接收 model,故按 base_url 判 provider:
     Gemini 原生端点(见 ``_is_gemini_native_endpoint``)用 ``x-goog-api-key`` 鉴权;其余用
     ``Bearer``。响应形态不绑死判定结果——``_parse_model_ids`` 认识的几种形态都会试,判定只
     决定先试哪一种。
-    (经代理转发的 Gemini 不含这些域名时,仍走 OpenAI 兼容分支——用户可手填 model 名兜底。)
+    经代理转发的 Gemini 不含这些域名时仍走兼容分支;列表不可用时可手填 model 名继续测试,
+    实际推理仍取决于所选 adapter 与端点协议是否匹配。
 
     ``{models:[{name}]}`` 这个响应形态只在 Gemini API 那条路上验证过;生产在用的那条
     Vertex base_url 实测 GET /models 回 404,故走下方 ``list_unsupported`` 分支。
@@ -207,6 +208,10 @@ async def fetch_models(base_url: str, api_key: str) -> dict[str, Any]:
     if err is not None:
         return {"ok": False, "code": "unreachable", "models": [], "message": err}
     is_gemini = _is_gemini_native_endpoint(base)
+    # 刻意只发鉴权头(Authorization / x-goog-api-key),**不**复用 build_request_headers():
+    # 当前列表接口不接收 model,这里只按 base_url 判 provider,问「endpoint 认不认这个 key」;
+    # session 头是推理请求的路由亲和 ID,
+    # 在这里带上没有意义。别"顺手收敛"——预检与运行时的差异是设计,不是遗漏。
     headers = (
         {"x-goog-api-key": api_key}
         if is_gemini
@@ -319,7 +324,10 @@ async def probe_chat(model: str, base_url: str, api_key: str) -> dict[str, Any]:
         return {"ok": False, "code": "unreachable", "message": err}
     # 延迟 import 避免 probe 被 wire 时循环拉起 provider (provider 只依赖标准库,
     # 但保险起见延后到函数内)。
-    from miloco.perception.engine.omni.provider import get_adapter
+    from miloco.perception.engine.omni.provider import (
+        build_request_headers,
+        get_adapter,
+    )
 
     adapter = get_adapter(model)
     body = adapter.build_request_body(
@@ -332,13 +340,8 @@ async def probe_chat(model: str, base_url: str, api_key: str) -> dict[str, Any]:
     )
     forced_stream = body.get("stream", False)
     url = adapter.endpoint(base, model, stream=forced_stream)
-    # adapter.auth_headers 走 provider 特化 —— Gemini 用 ``x-goog-api-key`` 头,
-    # OpenAI 兼容族用 ``Authorization: Bearer``。硬编码 Bearer 会对合法 Gemini
-    # 配置误报失败(401)。
-    headers = {
-        **adapter.auth_headers(api_key),
-        "Content-Type": "application/json",
-    }
+    # 统一走 provider 特化鉴权，并确保 probe 与运行时发送相同的附加头。
+    headers = build_request_headers(adapter, base, api_key)
     t0 = time.monotonic()
     try:
         async with httpx.AsyncClient(timeout=_TIMEOUT) as client:
@@ -481,6 +484,10 @@ async def probe_omni(model: str, base_url: str, api_key: str) -> dict[str, Any]:
     if not isinstance(get_adapter(model), OpenAICompatAdapter):
         return await probe_chat(model, base, api_key)
     try:
+        # 同 fetch_models:预检刻意只发 Authorization、**不**带 x-opencode-session。
+        # 这里的 model 已经能拿到 adapter,但 GET /models 只问「这个 endpoint 认不认我的
+        # key」,不是一次推理,session 头(运行时按 endpoint 派生的进程级路由亲和 ID)在这
+        # 里没有作用;真校验模型的 probe_chat 才按运行时同头发。别"顺手收敛"成半对齐。
         async with httpx.AsyncClient(timeout=_TIMEOUT) as client:
             r = await client.get(
                 f"{base}/models", headers={"Authorization": f"Bearer {api_key}"}

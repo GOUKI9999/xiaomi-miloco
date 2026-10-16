@@ -29,8 +29,9 @@ class GateTrace:
     # cycle 异常 fallback),写库时落 NULL,P50-P99 分布视图过滤掉。
     video_score: float | None = None
     audio_energy: float | None = None
-    # 本窗 packet 由 hold 滞回拉起(visual 不通过、距上次 visual 通过 <= hold_duration_sec)。
-    # 与 video_pass 互斥(hold 前置条件要求 visual 不通过);可与 audio_pass 共存。
+    # 滞回真把本窗开出来了(= GateTiming.hold_opened_window,与同名的 GateTiming.hold_pass
+    # 公式相反)。与 video_pass 互斥,可与 audio_pass 共存。语义约束与消费者清单见
+    # knowledge/03-features/perception-pipeline.md 的 Gate 小节。
     hold_pass: bool = False
 
     @property
@@ -147,6 +148,8 @@ class ActionLedgerRecord:
     source: str | None = None    # v3: cli | rule
     source_id: str | None = None  # v3: rule 写 rule_id,cli 留空
     home_id: str | None = None   # v4: 设备所属家庭,写入时从 device cache 解析,失败留 NULL
+    phase: str | None = None     # v5: enter | exit | legacy(链路记录之前写入的老行)
+    trigger_event_id: str | None = None  # v5: 触发它的事件 id,无链路留 NULL
 
     def to_row(self) -> dict[str, Any]:
         return {
@@ -166,6 +169,8 @@ class ActionLedgerRecord:
             "source": self.source,
             "source_id": self.source_id,
             "home_id": self.home_id,
+            "phase": self.phase,
+            "trigger_event_id": self.trigger_event_id,
         }
 
 

@@ -142,6 +142,13 @@ class BackendState:
     version_data: dict | None = None
 
 
+# UDP 探测收到 ICMP 端口不可达的标记串。产出方(_probe_udp)与两处消费方
+# (L3 可达判定、UDP 检查)共用同一常量:三处手写字面量之间没有任何机制保证同步,
+# 一旦分裂是**静默**的 —— doctor 会同时输出「三层不可达」和「UDP 探测有回应」,
+# 正是本次改动要修掉的自相矛盾,且不会有任何测试失败。
+_UDP_PORT_UNREACH_MARK = "ICMP Port Unreachable"
+
+
 @dataclass(frozen=True)
 class ReachabilityState:
     target_ip: str
@@ -158,6 +165,21 @@ class ReachabilityState:
     udp_error: str | None
     udp_local_ip: str | None = None
     udp_local_iface: str | None = None
+    # 所有同网段网卡(最具体在前)。子网重叠时 same_subnet_iface 只是其中最具体的
+    # 一块, 判"选路是否异常"要看路由接口是否落在**整个**集合里, 而非只比对首个。
+    same_subnet_ifaces: tuple[str, ...] = ()
+
+    @property
+    def udp_port_unreachable(self) -> bool:
+        """UDP 探测已发出且收到 ICMP 端口不可达 —— L3 可达的铁证。
+
+        单一判定入口:L3 可达判定与 UDP 检查都读它,保证两段结论不会分裂。
+        """
+        return bool(
+            self.udp_send_ok
+            and self.udp_error
+            and _UDP_PORT_UNREACH_MARK in self.udp_error
+        )
 
 
 # ─── Low-level helpers ─────────────────────────────────────────────────────────
@@ -195,13 +217,21 @@ def _is_virtual_iface(name: str) -> bool:
     return name in ("lo", "lo0") or name.startswith(_VIRTUAL_PREFIXES)
 
 
-def _in_same_subnet(
+def _matching_subnet_ifaces(
     interfaces: list[NetworkInterface], target_ip: str,
-) -> tuple[bool, str | None]:
+) -> list[str]:
+    """返回所有"目标落在其子网内"的物理网卡名, **按前缀长度降序**(最具体在前)。
+
+    多网卡重叠是常态而非异常: 例如 en0=192.168.18.2/16 与 en1=192.168.1.239/24
+    并存时, 192.168.1.116 同时落在两者内。内核选路用最长前缀匹配(LPM), 会走 en1;
+    若这里按遍历顺序取首个匹配(en0), 判据就与内核不一致, 于是把完全正常的选路
+    误报成"多网卡冲突"。故排序口径必须与 LPM 对齐。
+    """
     try:
         target = ipaddress.IPv4Address(target_ip)
     except (ipaddress.AddressValueError, ValueError):
-        return False, None
+        return []
+    matched: list[tuple[int, str]] = []
     for iface in interfaces:
         if iface.is_virtual:
             continue
@@ -210,8 +240,18 @@ def _in_same_subnet(
         except (ValueError, ipaddress.NetmaskValueError):
             continue
         if target in net:
-            return True, iface.name
-    return False, None
+            matched.append((net.prefixlen, iface.name))
+    # 前缀长度降序; 同长度时保持网卡枚举顺序稳定(sorted 稳定排序)。
+    matched.sort(key=lambda x: -x[0])
+    return [name for _, name in matched]
+
+
+def _in_same_subnet(
+    interfaces: list[NetworkInterface], target_ip: str,
+) -> tuple[bool, str | None]:
+    """是否与某物理网卡同网段, 以及**最具体**的那块网卡(与内核 LPM 选路一致)。"""
+    names = _matching_subnet_ifaces(interfaces, target_ip)
+    return (True, names[0]) if names else (False, None)
 
 
 # ─── Environment probing ───────────────────────────────────────────────────────
@@ -1239,7 +1279,7 @@ def _probe_udp_send(
         except socket.timeout:
             return True, None, local_ip
         except ConnectionRefusedError:
-            return True, "ICMP Port Unreachable", local_ip
+            return True, _UDP_PORT_UNREACH_MARK, local_ip
     except OSError as e:
         return False, f"{e.strerror or type(e).__name__} (errno={e.errno})", local_ip
     finally:
@@ -1291,7 +1331,9 @@ def probe_reachability(
     env: Environment, target_ip: str, target_label: str,
     interfaces: list[NetworkInterface],
 ) -> ReachabilityState:
-    same_subnet, same_subnet_iface = _in_same_subnet(interfaces, target_ip)
+    subnet_ifaces = _matching_subnet_ifaces(interfaces, target_ip)
+    same_subnet = bool(subnet_ifaces)
+    same_subnet_iface = subnet_ifaces[0] if subnet_ifaces else None
 
     if env.platform == "macos":
         route = _run_cmd(["route", "-n", "get", target_ip])
@@ -1329,6 +1371,7 @@ def probe_reachability(
     return ReachabilityState(
         target_ip=target_ip, target_label=target_label,
         same_subnet=same_subnet, same_subnet_iface=same_subnet_iface,
+        same_subnet_ifaces=tuple(subnet_ifaces),
         route_iface=route_iface, route_src=route_src,
         ping_ok=ping_ok, ping_rtt_ms=rtt,
         neigh_state=neigh_state, neigh_mac=neigh_mac,
@@ -1347,6 +1390,13 @@ def _udp_iface_suffix(state: ReachabilityState, t: Translator = _ZH_T) -> str:
     if state.udp_local_ip:
         return t("reach.udp.iface_suffix_ip_only", src=state.udp_local_ip)
     return ""
+
+
+def _subnet_iface_set(state: ReachabilityState) -> set[str]:
+    """同网段网卡集合; 旧构造(只给 same_subnet_iface)回落为单元素集合。"""
+    if state.same_subnet_ifaces:
+        return set(state.same_subnet_ifaces)
+    return {state.same_subnet_iface} if state.same_subnet_iface else set()
 
 
 def assess_reachability(state: ReachabilityState, t: Translator = _ZH_T) -> list[CheckResult]:
@@ -1376,7 +1426,7 @@ def assess_reachability(state: ReachabilityState, t: Translator = _ZH_T) -> list
             status=Status.WARN,
             message=t("reach.route.none.message"),
         ))
-    elif state.same_subnet and state.route_iface != state.same_subnet_iface:
+    elif state.same_subnet and state.route_iface not in _subnet_iface_set(state):
         results.append(CheckResult(
             name=prefix + t("reach.route.mismatch.name"),
             status=Status.WARN,
@@ -1399,6 +1449,10 @@ def assess_reachability(state: ReachabilityState, t: Translator = _ZH_T) -> list
             ),
         ))
 
+    # UDP 收到 ICMP Port Unreachable = 包已送达目标主机、目标回了「端口未监听」,
+    # 这是 L3 可达的铁证(比 ping/ARP 更强)。跨网段时 ARP 表天然无条目、ICMP echo
+    # 又常被对端/中间设备过滤,但 UDP 单播是真实拉流路径 —— 用它兜底判 L3 可达。
+    udp_port_unreach = state.udp_port_unreachable
     if state.ping_ok:
         rtt_suffix = (
             t("reach.l3.ping_ok.rtt_suffix", rtt=f"{state.ping_rtt_ms:.1f}")
@@ -1409,6 +1463,17 @@ def assess_reachability(state: ReachabilityState, t: Translator = _ZH_T) -> list
             name=prefix + t("reach.l3.ping_ok.name"),
             status=Status.PASS,
             message=t("reach.l3.ping_ok.message", rtt_suffix=rtt_suffix),
+        ))
+    elif udp_port_unreach:
+        # 分支顺序即证据强弱:ping 通 > UDP 收到端口不可达(包已达目标主机、目标
+        # 主动回应) > 邻居表有条目(只证明二层见过它)。UDP 这条必须排在 ARP 之前,
+        # 否则同网段目标(ARP 表天然有条目)永远短路在 ARP 的 WARN 上 —— 与本函数
+        # 刚立的「UDP 端口不可达是 L3 可达铁证」自相矛盾,新判据也就只在跨网段
+        # 路径上生效。
+        results.append(CheckResult(
+            name=prefix + t("reach.l3.udp_reach.name"),
+            status=Status.PASS,
+            message=t("reach.l3.udp_reach.message"),
         ))
     elif state.neigh_state in ("REACHABLE", "STALE", "DELAY"):
         results.append(CheckResult(
@@ -1433,7 +1498,7 @@ def assess_reachability(state: ReachabilityState, t: Translator = _ZH_T) -> list
         ))
     else:
         suffix = _udp_iface_suffix(state, t)
-        if state.udp_error and "ICMP Port Unreachable" in state.udp_error:
+        if state.udp_port_unreachable:
             results.append(CheckResult(
                 name=prefix + t("reach.udp.port_unreach.name"),
                 status=Status.PASS,

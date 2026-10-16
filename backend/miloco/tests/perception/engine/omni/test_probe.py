@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import httpx
 from miloco.perception.engine.omni import probe
+from miloco.perception.engine.omni.provider import build_request_headers, get_adapter
 
 
 class _FakeResp:
@@ -23,8 +24,9 @@ def _fake_async_client(
     get_resp: _FakeResp | None = None,
     post_resp: _FakeResp | None = None,
     seen: dict | None = None,
+    sent: list[dict] | None = None,
 ):
-    """``seen`` 传入则记录 GET 实际用的 url / headers，供鉴权头断言。"""
+    """``seen`` 记录 GET 的 url/headers，``sent`` 记录 POST 的 url/kwargs。"""
     g = get_resp if get_resp is not None else resp
     p = post_resp if post_resp is not None else resp
 
@@ -49,6 +51,8 @@ def _fake_async_client(
         async def post(self, *a, **k):
             if exc:
                 raise exc
+            if sent is not None:
+                sent.append({"url": a[0] if a else k.get("url"), **k})
             return p
 
     return _C
@@ -411,11 +415,11 @@ async def test_probe_chat_non_qwen_still_uses_post(monkeypatch):
         probe.httpx,
         "AsyncClient",
         _fake_async_client(
-            get_resp=_FakeResp(200, {"data": [{"id": "xiaomi/mimo-v2.5"}]}),
+            get_resp=_FakeResp(200, {"data": [{"id": "mimo-v2.6-flash"}]}),
             post_resp=_FakeResp(200, {"choices": [{"message": {"content": "pong"}}]}),
         ),
     )
-    r = await probe.probe_omni("xiaomi/mimo-v2.5", "https://mimo.example/v1", "sk-x")
+    r = await probe.probe_omni("mimo-v2.6-flash", "https://mimo.example/v1", "sk-x")
     assert r["ok"] is True
 
 
@@ -690,3 +694,137 @@ async def test_probe_reachable_gemini_404_not_reported_as_url_error(monkeypatch)
     monkeypatch.setattr(probe.httpx, "AsyncClient", _fake_async_client(_FakeResp(404)))
     r = await probe.probe_reachable("https://api.example.com/v1")
     assert r is not None and r["code"] == "http_error"
+
+
+# ─── probe × 运行时 header 一致性(传输层不变量) ──────────────────────────────
+#
+# 不变量:probe_chat 真正发到线上的 headers,必须与运行时 omni_client /
+# _call_omni_messages 发的是同一份 —— 即同一个 build_request_headers() 的产物。
+#
+# 为什么要在传输层测(而不是只测纯函数):修复前 probe 自己手写一份 headers
+# (**auth_headers + Content-Type),既没有 User-Agent 也没有 x-opencode-session。
+# OpenCode Go 拒收缺 session 头的请求,于是同一个 endpoint 上「probe 判失败、运行时
+# 却能跑通」——探测与真实调用行为分叉,用户看到 bad_key 但实际 key 有效。
+# test_provider.py 里的纯函数测试抓不到这个,因为分叉发生在「probe 有没有调用
+# build_request_headers」这一步;而既有 fake 的 post(*a, **k) 把 kwargs 吞掉,
+# 即使 probe 传错头也没人能看见。下面抓真正上线的 headers 逐项比对。
+
+
+async def test_probe_chat_sends_same_headers_as_runtime_path(monkeypatch):
+    """probe 上线的 headers 逐项等于 build_request_headers() 的产物。
+
+    断言的是**相等**而非「含有 session 头」:相等才能同时守住两头的漂移 ——
+    probe 少发一个头(修复前的形态)或多发一个头(未来加头时忘了 probe)都会红。
+    """
+    sent: list[dict] = []
+    monkeypatch.setattr(
+        probe.httpx,
+        "AsyncClient",
+        _fake_async_client(resp=_FakeResp(200), sent=sent),
+    )
+    base_url = "https://opencode.ai/zen/go/v1"
+    model = "xiaomi/mimo-v2.5"
+
+    r = await probe.probe_chat(model, base_url, "sk-x")
+
+    assert r["ok"] is True
+    assert len(sent) == 1
+    runtime_headers = build_request_headers(
+        get_adapter(model), base_url, "sk-x"
+    )
+    assert sent[0]["headers"] == runtime_headers
+    # 显式钉住这个 case 的意义:OpenCode Go 缺此头即拒probe,不分叉的前提。
+    assert sent[0]["headers"]["x-opencode-session"].startswith("ses_")
+
+
+async def test_probe_chat_headers_match_runtime_for_non_opencode_endpoint(monkeypatch):
+    """非 OpenCode Go endpoint:probe 与运行时同样不发 session 头。
+
+    反向守「别顺手给所有 endpoint 都加头」—— 一致性的正确形态是「跟运行时一样」,
+    不是「总是带session」;运行时对普通 endpoint 不发,probe 发了就是新的分叉。
+    """
+    sent: list[dict] = []
+    monkeypatch.setattr(
+        probe.httpx,
+        "AsyncClient",
+        _fake_async_client(resp=_FakeResp(200), sent=sent),
+    )
+    base_url = "https://api.openai.com/v1"
+    model = "xiaomi/mimo-v2.5"
+
+    r = await probe.probe_chat(model, base_url, "sk-x")
+
+    assert r["ok"] is True
+    assert len(sent) == 1
+    assert "x-opencode-session" not in sent[0]["headers"]
+    assert sent[0]["headers"] == build_request_headers(
+        get_adapter(model), base_url, "sk-x"
+    )
+
+
+async def test_probe_chat_sends_session_header_for_trailing_slash_base_url(monkeypatch):
+    """base_url 带尾斜杠时(probe 内部 ``_normalize_base_url`` 会 rstrip)仍要发session 头。
+
+    probe 在调 build_request_headers 前先归一化 base_url,归一化与「是否 OpenCode Go
+    判定」耦合:若归一化顺序变了导致 ``/zen/go/v1/`` 判定落空,probe 就会静默不发
+    session 头,只在用户手填尾斜杠时复现。故在传输层钉住这一条。
+    """
+    sent: list[dict] = []
+    monkeypatch.setattr(
+        probe.httpx,
+        "AsyncClient",
+        _fake_async_client(resp=_FakeResp(200), sent=sent),
+    )
+
+    r = await probe.probe_chat(
+        "xiaomi/mimo-v2.5", "https://opencode.ai/zen/go/v1/", "sk-x"
+    )
+
+    assert r["ok"] is True
+    assert len(sent) == 1
+    assert sent[0]["headers"]["x-opencode-session"].startswith("ses_")
+    assert sent[0]["headers"] == build_request_headers(
+        get_adapter("xiaomi/mimo-v2.5"),
+        "https://opencode.ai/zen/go/v1",
+        "sk-x",
+    )
+
+
+async def test_fetch_models_sends_only_auth_for_opencode_endpoint(monkeypatch):
+    """列模型仍是鉴权探测，不携带推理请求的会话头。"""
+    seen: dict = {}
+    monkeypatch.setattr(
+        probe.httpx,
+        "AsyncClient",
+        _fake_async_client(
+            _FakeResp(200, {"data": [{"id": "xiaomi/mimo-v2.5"}]}), seen=seen
+        ),
+    )
+
+    r = await probe.fetch_models("https://opencode.ai/zen/go/v1", "sk-x")
+
+    assert r == {"ok": True, "models": ["xiaomi/mimo-v2.5"]}
+    assert seen["url"] == "https://opencode.ai/zen/go/v1/models"
+    assert seen["headers"] == {"Authorization": "Bearer sk-x"}
+
+
+async def test_probe_omni_keeps_get_auth_and_chat_runtime_headers(monkeypatch):
+    """同次两阶段探测：GET 仅鉴权，POST 与运行时同头。"""
+    seen: dict = {}
+    sent: list[dict] = []
+    monkeypatch.setattr(
+        probe.httpx,
+        "AsyncClient",
+        _fake_async_client(_FakeResp(200), seen=seen, sent=sent),
+    )
+    base = "https://opencode.ai/zen/go/v1"
+    model = "xiaomi/mimo-v2.5"
+
+    r = await probe.probe_omni(model, base, "sk-x")
+
+    assert r["ok"] is True
+    assert seen["url"] == f"{base}/models"
+    assert seen["headers"] == {"Authorization": "Bearer sk-x"}
+    assert len(sent) == 1
+    assert sent[0]["headers"] == build_request_headers(get_adapter(model), base, "sk-x")
+    assert sent[0]["headers"]["x-opencode-session"].startswith("ses_")

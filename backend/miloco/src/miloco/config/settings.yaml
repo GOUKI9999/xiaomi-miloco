@@ -22,7 +22,7 @@ directories:
 model:
   omni:
     label: "mimo"
-    model: "xiaomi/mimo-v2.5"
+    model: "mimo-v2.6-flash"
     base_url: "https://api.xiaomimimo.com/v1"
     api_key: ""
   omni_profiles: []
@@ -54,6 +54,13 @@ app:
 # MIoT 云接入参数（可选值：cn / de / i2 / ru / sg / us）
 miot:
   cloud_server: "cn"
+  # 本地中枢网关总开关。false = 完全禁用（不签证书/不 mDNS/不连网关），控制全走云端。
+  central_hub_enabled: true
+  # 静态中枢网关地址：mDNS 发现不到时用（如容器/跨网段隔离，组播过不去）。
+  # 每项 "ip" 或 "ip:port"（默认端口 8883）。留空则仅靠 mDNS 自动发现。
+  central_hub_gateways: []
+  # central_hub_gateways:
+  #   - "192.168.1.152"
 
 # 通知发送运行参数
 notify:
@@ -93,9 +100,13 @@ perception:
       # 双闸:enabled = 发版级开关(本文件随包发布、不由 admin API 写,只能改文件;false 时
       #       整个能力关掉、前端开关随之置灰);
       #       user_enabled = 单机用户开关(UI「智能裁切增强」,admin API 写 config.json)。
-      #       两个都为 true 才裁。分两个 key 不是访问控制(本地部署拦不住),是配置层不同,
+      #       本文件这两个是**全局**闸,都为 true 只是必要条件 —— 还要该机位自己的
+      #       per-camera 闸也开(KV CAMERA_CROP_DENY_LIST_KEY,deny-list/默认开,
+      #       用 `miloco-cli scope camera crop-on/crop-off` 逐路配),三闸相与才裁。
+      #       分两个 key 不是访问控制(本地部署拦不住),是配置层不同,
       #       见 perception/engine/config.py::CropEnhanceConfig 的 docstring。
-      # 两闸默认放开:未改过 config.json / 未动 UI 开关的用户默认启用 Smart Crop。
+      # 两闸默认放开(per-camera 闸的默认也是开,空集=全开):未改过 config.json /
+      # 未动 UI 开关 / 未逐机位关过的用户默认启用 Smart Crop。
       # 关闭任一闸即回退全景路径(不再裁切),但**不等于**字节回到未接本特性前 —— 全景与 crop
       # 共用 _encode_video_mp4,其放大分支的重采样核已随本特性换成 LANCZOS4(源短边 < 用户档
       # 时命中,如 720p 子码流 + 768/1080 档),故关闸后全景 clip 字节仍与接特性前不同。
@@ -109,6 +120,22 @@ perception:
       motion_global_drift_ratio: 0.5
       crop_min_area_ratio: 0.10
       crop_max_area_ratio: 0.49
+    person_crop_inject:
+      # 单帧人像注入:给每个待识别 track 附一张从本窗视频里裁出的"外观单帧"、绑定 track_id。
+      # 离线评测(主指标 = 多人同框逐窗召回,配对 McNemar)显示显著提升,在已开 Smart Crop 的
+      # 条件下仍然可观;代价是误识率有方向性上升,压回基线另有专项。
+      # 单闸(不像 crop_enhance 是双闸):本能力没有 UI 入口,详见
+      # perception/engine/config.py::PersonCropInjectConfig 的 docstring。
+      # 每窗热读(不在建引擎时快照),但 get_settings() 有进程级 lru_cache、本能力又没有 admin/UI
+      # 入口去清它,所以手改本文件或 config.json 不会当场生效。关闸走 CLI:
+      #   miloco-cli config set perception.engine.person_crop_inject.enabled false
+      # (写 config.json 并默认顺手重启后端)。关闸即退化为只给 bbox 数字坐标。
+      enabled: true
+      # 256 是评测扫出来的效率前沿:往下掉得快且显著,往上检测不到增益却要 12.5× token。
+      crop_height: 256
+      # 原生框高低于此值的帧不参与选帧(远处小框放大只得到一张糊图);末帧兜底同样过这道闸 ——
+      # 否则全窗都是小框时它恰好失效,只把选帧从"窗内最大"降级成"末帧",清晰度一点没变。
+      min_bbox_height_px: 40
     gate:
       # visual 滞回时长(秒)。visual 最近通过过、距今 <= 此值时,本窗 visual 不通过
       # 也强制生成 packet 并打 hold 标志,保住 video 路由不被纯音频短路。

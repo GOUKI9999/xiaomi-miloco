@@ -39,6 +39,7 @@ cd cli && uv sync && uv tool install . --force --reinstall
 
 # OpenClaw 插件（TypeScript）
 cd plugins/openclaw && pnpm install && pnpm run build && openclaw plugins install .
+# openclaw >= 2026.8 需改为：openclaw plugins install --accept-capabilities .
 ```
 
 ---
@@ -133,7 +134,7 @@ Miloco 里"部署时区"指**家庭真实所在的时区**，所有 agent 可见
 - **为何首选改宿主**：宿主时区是这两个域**唯一共享的回落信道**——设好宿主、两边显式配置都留空，openclaw 与 miloco 便一起对齐，只需动一处。若偏好显式配置，须**同时**设 openclaw 的 `agents.defaults.userTimezone` 与 miloco 的 `config.json` `timezone`；只设一边会让另一边停在回落上。
 - **openclaw 侧没有"中国兜底"，这是历史 bug 的根源**：miloco 域在彻底无法解析时兜底 `Asia/Shanghai`，而 openclaw 域回落只到宿主时区（云主机通常 `Etc/UTC`）、无额外兜底。故 `userTimezone` 未设 + 宿主 UTC 时，openclaw 的 `Current time` 会显示 UTC——「上午 10 点被叙述成凌晨」正源于此。修法：设 `openclaw.json` 的 `userTimezone`（openclaw 原生机制），或设对宿主时区。
 - **云主机 / Docker 常见坑**：容器里 `/etc/localtime` 往往是普通文件拷贝（非 symlink）且无 `/etc/timezone`，系统反查靠内容比对兜住；但云主机默认时区多为 `Etc/UTC`——解析结果是 UTC 时 backend 启动会打红旗 warning（没有家庭真住在 UTC），此时应优先给宿主 / 容器设置正确时区；确实无法修改宿主时再用 miloco 侧 `timezone` 配置（openclaw 侧的 `Current time` 另由其 `userTimezone` / 宿主回落决定，见上）。
-- `miloco-cli service start` 生成 supervisord.conf 时会把解析出的时区以 `TZ` + `MILOCO_TIMEZONE` 注入 backend 子进程环境（改配置后重启生效）。
+- `miloco-cli service start` 会把解析出的时区以 `TZ` + `MILOCO_TIMEZONE` 注入 backend 子进程环境（Linux 写进 supervisord.conf 的 `environment=`，macOS 写进 LaunchAgent plist 的 `EnvironmentVariables`；改配置后重启生效）。macOS 侧 launchd 不继承登录 shell 环境，故 plist 还会按白名单快照 `MILOCO_*` 与代理 / 自定义 CA 变量，详见 [macOS LaunchAgent 与本地网络权限](../03-features/macos-launchagent-lnp.md)。
 
 ### 配置修改后是否需要重启
 
@@ -195,6 +196,7 @@ cd plugins/openclaw
 pnpm run build                 # 构建（prebuild 钩子把 plugins/skills/ 复制进来）
 pnpm test                      # 运行测试
 openclaw plugins install .     # 安装到 OpenClaw（build 后需重装）
+# openclaw >= 2026.8 需改为：openclaw plugins install --accept-capabilities .
 
 # 家庭面板前端（web/）
 cd web
@@ -205,7 +207,7 @@ pnpm test                      # 单元测试（vitest）
 pnpm typecheck                 # 类型检查
 ```
 
-**Skill 修改**：`plugins/skills/` 是唯一源，修改 `SKILL.md` 后须重新 `pnpm run build` + `openclaw plugins install`。
+**Skill 修改**：`plugins/skills/` 是唯一源，修改 `SKILL.md` 后须重新 `pnpm run build` + `openclaw plugins install`（`openclaw >= 2026.8` 需加 `--accept-capabilities`）。
 
 **家庭面板修改**：修改 `web/src/` 后 `pnpm build` 产出到 `web/dist/`，再手动复制到 `$MILOCO_HOME/static/`，或重跑 `install.sh` 自动同步。开发期用 `pnpm dev` + Vite proxy 直接对接 backend，无需额外部署步骤。
 
@@ -262,6 +264,7 @@ miloco-cli rule trigger <rule_id>
 cd plugins/openclaw
 pnpm run build
 openclaw plugins install .
+# openclaw >= 2026.8 需改为：openclaw plugins install --accept-capabilities .
 
 # 验证 Skill 已安装
 openclaw skills list | grep miloco
@@ -306,8 +309,9 @@ miloco-cli device list [--room <房间>] [--category <品类>]             # 查
 miloco-cli device spec <did>                                           # 查设备 spec
 
 # 规则管理
-miloco-cli rule create --task-id <id> --name "规则描述" --mode event --condition "..."
-miloco-cli rule list --pretty
+miloco-cli rule create --task-id <id> --name "规则描述" --direction enter --condition "..."
+miloco-cli rule list --pretty                                          # 不含服务端代建的达标规则
+miloco-cli task set-actions <task_id> --on-enter-desc "..." --on-exit-desc "..."
 miloco-cli rule logs --since 1h
 
 # 任务管理（task：生命周期；record：行为统计）
@@ -333,7 +337,7 @@ CLI 会读取 `$MILOCO_HOME/config.json` 中的 `server.url`（后端 HTTP Base 
 
 1. 在 `plugins/skills/` 下新建目录，命名为 `miloco-<name>`
 2. 创建 `SKILL.md`，填写 frontmatter 和指令正文
-3. 构建并安装：`cd plugins/openclaw && pnpm run build && openclaw plugins install .`
+3. 构建并安装：`cd plugins/openclaw && pnpm run build && openclaw plugins install .`（`openclaw >= 2026.8` 需加 `--accept-capabilities`）
 4. 验证：`openclaw skills list | grep miloco-<name>`
 5. 在 Agent 对话中触发，观察日志 `$MILOCO_HOME/log/openclaw-plugin.log`
 
@@ -395,22 +399,22 @@ bash scripts/install.sh --dev
 
 ## 数据落盘约定
 
-| 路径                              | 用途                                                                                                        |
-| --------------------------------- | ----------------------------------------------------------------------------------------------------------- |
-| `~/.openclaw/miloco/`             | `$MILOCO_HOME` 默认根                                                                                       |
-| `config.json`                     | 三端共享配置                                                                                                |
-| `miloco.db`                       | SQLite 业务数据库                                                                                           |
-| `observability.db`                | 性能追踪数据库（`perf.enabled=true` 时建）                                                                  |
-| `data/identity_lib/persons/<id>/` | 身份库（tier_a / tier_c / meta.json）                                                                       |
-| `models/`                         | ONNX 模型（必需 det_4C / human_body_reid_v2，另有可选模型；清单见 `resource_validator.py`）                 |
-| `home-profile/`                   | 家庭档案（candidates.json / profile.json / profile.md）                                                     |
-| `static/`                         | 家庭面板前端静态资源（由 `install.sh` 从 `web/dist/` 同步）                                                 |
-| `log/`                            | 各组件日志（`miloco-backend.log` / `supervisord.log` 等）                                                   |
-| `supervisord.*`                   | supervisor 配置和 socket（service start 首次生成）                                                          |
-| `memory/`                         | Agent 工作区记忆（如 `_system/dynamic_failures.md`；任务行为统计已迁至 `miloco.db` 的 `task_record_*` 表）  |
-| `trace/agent/`                    | DYNAMIC rule trace jsonl（`debug_observability` flag 开时写）                                               |
-| `snapshots/<event_id>/`           | meaningful event 产物：per-device `clip.{mp4,m4a}` + 事件级 `omni_trace.json.gz`（TTL + 磁盘 LRU 同生共死） |
-| `packs/`                          | 日志打包产物（LRU 保留最新几个）                                                                            |
+| 路径                              | 用途                                                                                                                                                |
+| --------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `~/.openclaw/miloco/`             | `$MILOCO_HOME` 默认根                                                                                                                               |
+| `config.json`                     | 三端共享配置                                                                                                                                        |
+| `miloco.db`                       | SQLite 业务数据库                                                                                                                                   |
+| `observability.db`                | 性能追踪数据库（`perf.enabled=true` 时建）                                                                                                          |
+| `data/identity_lib/persons/<id>/` | 身份库（tier_a / tier_c / meta.json）                                                                                                               |
+| `models/`                         | ONNX 模型（必需 det_4C / human_body_reid_v2，另有可选模型；清单见 `resource_validator.py`）                                                         |
+| `home-profile/`                   | 家庭档案（candidates.json / profile.json / profile.md）                                                                                             |
+| `static/`                         | 家庭面板前端静态资源（由 `install.sh` 从 `web/dist/` 同步）                                                                                         |
+| `log/`                            | 各组件日志（`miloco-backend.log` + 轮转的 `.1`…`.20`；Linux 另有 `supervisord.log`，macOS 另有 `launchd-stdio.log`）                                |
+| `supervisord.*`                   | supervisor 配置和 socket（**仅 Linux**；service start 首次生成。macOS 用 LaunchAgent，见 `~/Library/LaunchAgents/com.xiaomi.miloco.backend.plist`） |
+| `memory/`                         | Agent 工作区记忆（如 `_system/dynamic_failures.md`；任务行为统计已迁至 `miloco.db` 的 `task_record_*` 表）                                          |
+| `trace/agent/`                    | DYNAMIC rule trace jsonl（`debug_observability` flag 开时写）                                                                                       |
+| `snapshots/<event_id>/`           | meaningful event 产物：per-device `clip.{mp4,m4a}` + 事件级 `omni_trace.json.gz`（TTL + 磁盘 LRU 同生共死）                                         |
+| `packs/`                          | 日志打包产物（LRU 保留最新几个）                                                                                                                    |
 
 ---
 

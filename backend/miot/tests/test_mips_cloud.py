@@ -30,12 +30,16 @@ from miot.types import (
     MIoTDeviceBindEvent,
     MIoTDeviceStateEvent,
     MIoTSceneChangedEvent,
+    MipsConnectionError,
     MipsSubscribeRejectedError,
     MipsSubscribeTimeoutError,
 )
 from paho.mqtt.enums import MQTTErrorCode
 
 _LOGGER = logging.getLogger(__name__)
+
+# 无真实网络/凭据/设备依赖 —— CI 的 `miot 单元测试` 步骤按 `-m unit` 选择。
+pytestmark = pytest.mark.unit
 
 
 class _FakeReasonCode:
@@ -746,10 +750,10 @@ async def test_subscribe_transient_rejection_keeps_topic_and_reconnect_retries()
 
 
 @pytest.mark.asyncio
-async def test_device_state_subscribes_exact_topics():
-    """sub_device_state_async subscribes the exact per-op leaf topics
-    (NOT a `state/#` wildcard — the broker ACL rejects the wildcard, same as
-    the g_op/# case)."""
+async def test_device_state_subscribes_wildcard():
+    """sub_device_state_async issues ONE wildcard subscription per did —
+    `device/{did}/state/#` (same filter as xiaomi-ha; probe-verified allowed
+    by the broker ACL). Exact leaves are NOT subscribed individually."""
     mips, _ = _make_mips()
     holder: dict[str, _FakeMqttClient] = {}
 
@@ -763,12 +767,11 @@ async def test_device_state_subscribes_exact_topics():
     try:
         await asyncio.gather(
             mips.sub_device_state_async("dev-1", handler=lambda _m: None),
-            _ack_subscribes(fake, 2),
+            _ack_subscribes(fake, 1),
         )
         topics = {t for t, _, _ in fake.subscribed}
-        assert "device/dev-1/state/online" in topics
-        assert "device/dev-1/state/offline" in topics
-        assert "device/dev-1/state/#" not in topics
+        assert "device/dev-1/state/#" in topics
+        assert len(topics) == 1
     finally:
         await mips.deinit_async()
 
@@ -776,8 +779,8 @@ async def test_device_state_subscribes_exact_topics():
 @pytest.mark.parametrize("op", ["online", "offline"])
 @pytest.mark.asyncio
 async def test_device_state_decoded_event_dispatched(op):
-    """device/{did}/state/{online,offline} → MIoTDeviceStateEvent with
-    event=op and did parsed from the topic; payload kept in `raw`."""
+    """Messages arrive on exact leaf topics despite the `#` subscription →
+    MIoTDeviceStateEvent with event=op and did parsed from the topic."""
     mips, _ = _make_mips()
     holder: dict[str, _FakeMqttClient] = {}
 
@@ -793,7 +796,7 @@ async def test_device_state_decoded_event_dispatched(op):
     try:
         await asyncio.gather(
             mips.sub_device_state_async("dev-42", handler=received.append),
-            _ack_subscribes(fake, 2),
+            _ack_subscribes(fake, 1),
         )
         fake.fire_message(
             f"device/dev-42/state/{op}",
@@ -809,8 +812,35 @@ async def test_device_state_decoded_event_dispatched(op):
 
 
 @pytest.mark.asyncio
-async def test_device_state_unsubscribes_exact_topics():
-    """unsub_device_state_async removes both online + offline leaf topics."""
+async def test_device_state_unknown_leaf_dropped():
+    """We subscribe `state/#`, so ANY other leaf the cloud publishes under
+    state/ reaches the decoder too — it must be silently dropped (the
+    load-bearing `if not m` guard), not raise or dispatch an illegal event."""
+    mips, _ = _make_mips()
+    holder: dict[str, _FakeMqttClient] = {}
+
+    def factory(client_id: str) -> _FakeMqttClient:
+        holder["c"] = _FakeMqttClient(client_id)
+        return holder["c"]  # type: ignore[return-value]
+
+    mips._client_factory = factory  # type: ignore[assignment]
+    fake = await _connect(mips, holder)
+    received: list = []
+    try:
+        await asyncio.gather(
+            mips.sub_device_state_async("dev-9", handler=received.append),
+            _ack_subscribes(fake, 1),
+        )
+        fake.fire_message("device/dev-9/state/whatever", b"{}")
+        await asyncio.sleep(0.01)
+        assert received == []
+    finally:
+        await mips.deinit_async()
+
+
+@pytest.mark.asyncio
+async def test_device_state_unsubscribes_wildcard():
+    """unsub_device_state_async removes the single wildcard topic."""
     mips, _ = _make_mips()
     holder: dict[str, _FakeMqttClient] = {}
 
@@ -824,20 +854,62 @@ async def test_device_state_unsubscribes_exact_topics():
     try:
         await asyncio.gather(
             mips.sub_device_state_async("dev-7", handler=lambda _m: None),
-            _ack_subscribes(fake, 2),
+            _ack_subscribes(fake, 1),
         )
         await mips.unsub_device_state_async("dev-7")
         unsubbed = set(fake.unsubscribed)
-        assert "device/dev-7/state/online" in unsubbed
-        assert "device/dev-7/state/offline" in unsubbed
+        assert "device/dev-7/state/#" in unsubbed
     finally:
         await mips.deinit_async()
 
 
 @pytest.mark.asyncio
-async def test_device_state_reconnect_resubscribes_both_topics():
-    """After disconnect/reconnect both online + offline leaf topics are
-    re-issued by the _subs replay."""
+async def test_subscribe_superseded_by_concurrent_unsubscribe_raises():
+    """SUBACK 等待期间同 topic 被并发退订(上层 bind 作废路径的 unsub 弹掉了
+    在飞订阅自己的 _subs 条目)时,订阅必须抛 MipsConnectionError——否则 SDK
+    在 await 之后记"已订阅"、broker 却已 UNSUB,`did in set` 短路会吞掉之后
+    所有重试,该 did 的推送静默丢失直到 mips 实例重建。"""
+    mips, _ = _make_mips()
+    holder: dict[str, _FakeMqttClient] = {}
+
+    def factory(client_id: str) -> _FakeMqttClient:
+        holder["c"] = _FakeMqttClient(client_id)
+        return holder["c"]  # type: ignore[return-value]
+
+    mips._client_factory = factory  # type: ignore[assignment]
+    fake = await _connect(mips, holder)
+
+    try:
+        subscribe_task = asyncio.create_task(
+            mips.sub_device_state_async("dev-x", handler=lambda _m: None)
+        )
+        # 等 SUBSCRIBE 发出、停在 SUBACK 等待上。
+        for _ in range(50):
+            if fake.subscribed:
+                break
+            await asyncio.sleep(0.005)
+        _, _, mid = fake.subscribed[-1]
+
+        # 并发退订:弹掉 _subs 条目、发出 UNSUBSCRIBE,但不补 SUBACK。
+        await mips.unsub_device_state_async("dev-x")
+
+        # SUBACK 到达后,订阅路径必须发现自己的授权已过期。
+        fake.fire_suback(mid, [2])
+        with pytest.raises(MipsConnectionError):
+            await subscribe_task
+
+        # _subs 里已无该 topic(不会进重连重放),且 UNSUBSCRIBE 已发出。
+        with mips._subs_lock:
+            assert "device/dev-x/state/#" not in mips._subs
+        assert "device/dev-x/state/#" in set(fake.unsubscribed)
+    finally:
+        await mips.deinit_async()
+
+
+@pytest.mark.asyncio
+async def test_device_state_reconnect_resubscribes_wildcard():
+    """After disconnect/reconnect the wildcard topic is re-issued by the
+    _subs replay."""
     mips, _ = _make_mips()
     holder: dict[str, _FakeMqttClient] = {}
 
@@ -851,20 +923,257 @@ async def test_device_state_reconnect_resubscribes_both_topics():
     try:
         await asyncio.gather(
             mips.sub_device_state_async("dev-rec", handler=lambda _m: None),
-            _ack_subscribes(fake, 2),
+            _ack_subscribes(fake, 1),
         )
         before = len(fake.subscribed)
         fake.fire_disconnect(reason_code=1)
         fake.fire_connect(reason_code=0)
         for _ in range(10):
             await asyncio.sleep(0)
-            if len(fake.subscribed) >= before + 2:
+            if len(fake.subscribed) >= before + 1:
                 break
         resub_topics = {t for t, _, _ in fake.subscribed[before:]}
-        assert "device/dev-rec/state/online" in resub_topics
-        assert "device/dev-rec/state/offline" in resub_topics
+        assert "device/dev-rec/state/#" in resub_topics
         for _, _, mid in fake.subscribed[before:]:
             fake.fire_suback(mid, [2])
         await asyncio.sleep(0.01)
     finally:
         await mips.deinit_async()
+
+
+# ── 属性推送 ──────────────────────────────────────────────────────────
+
+
+def _props_decoder():
+    return MIoTMipsCloud._make_device_props_decoder()
+
+
+def test_a_properties_changed_push_decodes_into_one_change():
+    event = _props_decoder()(
+        "device/d1/up/properties_changed/2/1",
+        b'{"method":"properties_changed",'
+        b'"params":{"did":"d1","siid":2,"piid":1,"value":26}}',
+    )
+
+    assert event is not None
+    assert event.did == "d1"
+    assert [(c.siid, c.piid, c.value) for c in event.changes] == [(2, 1, 26)]
+    assert event.timestamp_ms > 0
+
+
+def test_a_params_list_decodes_into_several_changes():
+    """broker 没文档化 params 形态：实测是裸 dict，HA 的惯例是 list，两种都收。"""
+    event = _props_decoder()(
+        "device/d1/up/properties_changed",
+        b'{"method":"properties_changed","params":['
+        b'{"siid":2,"piid":1,"value":1},{"siid":3,"piid":4,"value":"x"}]}',
+    )
+
+    assert [(c.siid, c.piid, c.value) for c in event.changes] == [
+        (2, 1, 1),
+        (3, 4, "x"),
+    ]
+
+
+def test_a_topic_outside_the_properties_changed_subtree_is_dropped():
+    """订的是通配，别的 leaf 也会落进来 —— 这道闸是白名单，不是防御性冗余。
+
+    payload 必须完全合法，否则后面几道闸会替它把这条拒掉，分不出是谁拒的。
+    """
+    assert (
+        _props_decoder()(
+            "device/d1/up/something_else/2/1",
+            b'{"method":"properties_changed","params":{"siid":2,"piid":1,"value":1}}',
+        )
+        is None
+    )
+
+
+def test_a_payload_with_another_method_is_dropped():
+    assert (
+        _props_decoder()(
+            "device/d1/up/properties_changed/2/1",
+            b'{"method":"event_occured","params":{"siid":2,"piid":1,"value":1}}',
+        )
+        is None
+    )
+
+
+def test_a_payload_did_that_contradicts_the_topic_is_dropped():
+    """不一致会把一台设备的值写到另一台的路径上。"""
+    assert (
+        _props_decoder()(
+            "device/d1/up/properties_changed/2/1",
+            b'{"method":"properties_changed",'
+            b'"params":{"did":"d2","siid":2,"piid":1,"value":1}}',
+        )
+        is None
+    )
+
+
+def test_a_single_entry_that_contradicts_the_topic_iid_is_dropped():
+    assert (
+        _props_decoder()(
+            "device/d1/up/properties_changed/2/1",
+            b'{"method":"properties_changed","params":{"siid":9,"piid":9,"value":1}}',
+        )
+        is None
+    )
+
+
+def test_a_multi_entry_payload_is_not_checked_against_the_topic_iid():
+    """topic 只承载一对 iid，多条时无从对应，校验不了。
+
+    首条故意与 topic 的 iid 不一致：一致的话「校验也套到多条上」这个错也能让它绿。
+    """
+    event = _props_decoder()(
+        "device/d1/up/properties_changed/2/1",
+        b'{"method":"properties_changed","params":['
+        b'{"siid":9,"piid":9,"value":2},{"siid":2,"piid":1,"value":1}]}',
+    )
+
+    assert [(c.siid, c.piid) for c in event.changes] == [(9, 9), (2, 1)]
+
+
+def test_an_entry_without_integer_ids_is_skipped_not_fatal():
+    event = _props_decoder()(
+        "device/d1/up/properties_changed",
+        b'{"method":"properties_changed","params":['
+        b'{"siid":"x","piid":1,"value":1},{"siid":3,"piid":4,"value":2}]}',
+    )
+
+    assert [(c.siid, c.piid) for c in event.changes] == [(3, 4)]
+
+
+def test_a_message_that_yields_no_entry_is_dropped():
+    assert (
+        _props_decoder()(
+            "device/d1/up/properties_changed",
+            b'{"method":"properties_changed","params":[]}',
+        )
+        is None
+    )
+
+
+def test_a_non_json_props_payload_is_dropped():
+    assert _props_decoder()("device/d1/up/properties_changed/2/1", b"not json") is None
+
+
+@pytest.mark.asyncio
+async def test_a_props_push_reaches_the_handler_through_the_wildcard():
+    """通配是必需的：推送落在 .../properties_changed/{siid}/{piid}，
+    leaf-only 的 filter 匹配不到任何已发布 topic。"""
+    mips, _ = _make_mips()
+    holder: dict[str, _FakeMqttClient] = {}
+
+    def factory(client_id: str) -> _FakeMqttClient:
+        holder["c"] = _FakeMqttClient(client_id)
+        return holder["c"]  # type: ignore[return-value]
+
+    mips._client_factory = factory  # type: ignore[assignment]
+    fake = await _connect(mips, holder)
+    received: list = []
+    try:
+        await asyncio.gather(
+            mips.sub_device_props_async("dev-9", handler=received.append),
+            _ack_subscribes(fake, 1),
+        )
+        fake.fire_message(
+            "device/dev-9/up/properties_changed/2/1",
+            b'{"method":"properties_changed","params":{"siid":2,"piid":1,"value":7}}',
+        )
+        await asyncio.sleep(0.01)
+
+        assert [(c.siid, c.piid, c.value) for c in received[0].changes] == [(2, 1, 7)]
+    finally:
+        await mips.deinit_async()
+
+
+@pytest.mark.asyncio
+async def test_props_unsubscribes_the_same_wildcard_it_subscribed():
+    mips, _ = _make_mips()
+    holder: dict[str, _FakeMqttClient] = {}
+
+    def factory(client_id: str) -> _FakeMqttClient:
+        holder["c"] = _FakeMqttClient(client_id)
+        return holder["c"]  # type: ignore[return-value]
+
+    mips._client_factory = factory  # type: ignore[assignment]
+    fake = await _connect(mips, holder)
+    try:
+        await asyncio.gather(
+            mips.sub_device_props_async("dev-9", handler=lambda _msg: None),
+            _ack_subscribes(fake, 1),
+        )
+        await mips.unsub_device_props_async("dev-9")
+
+        # 判据是「退的和订的是同一个」，不是「退了某个 topic」：只断言后者时，
+        # 订阅端改成 leaf 也能绿
+        assert set(fake.unsubscribed) == {
+            topic for topic, _qos, _mid in fake.subscribed
+        }
+    finally:
+        await mips.deinit_async()
+
+
+@pytest.mark.asyncio
+async def test_a_second_handler_on_the_same_topic_is_reported(caplog):
+    """一个 topic 只挂一个 handler：第二个注册会静默替换掉第一个，
+    两个消费方各订一份时先注册的那个从此收不到推送。"""
+    mips, _ = _make_mips()
+    holder: dict[str, _FakeMqttClient] = {}
+
+    def factory(client_id: str) -> _FakeMqttClient:
+        holder["c"] = _FakeMqttClient(client_id)
+        return holder["c"]  # type: ignore[return-value]
+
+    mips._client_factory = factory  # type: ignore[assignment]
+    fake = await _connect(mips, holder)
+    try:
+        await asyncio.gather(
+            mips.sub_device_props_async("dev-9", handler=lambda _msg: None),
+            _ack_subscribes(fake, 1),
+        )
+        with caplog.at_level(logging.ERROR, logger="miot.mips_cloud"):
+            await asyncio.gather(
+                mips.sub_device_props_async("dev-9", handler=lambda _msg: "other"),
+                _ack_subscribes(fake, 1),
+            )
+
+        assert any(
+            "already has a different handler" in r.message for r in caplog.records
+        )
+    finally:
+        await mips.deinit_async()
+
+
+def test_an_entry_without_a_value_is_skipped():
+    """缺 value 不是「值为 None」，是一条残缺的推送 —— 当成 None 写进容器会把真实值
+    盖掉，而容器没有时间戳可仲裁。与对齐侧同口径。"""
+    event = _props_decoder()(
+        "device/d1/up/properties_changed",
+        b'{"method":"properties_changed","params":['
+        b'{"siid":2,"piid":1},{"siid":3,"piid":4,"value":2}]}',
+    )
+
+    assert [(c.siid, c.piid, c.value) for c in event.changes] == [(3, 4, 2)]
+
+
+def test_a_message_whose_only_entry_lacks_a_value_is_dropped():
+    assert (
+        _props_decoder()(
+            "device/d1/up/properties_changed/2/1",
+            b'{"method":"properties_changed","params":{"siid":2,"piid":1}}',
+        )
+        is None
+    )
+
+
+def test_an_explicit_null_value_is_kept():
+    """显式 null 是设备真的报了空值，与缺键不是一回事。"""
+    event = _props_decoder()(
+        "device/d1/up/properties_changed/2/1",
+        b'{"method":"properties_changed","params":{"siid":2,"piid":1,"value":null}}',
+    )
+
+    assert [(c.siid, c.piid, c.value) for c in event.changes] == [(2, 1, None)]

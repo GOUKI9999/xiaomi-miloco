@@ -6,6 +6,7 @@
  */
 
 import { ApiError, apiFetch, resolveToken } from "./client";
+import { textResidual } from "@/lib/usageTokens";
 import { authHeaders } from "./register";
 import i18n from "@/i18n";
 import type {
@@ -34,6 +35,7 @@ import type {
   UsagePeriod,
   UsageRow,
   UsageStats,
+  UsageTimelinePoint,
   OmniConfigState,
   OmniConfigUpdate,
   OmniHealth,
@@ -42,7 +44,18 @@ import type {
   OmniModelsResult,
   UpgradeCheck,
   UpgradeStatus,
+  TaskRuleDirection,
+  TaskRuleSourceType,
 } from "@/lib/types";
+
+export async function realGetPerceptionFlow(
+  deviceId?: string,
+): Promise<unknown> {
+  const query = deviceId
+    ? `?device_id=${encodeURIComponent(deviceId)}`
+    : "";
+  return apiFetch<unknown>(`/api/perf/perception-flow${query}`);
+}
 
 // backend NormalResponse 包装：{ code, message, data }
 interface Normal<T> {
@@ -145,7 +158,7 @@ interface BackendDevice {
   sub_devices?: unknown;
 }
 
-interface BackendPropSpec {
+export interface BackendPropSpec {
   description?: string;
   prop_description?: string;
   format?: string;
@@ -157,6 +170,8 @@ interface BackendPropSpec {
   unit?: string;
   value_list?: { name: string; value: number | string }[];
   value_range?: number[];
+  /** 仅 action 有：入参的名字与格式，按顺序对齐台账 value_json 里的入参数组。 */
+  in_params?: { name: string; format: string }[];
 }
 
 interface BackendDeviceStatus {
@@ -878,6 +893,23 @@ async function batchWithConcurrency<T>(
   return results;
 }
 
+/** did → 该设备的 spec 表（iid → spec）。日志页拿它把台账里的 iid 翻成人话。
+ *
+ *  走的是与设备控制页同一个 home 请求（5s TTL 缓存共享），**不拉每台设备的 status**
+ *  ——realListDevices 会为每台设备各打一次 /status（并发 6 路、单次 2.5s 超时），
+ *  日志页只要 spec，付不起那个代价，也会撞 MiOT 云端限频。
+ *  取不到 spec 的行由调用方回落成原始 iid，不是错误路径。 */
+export async function realDeviceSpecs(): Promise<
+  Map<string, Record<string, BackendPropSpec>>
+> {
+  const r = await fetchMiotHome();
+  const byDid = new Map<string, Record<string, BackendPropSpec>>();
+  for (const d of r.data.devices) {
+    if (d.spec) byDid.set(d.did, d.spec);
+  }
+  return byDid;
+}
+
 export async function realListDevices(): Promise<Device[]> {
   const r = await fetchMiotHome();
   const devices = r.data.devices;
@@ -944,13 +976,42 @@ export async function realListDevices(): Promise<Device[]> {
   });
 }
 
+/** iid → 住户能读的名字。`prop_description` 是 miot spec 的英文原名，`description`
+ *  是云端译好的「服务名 属性名」——先取英文原名再过 zhLabel 词表，表外原样回退
+ *  （英文模式天然就是原文）。导出给日志页复用：同一个属性在两个页面必须同名。 */
+export function specLabel(iid: string, spec: BackendPropSpec): string {
+  return zhLabel(spec.prop_description || spec.description || iid);
+}
+
+/** spec + 值 → 一句话。分支与 mapProp 同源（bool / value_list / unit 三种），
+ *  差别只在输出形态：mapProp 给的是控件（开关、下拉、滑杆），这里给的是文本。
+ *  读不出意思时返回 null，由调用方回落成原始 JSON——不猜。 */
+export function propValueText(
+  spec: BackendPropSpec,
+  value: unknown,
+): string | null {
+  if (value === null || value === undefined) return null;
+  if (spec.format === "bool") {
+    // 借枚举词表译「开/关」：bool 与枚举 On/Off 在同一个词表里不该有两种译法。
+    return zhEnumValue(value ? "On" : "Off");
+  }
+  if (spec.value_list && spec.value_list.length > 0) {
+    // 用字符串比对：台账的 value_json 过了一次 JSON 往返，数值与字符串的边界会漂。
+    const hit = spec.value_list.find((v) => String(v.value) === String(value));
+    // 值不在枚举里（固件 / 规格漂移）→ 不贴一个近似的名，交给回落。
+    return hit ? zhEnumValue(hit.name) : null;
+  }
+  if (typeof value === "number") return `${value}${zhUnit(spec.unit) ?? ""}`;
+  if (typeof value === "string") return value;
+  return null;
+}
+
 function mapProp(
   iid: string,
   spec: BackendPropSpec,
   value: unknown,
 ): DeviceProperty {
-  const rawLabel = spec.prop_description || spec.description || iid;
-  const label = zhLabel(rawLabel);
+  const label = specLabel(iid, spec);
   const unit = zhUnit(spec.unit);
   const writeable = !!spec.writeable;
 
@@ -1212,6 +1273,7 @@ interface BackendScopeCamera {
   connected: boolean;
   channel?: number;  // 通道号，用于多通道摄像头
   channel_count?: number;  // 通道总数；判多通道的权威信号（旧后端无则兜底 1）
+  stream_error?: "cross_subnet_nat" | null;
 }
 
 export async function realListScopeCameras(): Promise<ScopeCamera[]> {
@@ -1232,6 +1294,7 @@ export async function realListScopeCameras(): Promise<ScopeCamera[]> {
     connected: c.connected,
     channel: c.channel ?? 0,  // 传递通道号，默认为 0
     channelCount: c.channel_count ?? 1,  // 通道总数，判多通道用；旧后端兜底 1
+    streamError: c.stream_error ?? undefined,
   }));
 }
 
@@ -1325,15 +1388,23 @@ interface BackendMeaningfulEvent {
   feedback_pack_size?: number | null;
 }
 
+/** 拉有意义事件列表。
+ *
+ *  `eventId` 是**按主键单查**那条路(反查动作的宿主事件):命中就返回那一条、不看时间窗,
+ *  查不到返回空数组而不是报错——「没有这条事件」是正常答案。调用方是折叠视图里那枚
+ *  「触发事件未加载」的 chip:它要的是**说实话**(那条事件在不在、在哪一刻),不是把它
+ *  抓进列表,所以这里拿到的结果只用于提示、不并进 events。 */
 export async function realListActivity(opts?: {
   since?: number;
   before?: number;
   limit?: number;
   offset?: number;
+  eventId?: string;
 }): Promise<ActivityEvent[]> {
   const params = new URLSearchParams();
   if (opts?.since !== undefined) params.set("since", String(opts.since));
   if (opts?.before !== undefined) params.set("before", String(opts.before));
+  if (opts?.eventId) params.set("event_id", opts.eventId);
   params.set("limit", String(opts?.limit ?? 50));
   if (opts?.offset !== undefined) params.set("offset", String(opts.offset));
   const qs = params.toString();
@@ -1585,13 +1656,14 @@ export async function realResumePerception(): Promise<void> {
 // ── Token 用量统计（用量 tab）─────────────────────────────────
 // 数据全部来自 omni/MiMo 计费。backend 两个接口：
 //   today      → /api/admin/token-usage/buckets  服务端按桶聚合（bin 分钟粒度）
-//   week/month → /api/admin/token-usage/daily    按 date/model/type 聚合（滚动近 N 天）
+//   week/month → /api/admin/token-usage/daily    按 date/model/base_url/type 聚合（滚动近 N 天）
 // 这里把两种形态都归一成 Unit[] 再折算成 UsageStats。
 
-// today：服务端已按 (时间桶 × model × type) 聚合，每行是一个桶的小计。
+// today：服务端已按 (时间桶 × model × base_url × type) 聚合，每行是一个桶的小计。
 interface BucketRow {
   bucket_ms: number; // 桶起始 ms epoch
   model: string;
+  base_url: string;
   type: string;
   calls: number;
   input_tokens: number;
@@ -1604,6 +1676,7 @@ interface BucketRow {
 interface DailyRow {
   date: string; // YYYY-MM-DD（backend 已按 localtime 归日）
   model: string;
+  base_url: string;
   type: string;
   calls: number;
   input_tokens: number;
@@ -1616,6 +1689,8 @@ interface DailyRow {
 /** bucket / daily 聚合行的统一形态。 */
 interface UsageUnit {
   model: string;
+  /** 完整 URL 原文；'' = 老数据未记录（见 UsageRow.base_url）。 */
+  base_url: string;
   type: string;
   calls: number;
   input_tokens: number;
@@ -1625,7 +1700,20 @@ interface UsageUnit {
   audio_tokens: number;
 }
 
-const ONE_DAY_MS = 86_400_000;
+/**
+ * 今天的绝对时间窗 [startMs, endMs)。终点走日历取次日 00:00，而不是起点加固定 24 小时：
+ * 带夏令时的浏览器时区下本地一天是 23 或 25 小时——回拨那天加 24 小时落在当天 23:00，
+ * 最后一小时既查不到也画不出；前拨那天落到次日 01:00，把次日头一小时算进今日。两者都
+ * 不报错，因为查询窗与桶骨架用同一个数、只是整体偏了。与 dailyTimeline 和近 7/30 天的
+ * 查询窗共用同一条日历链（都靠 setDate 走日历，不减毫秒）。
+ */
+function todayWindow(): { startMs: number; endMs: number } {
+  const start = new Date();
+  start.setHours(0, 0, 0, 0);
+  const end = new Date(start);
+  end.setDate(end.getDate() + 1);
+  return { startMs: start.getTime(), endMs: end.getTime() };
+}
 
 function emptyBreakdown(): TokenBreakdown {
   return { input: 0, output: 0, cache: 0, video: 0, audio: 0 };
@@ -1657,57 +1745,122 @@ function localDateStr(d: Date): string {
   return `${y}-${m}-${day}`;
 }
 
+/** 空的时间序列桶。tokens 为口径总量，其余为分模态拆分（见 UsageTimelinePoint）。 */
+function emptyPoint(ts: string): UsageTimelinePoint {
+  return { ts, tokens: 0, text: 0, video: 0, audio: 0, output: 0, cache: 0, targets: [] };
+}
+
+/** 桶内按「模型名 + endpoint」找/建目标。分隔符用 \u001f：两者都可能含空格。 */
+function targetOf(p: UsageTimelinePoint, model: string, baseUrl: string) {
+  const key = `${model}\u001f${baseUrl}`;
+  // 一个桶里的目标个数是「本周期用过几个 endpoint」，个位数，线性找足够
+  let t = p.targets.find((x) => `${x.model}\u001f${x.base_url}` === key);
+  if (!t) {
+    t = { model, base_url: baseUrl, text: 0, video: 0, audio: 0, output: 0, cache: 0 };
+    p.targets.push(t);
+  }
+  return t;
+}
+
+/**
+ * 把一行聚合结果累加进某个桶。text 是 `input − video − audio` 的**残差**——后端未单列
+ * image 模态，残差里含图片与系统提示，故它不是「纯文本」。残差规则与环形图共用
+ * 同一个定义（textResidual），不在两处各写一遍。
+ */
+function accPoint(p: UsageTimelinePoint, r: UsageUnit): void {
+  const video = r.video_tokens || 0;
+  const audio = r.audio_tokens || 0;
+  const input = r.input_tokens || 0;
+  const output = r.output_tokens || 0;
+  p.text += textResidual(input, video, audio);
+  p.video += video;
+  p.audio += audio;
+  p.output += output;
+  p.cache += r.cache_tokens || 0;
+  p.tokens += input + output;
+
+  // 同一份数值再落一份到所属目标上：桶字段与目标之和必须恒等，少加一处，浮层里
+  // 各 endpoint 的数就与柱高对不上（且不会有任何报错）。
+  const t = targetOf(p, r.model, r.base_url ?? "");
+  t.text += textResidual(input, video, audio);
+  t.video += video;
+  t.audio += audio;
+  t.output += output;
+  t.cache += r.cache_tokens || 0;
+}
+
 /**
  * today：把服务端返回的桶行铺满一整天（00:00 → 次日 00:00），缺的桶补 0。
- * 服务端已按 bin 聚合，这里只负责对齐到整天的连续桶骨架。tokens = input + output。
+ * 服务端已按 bin 聚合，这里只负责对齐到整天的连续桶骨架。
+ * 每桶除总量外一并保留分模态拆分，供时间分布图按模态堆叠。
  */
 function bucketTimeline(
   rows: BucketRow[],
   binMinutes: number,
-): { ts: string; tokens: number }[] {
-  const start = new Date();
-  start.setHours(0, 0, 0, 0);
-  const startMs = start.getTime();
+  // 必须与拼查询串用的是同一份：自己再取一次的话，跨本地午夜的那次刷新会「查昨天、
+  // 铺今天」——服务端返回的是昨天的桶行，而骨架起点已是今天 00:00，每行算出的下标
+  // 全为负、被下面的范围判断整体丢掉，于是图表切空态说「还没有用量」，而同一次返回
+  // 的行没过骨架、直接进了合计，左栏与明细仍显示昨天一整天的数。
+  win: { startMs: number; endMs: number },
+): UsageTimelinePoint[] {
+  const { startMs, endMs } = win;
   const binMs = Math.max(1, binMinutes) * 60_000;
-  const n = Math.max(1, Math.ceil(ONE_DAY_MS / binMs)); // 覆盖整天
-  const buckets = Array.from({ length: n }, (_, i) => ({
-    ts: new Date(startMs + i * binMs).toISOString(),
-    tokens: 0,
-  }));
+  // 覆盖整天：按实际窗长算，夏令时切换那天不是 24 小时
+  const n = Math.max(1, Math.ceil((endMs - startMs) / binMs));
+  const buckets = Array.from({ length: n }, (_, i) =>
+    emptyPoint(new Date(startMs + i * binMs).toISOString()),
+  );
   for (const r of rows) {
     const idx = Math.floor((r.bucket_ms - startMs) / binMs);
-    if (idx >= 0 && idx < n) {
-      buckets[idx].tokens += (r.input_tokens || 0) + (r.output_tokens || 0);
-    }
+    if (idx >= 0 && idx < n) accPoint(buckets[idx], r);
   }
   return buckets;
 }
 
-/** week/month：连续 N 天（含今天），缺数据的天补 0。 */
+/** week/month：连续 N 天（含今天），缺数据的天补 0。同样保留分模态拆分。 */
 function dailyTimeline(
   rows: DailyRow[],
   days: number,
-): { ts: string; tokens: number }[] {
-  const byDate = new Map<string, number>();
+  // 与算 since/until 用的是同一个 Date，理由同 bucketTimeline：各取各的话跨午夜那次
+  // 刷新会最左挤掉一天、最右多出一个恒空的新日期。
+  today: Date,
+): UsageTimelinePoint[] {
+  // 先按 date 聚成桶（同一天可有多行：model × base_url × type 各一行——同名模型挂
+  // 两个 endpoint 时同一天就会多出行）
+  const byDate = new Map<string, UsageTimelinePoint>();
   for (const r of rows) {
-    const t = (r.input_tokens || 0) + (r.output_tokens || 0);
-    byDate.set(r.date, (byDate.get(r.date) ?? 0) + t);
+    let p = byDate.get(r.date);
+    if (!p) {
+      p = emptyPoint(r.date);
+      byDate.set(r.date, p);
+    }
+    accPoint(p, r);
   }
-  const today = new Date();
-  today.setHours(0, 0, 0, 0);
-  const out: { ts: string; tokens: number }[] = [];
+  const out: UsageTimelinePoint[] = [];
   for (let i = days - 1; i >= 0; i--) {
-    const d = new Date(today.getTime() - i * ONE_DAY_MS);
-    out.push({ ts: d.toISOString(), tokens: byDate.get(localDateStr(d)) ?? 0 });
+    // 走日历而不是减毫秒：带夏令时的浏览器时区下，跨过 spring-forward 那天减 24 小时
+    // 会落到前一天的 23:00，localDateStr 就返回错的一天，整周的格子从那天起集体错位、
+    // 而且不报错。查询窗口那侧同法，两处共用同一条日历链。
+    const d = new Date(today);
+    d.setDate(d.getDate() - i);
+    const hit = byDate.get(localDateStr(d));
+    // ts 统一成 ISO，与 today 分支一致（byDate 的 key 是 YYYY-MM-DD，不能直接用）
+    // 浅拷贝只换 ts；targets 与源共享同一个数组，此后只读不再累加
+    out.push(hit ? { ...hit, ts: d.toISOString() } : emptyPoint(d.toISOString()));
   }
   return out;
 }
 
-/** Unit[] → UsageStats：汇总 totals、按调用类型聚合、按 model×type 出明细行。 */
+/** Unit[] → UsageStats：汇总 totals、按调用类型聚合、按「模型名 + endpoint + 类型」出明细行。 */
 function unitsToStats(
   period: UsagePeriod,
   units: UsageUnit[],
-  timeline: { ts: string; tokens: number }[],
+  timeline: UsageTimelinePoint[],
+  // 顺序与后端 daily_date_range() 的返回一致（早, 晚）：两个同类型参数相邻时,顺序不一致
+  // 就是个迟早会传反的坑,而传反了两个判据都还会「正常」返回 false。也不给默认值——
+  // 漏传要在编译期报错,不能降级成那句提示永远不显示。
+  dailyEarliestDate: string | null,
+  dailyLatestDate: string | null,
 ): UsageStats {
   const totals = emptyBreakdown();
   let calls = 0;
@@ -1734,11 +1887,16 @@ function unitsToStats(
     accBreakdown(g.breakdown, u);
     g.tokens = breakdownTotal(g.breakdown);
 
-    const rk = `${u.model} ${tk}`;
+    // key 含 base_url：模型身份是 (model, base_url)，只按模型名并行会把两个
+    // endpoint 的用量合成一行，哪个 endpoint 用了多少就再也分不出来。
+    // 分隔符用 \u001f 而不是空格：模型名与 URL 都可能含空格，用空格会让
+    // ("a b", "c") 与 ("a", "b c") 撞同一个 key。
+    const rk = `${u.model}\u001f${u.base_url ?? ""}\u001f${tk}`;
     let row = rowMap.get(rk);
     if (!row) {
       row = {
         model: u.model,
+        base_url: u.base_url ?? "",
         type: tk,
         calls: 0,
         tokens: 0,
@@ -1751,14 +1909,24 @@ function unitsToStats(
     row.tokens = breakdownTotal(row.breakdown);
   }
 
-  // 每个出现过的模型都补齐 realtime + on_demand 两行（缺的填 0），与 by_type 恒显示一致。
-  // 注意：分隔符必须与主循环的 rowMap key 一致（ ），否则 has() 命中失败会补出重复行。
-  for (const model of new Set([...rowMap.values()].map((r) => r.model))) {
+  // 每个出现过的 (模型, endpoint) 都补齐 realtime + on_demand 两行（缺的填 0），
+  // 与 by_type 恒显示一致。按**对**补而不是只按模型名补——否则同名的两个 endpoint
+  // 会共用一次补齐，其中一个缺失的调用类型永远不出现。
+  // 注意：分隔符必须与主循环的 rowMap key 完全一致，否则 has() 命中失败会补出重复行。
+  const seenPairs = new Map<string, { model: string; base_url: string }>();
+  for (const r of rowMap.values()) {
+    seenPairs.set(`${r.model}\u001f${r.base_url}`, {
+      model: r.model,
+      base_url: r.base_url,
+    });
+  }
+  for (const { model, base_url } of seenPairs.values()) {
     for (const tk of ["realtime", "on_demand"] as UsageCallType[]) {
-      const rk = `${model} ${tk}`;
+      const rk = `${model}\u001f${base_url}\u001f${tk}`;
       if (!rowMap.has(rk)) {
         rowMap.set(rk, {
           model,
+          base_url,
           type: tk,
           calls: 0,
           tokens: 0,
@@ -1772,6 +1940,8 @@ function unitsToStats(
   const typeRank = (t: string): number => (t === "realtime" ? 0 : 1);
   const rows = [...rowMap.values()].sort((a, b) => {
     if (a.model !== b.model) return a.model < b.model ? -1 : 1;
+    // 同模型名的多个 endpoint 之间也要有确定顺序，否则每次刷新行序都可能跳
+    if (a.base_url !== b.base_url) return a.base_url < b.base_url ? -1 : 1;
     return typeRank(a.type) - typeRank(b.type);
   });
 
@@ -1783,6 +1953,8 @@ function unitsToStats(
     by_type: [...byType.values()].sort((a, b) => b.tokens - a.tokens),
     rows,
     timeline,
+    daily_earliest_date: dailyEarliestDate,
+    daily_latest_date: dailyLatestDate,
   };
 }
 
@@ -1794,8 +1966,10 @@ function rowToUnit(d: DailyRow): UsageUnit {
   return { ...d };
 }
 
-// 请求级缓存：UsagePage 与 UsageTimelineChart 在挂载同一 tick 各打一次 today，
-// 按 (period, bin) 合并并发请求 + 5s TTL，避免重复打较重的 token-usage 接口（同 fetchMiotHome 思路）。
+// 请求级缓存：按 (period, bin) 合并并发请求 + 5s TTL，避免重复打较重的 token-usage
+// 接口（同 fetchMiotHome 思路）。两个组件在取数：用量页（带周期与粒度）和首页那个
+// 今日小读数——后者不传粒度、落到默认的 60，与用量页默认档**同键**，所以「合并并发
+// 请求」这条至今仍在生效，不只是挡「切周期来回点」与自动刷新撞手动刷新。
 const usageCache = new Map<string, { ts: number; p: Promise<UsageStats> }>();
 const USAGE_TTL_MS = 5000;
 
@@ -1819,10 +1993,42 @@ export function realGetUsageStats(
   return p;
 }
 
-// 清空全部用量数据（实时表 + 日聚合）。清完顺手失效请求级缓存，确保下次取到空。
-export async function realClearUsageData(): Promise<void> {
+// 清除用量数据（实时表 + 日聚合），范围由 opts 决定：可限时间、可限「模型名 + endpoint」，
+// 都不给才是全清。清完顺手失效请求级缓存，确保下次取到的是删后的数。
+export async function realClearUsageData(
+  opts: {
+    sinceMs?: number | null;
+    model?: string;
+    baseUrl?: string;
+    /**
+     * 界面**已经显示给用户**的那个「连带删除哪一天」（YYYY-MM-DD）。
+     * 日表的日期按盒子的时区写入，而这句话是浏览器按自己的时区算的，两者能差一天，
+     * 且差错的方向可能是「实际删的比说的更多」。带上它，后端就以界面说的那天为准。
+     */
+    fromDate?: string | null;
+  } = {},
+): Promise<void> {
+  // 三者都不传 = 全清。始终带上 body，语义显式。
+  // model / base_url 必须成对：只给一半时直接抛，不发请求——把半个目标丢掉
+  // 会让「清这一项」静默变成「清所有模型」，是这里最坏的失败方向。
+  // 判定一律用 !== undefined：base_url 空串是合法目标（v3 之前的老数据未记录来源）。
+  const hasModel = opts.model !== undefined;
+  const hasUrl = opts.baseUrl !== undefined;
+  if (hasModel !== hasUrl) {
+    throw new Error(
+      `clearUsageData: model 与 base_url 必须同时给（model=${String(opts.model)} ` +
+        `baseUrl=${String(opts.baseUrl)}）`,
+    );
+  }
+  const hasTarget = hasModel && hasUrl;
   await apiFetch<Normal<unknown>>("/api/admin/token-usage/clear", {
     method: "POST",
+    body: JSON.stringify({
+      since_ms: opts.sinceMs ?? null,
+      model: hasTarget ? opts.model : null,
+      base_url: hasTarget ? opts.baseUrl : null,
+      from_date: opts.sinceMs == null ? null : (opts.fromDate ?? null),
+    }),
   });
   _resetUsageStatsCache();
 }
@@ -2003,20 +2209,29 @@ async function fetchUsageStats(
 ): Promise<UsageStats> {
   if (period === "today") {
     // 服务端按 bin 桶聚合（响应大小由桶数封顶，不随事件数增长，不会触顶截断）。
-    // 显式传 client 本地 00:00 的窗口，与 bucketTimeline 的骨架起点锚定同一绝对时刻，
-    // 避免浏览器/服务器时区不一致时今日早段被后端窗口或前端骨架静默丢弃。
-    const start = new Date();
-    start.setHours(0, 0, 0, 0);
-    const startMs = start.getTime();
-    const r = await apiFetch<Normal<{ rows: BucketRow[]; total: number }>>(
+    // 显式传 client 本地的今日窗口，并把同一份对象交给骨架：起止都锚在同一绝对时刻，
+    // 既避免浏览器/服务器时区不一致时今日早段被静默丢弃，也让两侧在夏令时切换那天一起
+    // 用 23 或 25 小时。取一次传下去、不各取各的——理由见 bucketTimeline 的入参说明。
+    const win = todayWindow();
+    const { startMs, endMs } = win;
+    const r = await apiFetch<
+      Normal<{
+        rows: BucketRow[];
+        total: number;
+        daily_earliest_date?: string | null;
+        daily_latest_date?: string | null;
+      }>
+    >(
       `/api/admin/token-usage/buckets?bin=${binMinutes}` +
-        `&since=${startMs}&until=${startMs + ONE_DAY_MS}`,
+        `&since=${startMs}&until=${endMs}`,
     );
     const rows = r.data.rows ?? [];
     return unitsToStats(
       period,
       rows.map(bucketToUnit),
-      bucketTimeline(rows, binMinutes),
+      bucketTimeline(rows, binMinutes, win),
+      r.data.daily_earliest_date ?? null,
+      r.data.daily_latest_date ?? null,
     );
   }
 
@@ -2024,13 +2239,25 @@ async function fetchUsageStats(
   const days = period === "week" ? 7 : 30;
   const until = new Date();
   until.setHours(0, 0, 0, 0);
-  const since = new Date(until.getTime() - (days - 1) * ONE_DAY_MS);
+  const since = new Date(until);
+  since.setDate(since.getDate() - (days - 1)); // 走日历，见 dailyTimeline 的说明
   const qs = `since=${localDateStr(since)}&until=${localDateStr(until)}`;
-  const r = await apiFetch<Normal<{ rows: DailyRow[]; total: number }>>(
-    `/api/admin/token-usage/daily?${qs}`,
-  );
+  const r = await apiFetch<
+    Normal<{
+      rows: DailyRow[];
+      total: number;
+      daily_earliest_date?: string | null;
+      daily_latest_date?: string | null;
+    }>
+  >(`/api/admin/token-usage/daily?${qs}`);
   const rows = r.data.rows ?? [];
-  return unitsToStats(period, rows.map(rowToUnit), dailyTimeline(rows, days));
+  return unitsToStats(
+    period,
+    rows.map(rowToUnit),
+    dailyTimeline(rows, days, until),
+    r.data.daily_earliest_date ?? null,
+    r.data.daily_latest_date ?? null,
+  );
 }
 
 // ── 任务（task）─────────────────────────────────────────────
@@ -2045,11 +2272,22 @@ interface BackendTaskSummary {
   status: "active" | "paused";
   paused_at?: string | null;
   created_at: string;
+  runtime_state?: "off" | "on";
   rule_briefs?: {
     rule_id: string;
     query: string;
+    direction?: TaskRuleDirection;
+    source_type?: TaskRuleSourceType;
     actions_desc?: string[];
   }[];
+  actions?: {
+    on_enter_actions?: unknown[];
+    on_enter_desc?: string | null;
+    on_exit_actions?: unknown[];
+    on_exit_desc?: string | null;
+    on_target_actions?: unknown[];
+    on_target_desc?: string | null;
+  } | null;
   record: {
     kind: "progress" | "duration" | "event";
     completed: boolean;
@@ -2069,11 +2307,24 @@ export async function realListTasks(): Promise<Task[]> {
     status: t.status,
     pausedAt: t.paused_at ?? null,
     createdAt: t.created_at,
+    runtimeState: t.runtime_state ?? "off",
     ruleBriefs: (t.rule_briefs ?? []).map((b) => ({
       ruleId: b.rule_id,
       query: b.query,
+      direction: b.direction ?? "enter",
+      sourceType: b.source_type ?? "omni",
       actionsDesc: b.actions_desc ?? [],
     })),
+    // 六个槽恒有。后端漏传时归一成"全空"而不是 null —— 调用方据此决定整个分区
+    // 渲不渲染, 留一个可空类型只会换来一句永真的判断
+    actions: {
+      onEnterDesc: t.actions?.on_enter_desc ?? null,
+      onExitDesc: t.actions?.on_exit_desc ?? null,
+      onTargetDesc: t.actions?.on_target_desc ?? null,
+      onEnterActionCount: (t.actions?.on_enter_actions ?? []).length,
+      onExitActionCount: (t.actions?.on_exit_actions ?? []).length,
+      onTargetActionCount: (t.actions?.on_target_actions ?? []).length,
+    },
     record: t.record
       ? {
           kind: t.record.kind,

@@ -537,6 +537,117 @@ class TestAudioRoutePayload:
         assert audio_payload["system_prompt"] == audio_payload2["system_prompt"]
 
 
+class TestNoMediaBlockWarning:
+    """拼不出本窗媒体块时必须留痕——生产默认路径（fused + query）逐 route 覆盖。
+
+    与 fused video route 那条（``test_empty_window_guard.py::TestFusedNoMediaBlockWarning``）
+    共用 ``event=fused_no_media_block``，按一个 event 名 grep 就能盖住全部 route。
+    这类分支不在任何主路径上，不实际执行到就等于没写。
+    """
+
+    def test_fused_audio_route_warns_when_audio_unencodable(self, caplog):
+        """audio route 编不出音频 → 打 warning。
+
+        ``_encode_audio_only_mp4`` 对不足一个 AAC 帧的采样返回 None，此时 audio route 的
+        user_content 里一个媒体块都没有（这条路不渲染参考图），模型手里只剩时间和房间名。
+        """
+        from miloco.perception.engine.omni.prompt_builder import build_fused_payload
+
+        ep = _audio_only_packet()
+        ep.audio_clip = np.zeros(512, dtype=np.int16)  # < 一个 AAC 帧 → 编不出
+
+        with caplog.at_level("WARNING"):
+            fused = build_fused_payload(
+                packets=[ep],
+                context=OmniContext(room_name="厨房"),
+                candidates=[],
+                gallery_snapshot={},
+            )
+
+        blocks = fused["messages"][-1]["content"]
+        assert not [b for b in blocks if b.get("type") == "input_audio"]
+        msg = next(
+            r.getMessage() for r in caplog.records
+            if "fused_no_media_block" in r.getMessage()
+        )
+        assert "route=audio" in msg
+        assert "room=厨房" in msg
+
+    def test_fused_audio_unencodable_marks_encode_failure_diagnostics(self):
+        """fused audio route 编不出媒体块 → 图中不会出现 encode 未知 + request OK。"""
+        from miloco.observability.perception_flow import PerDeviceFlowDiagnostics
+        from miloco.perception.engine.omni.prompt_builder import build_fused_payload
+        from miloco.perception.flow_context import flow_diagnostics_scope
+
+        diagnostics = PerDeviceFlowDiagnostics(
+            device_id="camera-1",
+            room_name="Living Room",
+            trace_id="trace-1",
+            device_trace_id="device-trace-1",
+            observed_at=1,
+        )
+        ep = _audio_only_packet()
+        ep.audio_clip = np.zeros(512, dtype=np.int16)  # < 一个 AAC 帧 → 编不出
+
+        with flow_diagnostics_scope(diagnostics):
+            build_fused_payload(
+                packets=[ep],
+                context=OmniContext(room_name="厨房"),
+                candidates=[],
+                gallery_snapshot={},
+            )
+
+        assert diagnostics.media_encode_status.value == "error"
+        assert diagnostics.omni_request_status.value == "skipped"
+
+    def test_batch_audio_unencodable_marks_encode_failure_diagnostics(self):
+        """batch audio route 编不出媒体块 → 同样标记 encode ERROR + request SKIPPED。"""
+        from miloco.observability.perception_flow import PerDeviceFlowDiagnostics
+        from miloco.perception.engine.omni.prompt_builder import build_batch_prompt
+        from miloco.perception.flow_context import flow_diagnostics_scope
+
+        diagnostics = PerDeviceFlowDiagnostics(
+            device_id="camera-1",
+            room_name="Living Room",
+            trace_id="trace-1",
+            device_trace_id="device-trace-1",
+            observed_at=1,
+        )
+        ep = _audio_only_packet()
+        ep.audio_clip = np.zeros(512, dtype=np.int16)
+
+        with flow_diagnostics_scope(diagnostics):
+            build_batch_prompt(
+                identity_packets=[ep],
+                context=OmniContext(room_name="厨房"),
+            )
+
+        assert diagnostics.media_encode_status.value == "error"
+        assert diagnostics.omni_request_status.value == "skipped"
+
+    def test_query_route_warns_when_video_unencodable(self, caplog):
+        """query 路径拼不出 video 块 → 打 warning。
+
+        query 只有 video 一个媒体块，拼不出就是纯文本问模型「现在怎么样」，而 prompt 里
+        还带着上一窗的 last_caption —— 用户直接读到没有本窗画面依据的现场描述。
+        """
+        from miloco.perception.engine.omni.prompt_builder import build_query_prompt
+
+        ep = _mock_edge_packet()
+        ep.all_frames = []  # _encode_batch_video 拿不到帧 → (None, None)
+
+        with caplog.at_level("WARNING"):
+            payload = build_query_prompt([ep], "厨房现在怎么样")
+
+        assert payload["video_base64"] is None
+        msg = next(
+            r.getMessage() for r in caplog.records
+            if "fused_no_media_block" in r.getMessage()
+        )
+        assert "route=query" in msg
+        assert "room=study-room" in msg
+
+
 class TestBuildMessagesContentBlocks:
     """omni_client._build_messages 块组装（audio vs video route）。"""
 
@@ -605,6 +716,85 @@ class TestFusedAudioRoute:
         types = [b["type"] for b in user_blocks]
         assert "video_url" in types
         assert "input_audio" not in types
+
+
+class TestFusedVideoBlockSkipped:
+    """fused video route 拼出不可用 video 块(过短/为空)时必须留痕——与音频侧
+    ``record_audio_encode_failure`` 同口径,图中不能出现 encode OK + request OK。"""
+
+    def test_fused_video_b64_too_short_marks_block_skipped(self, monkeypatch, caplog):
+        """编码产出过短 b64 → video 块被跳过、text-only。
+
+        PyAV 编码异常可能返回非空但损坏的极短 base64 串(< _MIN_VIDEO_B64_LEN),
+        入 payload 会让 omni 服务端 400,故走 skip。模型本窗没收到画面,排查
+        「描述与实际画面不符」时图必须指向 encode ERROR 而非假全绿。
+        """
+        from miloco.observability.perception_flow import PerDeviceFlowDiagnostics
+        from miloco.perception.engine.omni import prompt_builder
+        from miloco.perception.engine.omni.prompt_builder import build_fused_payload
+        from miloco.perception.flow_context import flow_diagnostics_scope
+
+        diagnostics = PerDeviceFlowDiagnostics(
+            device_id="camera-1",
+            room_name="Living Room",
+            trace_id="trace-1",
+            device_trace_id="device-trace-1",
+            observed_at=1,
+        )
+        monkeypatch.setattr(
+            prompt_builder,
+            "_encode_batch_video",
+            lambda packets, short_edge=0: (b"c2hvcnQ=", None),  # 7 字符 < 1000
+        )
+
+        with flow_diagnostics_scope(diagnostics), caplog.at_level("WARNING"):
+            fused = build_fused_payload(
+                packets=[_video_route_packet()],
+                context=OmniContext(room_name="厨房"),
+                candidates=[],
+                gallery_snapshot={},
+            )
+
+        assert diagnostics.media_encode_status.value == "error"
+        assert diagnostics.omni_request_status.value == "skipped"
+        types = [b["type"] for b in _multimodal_user_content(fused["messages"])]
+        assert "video_url" not in types
+        assert any(
+            "fused_video_b64_too_short" in r.getMessage() for r in caplog.records
+        )
+
+    def test_fused_video_empty_marks_block_skipped(self, monkeypatch):
+        """编码产出为空 → video 块整个消失,同样标记 encode ERROR + request SKIPPED。"""
+        from miloco.observability.perception_flow import PerDeviceFlowDiagnostics
+        from miloco.perception.engine.omni import prompt_builder
+        from miloco.perception.engine.omni.prompt_builder import build_fused_payload
+        from miloco.perception.flow_context import flow_diagnostics_scope
+
+        diagnostics = PerDeviceFlowDiagnostics(
+            device_id="camera-1",
+            room_name="Living Room",
+            trace_id="trace-1",
+            device_trace_id="device-trace-1",
+            observed_at=1,
+        )
+        monkeypatch.setattr(
+            prompt_builder,
+            "_encode_batch_video",
+            lambda packets, short_edge=0: (None, None),
+        )
+
+        with flow_diagnostics_scope(diagnostics):
+            fused = build_fused_payload(
+                packets=[_video_route_packet()],
+                context=OmniContext(room_name="厨房"),
+                candidates=[],
+                gallery_snapshot={},
+            )
+
+        assert diagnostics.media_encode_status.value == "error"
+        assert diagnostics.omni_request_status.value == "skipped"
+        types = [b["type"] for b in _multimodal_user_content(fused["messages"])]
+        assert "video_url" not in types
 
 
 class TestFusedPetRefs:
@@ -1575,8 +1765,9 @@ def _adaptive_packet(
 class TestAdaptiveResolution:
     """Smart Crop(智能裁切增强)在 fused 路径的接线。
 
-    激活看 crop_enhance 双闸(enabled=发版级开关 AND user_enabled=单机用户开关),**与
-    video_short_edge 正交** —— 分辨率档只决定编码短边(全景 / crop / 参考帧),不再决定裁不裁。
+    激活看三闸相与:enabled=发版级开关 AND user_enabled=单机用户开关(两者都在 crop_enhance
+    配置里) AND OmniContext.per_camera_crop_enabled=per-camera 开关(按机位存 KV、逐窗热读)。
+    **与 video_short_edge 正交** —— 分辨率档只决定编码短边(全景 / crop / 参考帧),不决定裁不裁。
     """
 
     def _patches(self, *, short_edge: int = 512, enabled: bool = True, user_enabled: bool = True):
@@ -1593,11 +1784,11 @@ class TestAdaptiveResolution:
             ),
         )
 
-    def _content(self, packet=None, **kwargs):
+    def _content(self, packet=None, context=None, **kwargs):
         from miloco.perception.engine.omni.prompt_builder import build_fused_payload
 
         fused = build_fused_payload(
-            packets=[packet or _adaptive_packet()], context=OmniContext(),
+            packets=[packet or _adaptive_packet()], context=context or OmniContext(),
             gallery_snapshot={}, **kwargs,
         )
         return _multimodal_user_content(fused["messages"])
@@ -1662,9 +1853,12 @@ class TestAdaptiveResolution:
             content = self._content(candidates=[])
         assert self._has_ref(content)
         vid_idx = next(i for i, b in enumerate(content) if b.get("type") == "video_url")
+        # 筛**全部** image_url、不筛 mime：曾经这里只数 image/jpeg，于是走 PNG 的 gallery /
+        # 单帧人像注入插到 ref 之后照样绿。格式无关才真钉得住。
+        # ⚠️ 但只改 mime 还不够：本用例传的是 candidates=[]，注入分支根本进不来，所以它对
+        # 人像注入始终是瞎的。真正覆盖那条路的是 TestPersonCropInject 里带候选的同款用例。
         img_idxs = [
-            i for i, b in enumerate(content[:vid_idx])
-            if b.get("type") == "image_url" and "image/jpeg" in b["image_url"]["url"]
+            i for i, b in enumerate(content[:vid_idx]) if b.get("type") == "image_url"
         ]
         assert len(img_idxs) >= 2  # 宠物图 + 全景图都在
         guide_idx = next(
@@ -1785,6 +1979,93 @@ class TestAdaptiveResolution:
         with p1, p2:
             content = self._content(candidates=[])
         assert not self._has_ref(content)
+
+    def test_off_when_per_camera_switch_off(self):
+        """全局双闸都开,但该机位的 per-camera 闸关 → 回退全景(不裁)。"""
+        p1, p2 = self._patches()  # 两个全局闸都开
+        with p1, p2:
+            content = self._content(
+                context=OmniContext(per_camera_crop_enabled=False), candidates=[]
+            )
+        assert not self._has_ref(content)
+
+    def test_on_when_per_camera_switch_on(self):
+        """per-camera 闸显式为 True 时照旧裁切(与默认值同),证明第三道闸不是恒否。"""
+        p1, p2 = self._patches()
+        with p1, p2:
+            content = self._content(
+                context=OmniContext(per_camera_crop_enabled=True), candidates=[]
+            )
+        assert self._has_ref(content)
+
+    def test_per_camera_switch_defaults_on(self):
+        """OmniContext 不显式给该字段时默认开 —— 老调用点(未透传)零行为变化。"""
+        assert OmniContext().per_camera_crop_enabled is True
+        p1, p2 = self._patches()
+        with p1, p2:
+            content = self._content(candidates=[])
+        assert self._has_ref(content)
+
+    @pytest.mark.parametrize(
+        ("enabled", "user_enabled", "per_camera"),
+        [
+            (False, True, True),
+            (True, False, True),
+            (True, True, False),
+            (False, False, False),
+        ],
+    )
+    def test_any_gate_off_falls_back(self, enabled, user_enabled, per_camera):
+        """三闸是**相与**:任一为 false 就回退全景。"""
+        p1, p2 = self._patches(enabled=enabled, user_enabled=user_enabled)
+        with p1, p2:
+            content = self._content(
+                context=OmniContext(per_camera_crop_enabled=per_camera), candidates=[]
+            )
+        assert not self._has_ref(content)
+
+    def test_per_camera_off_log_carries_device_id(self, caplog):
+        """回退日志必须带 did：4 路交织在同一日志文件里，不带 did 的话行与行字节
+        完全相同，这条日志自称的用途（确认哪台走到了这里）就无法完成。"""
+        import logging
+
+        from miloco.observability.context import (
+            DeviceContext,
+            reset_device_context,
+            set_device_context,
+        )
+
+        p1, p2 = self._patches()
+        token = set_device_context(DeviceContext(
+            device_trace_id="t1", device_id="cam_x:ch1", room_name="客厅"
+        ))
+        try:
+            with p1, p2, caplog.at_level(
+                logging.DEBUG, logger="miloco.perception.engine.omni.prompt_builder"
+            ):
+                self._content(
+                    context=OmniContext(per_camera_crop_enabled=False), candidates=[]
+                )
+        finally:
+            reset_device_context(token)
+
+        hit = [r for r in caplog.records if "reason=per_camera_off" in r.getMessage()]
+        assert hit, "没打出 per_camera_off 回退日志"
+        assert "device_id=cam_x:ch1" in hit[0].getMessage()
+
+    def test_per_camera_off_log_falls_back_to_unknown_without_context(self, caplog):
+        """DeviceContext 未设置时退 unknown，不抛异常（该行在推理主路径上）。"""
+        import logging
+
+        p1, p2 = self._patches()
+        with p1, p2, caplog.at_level(
+            logging.DEBUG, logger="miloco.perception.engine.omni.prompt_builder"
+        ):
+            self._content(
+                context=OmniContext(per_camera_crop_enabled=False), candidates=[]
+            )
+        hit = [r for r in caplog.records if "reason=per_camera_off" in r.getMessage()]
+        assert hit and "device_id=unknown" in hit[0].getMessage()
 
     @pytest.mark.parametrize("short_edge", [360, 512, 768, 1080])
     def test_on_at_any_resolution(self, short_edge):
@@ -2249,10 +2530,295 @@ class TestAdaptiveResolution:
 
     def test_non_fused_never_crops(self):
         # 非 fused/legacy 路径不接 crop:即便 adaptive 全开,也恒走全景、crops 为空(零回归)。
+        from miloco.observability.perception_flow import PerDeviceFlowDiagnostics
         from miloco.perception.engine.omni.prompt_builder import build_batch_prompt
+        from miloco.perception.flow_context import flow_diagnostics_scope
 
+        diagnostics = PerDeviceFlowDiagnostics(
+            device_id="camera-1",
+            room_name="Living Room",
+            trace_id="trace-1",
+            device_trace_id="device-trace-1",
+            observed_at=1,
+        )
         p1, p2 = self._patches()
-        with p1, p2:
+        with p1, p2, flow_diagnostics_scope(diagnostics):
             payload = build_batch_prompt([_adaptive_packet()], OmniContext())
         assert payload["crops"] == []
         assert payload.get("video_base64")
+        assert diagnostics.smart_crop_enabled is False
+        assert diagnostics.smart_crop_applied is False
+        assert diagnostics.crop_region is None
+
+
+def test_video_transform_status_requires_every_frame_to_resize():
+    import miloco.perception.engine.omni.prompt_builder as pb
+    from miloco.observability.perception_flow import PerDeviceFlowDiagnostics
+    from miloco.perception.flow_context import flow_diagnostics_scope
+
+    diagnostics = PerDeviceFlowDiagnostics(
+        device_id="camera-1",
+        room_name="Living Room",
+        trace_id="trace-1",
+        device_trace_id="device-trace-1",
+        observed_at=1,
+    )
+    frames = [np.zeros((8, 8, 3), dtype=np.uint8) for _ in range(2)]
+
+    with (
+        flow_diagnostics_scope(diagnostics),
+        patch.object(
+            pb.cv2,
+            "resize",
+            side_effect=[frames[0], RuntimeError("resize failed")],
+        ),
+        pytest.raises(RuntimeError, match="resize failed"),
+    ):
+        list(pb._resize_video_frames(frames, 4, 4, pb.cv2.INTER_AREA))
+
+    assert diagnostics.media_transform_status.value == "unknown"
+
+    with flow_diagnostics_scope(diagnostics):
+        resized = list(pb._resize_video_frames(frames, 4, 4, pb.cv2.INTER_AREA))
+
+    assert len(resized) == 2
+    assert diagnostics.media_transform_status.value == "ok"
+
+
+# =============================================================================
+# 单帧人像注入（4.4 段）在 fused 路径的接线
+# =============================================================================
+
+
+def _png_bytes(fill: int, h: int = 64, w: int = 32) -> bytes:
+    ok, buf = cv2.imencode(".png", np.full((h, w, 3), fill, dtype=np.uint8))
+    assert ok
+    return buf.tobytes()
+
+
+class TestPersonCropInject:
+    """单帧人像注入的位置、门控与降级。
+
+    位置是本段的重点：它必须落在 gallery **之后**（文案写的是「与上方 gallery 逐一比对」），
+    又必须落在 4.6 全景参考帧引导语**之前**（那条不变式要求引导语紧跟的那张就是 video 前
+    最后一张图）。两头都钉住，才不会在后续有人插新图块时静默漂走。
+    """
+
+    _NOTE = "【识别辅助】下方为每个待识别 track 的"
+
+    def _gallery(self):
+        from miloco.perception.engine.identity.library import GallerySamples
+
+        return {
+            "p-1": GallerySamples(
+                person_id="p-1", name="张三", role=None,
+                body_composite_jpeg=_png_bytes(200),
+            ),
+        }
+
+    def _cands(self, *track_ids):
+        from miloco.perception.engine.identity.dispatcher import IdentityQueryItem
+
+        return [
+            IdentityQueryItem(
+                track_id=t,
+                body_crop=np.full((120, 60, 3), 30 + t, dtype=np.uint8),
+                bbox_xyxy_norm=(100, 100, 300, 600),
+            )
+            for t in track_ids
+        ]
+
+    def _content(self, *, candidates, gallery_snapshot, matching_moot=False, packet=None,
+                 packets=None):
+        """闸**由用例自己钉成开**，不读机器上的合并 settings。
+
+        否则用户在自己 config.json 里合法地把它关掉，本类的阳性用例会集体变红；而阴性用例
+        （test_not_injected_*）会变成"永远绿"的假保证 —— 它们要证明的是 prompt 侧的门控，
+        不是配置默认值。随包默认值另有专门用例（test_person_crop_inject.py::TestShippedDefault）。
+        """
+        from miloco.perception.engine.config import PersonCropInjectConfig
+        from miloco.perception.engine.omni.prompt_builder import build_fused_payload
+
+        with patch(
+            "miloco.perception.engine.omni.person_crop_inject"
+            ".person_crop_inject_config_from_settings",
+            return_value=PersonCropInjectConfig(enabled=True),
+        ):
+            fused = build_fused_payload(
+                packets=packets or [packet or _adaptive_packet()], context=OmniContext(),
+                candidates=candidates, gallery_snapshot=gallery_snapshot,
+                matching_moot=matching_moot,
+            )
+        return _multimodal_user_content(fused["messages"])
+
+    def _idx(self, content, pred):
+        return next((i for i, b in enumerate(content) if pred(b)), None)
+
+    def _note_idx(self, content):
+        return self._idx(
+            content, lambda b: b.get("type") == "text" and self._NOTE in b.get("text", "")
+        )
+
+    def test_injected_after_gallery_and_before_video(self):
+        content = self._content(candidates=self._cands(1), gallery_snapshot=self._gallery())
+        note = self._note_idx(content)
+        assert note is not None
+        gallery_close = self._idx(
+            content, lambda b: b.get("type") == "text" and b.get("text") == "</gallery>"
+        )
+        vid = self._idx(content, lambda b: b.get("type") == "video_url")
+        assert gallery_close < note < vid
+        assert any("track_id=1 的外观单帧" in b.get("text", "") for b in content)
+
+    def test_one_image_per_candidate(self):
+        content = self._content(candidates=self._cands(1, 2, 5), gallery_snapshot=self._gallery())
+        bind = [b for b in content if "的外观单帧：" in b.get("text", "")]
+        assert [t["text"] for t in bind] == [
+            "待识别 track_id=1 的外观单帧：",
+            "待识别 track_id=2 的外观单帧：",
+            "待识别 track_id=5 的外观单帧：",
+        ]
+
+    def test_injected_immediately_after_gallery(self):
+        """紧贴 gallery：说明块必须是 </gallery> 的下一块。
+
+        文案写的是「与**上方** gallery 成员参考图逐一比对」，中间垫东西这句就开始变虚；
+        另一头（必须在全景引导语之前）由 test_ref_stays_last_image_before_video 钉。
+        """
+        content = self._content(candidates=self._cands(1), gallery_snapshot=self._gallery())
+        close = self._idx(
+            content, lambda b: b.get("type") == "text" and b.get("text") == "</gallery>"
+        )
+        assert self._note_idx(content) == close + 1
+
+    def test_not_injected_when_gallery_gives_up(self):
+        """gallery 走「全或无」放弃（成员参考图坏了）时不注入。
+
+        这是运行时真会发生的那一支：库里存的 composite 损坏 / 半截，gallery 段整段放弃、
+        退化为 unknown 以避免错认。此时注入一张人像没有可比对的对象，文案里的「上方 gallery」
+        也成了悬空指代。
+        """
+        from miloco.perception.engine.identity.library import GallerySamples
+
+        broken = {
+            "p-1": GallerySamples(
+                person_id="p-1", name="张三", role=None, body_composite_jpeg=b"xx",
+            ),
+        }
+        content = self._content(candidates=self._cands(1), gallery_snapshot=broken)
+        assert self._note_idx(content) is None
+        # gallery 合成图与人像注入都是 PNG，全景参考帧是 JPEG —— 按 PNG 判定，才能同时证明
+        # "gallery 段确已放弃"和"没注入人像"，又不会被 Smart Crop 的参考帧干扰。
+        assert not any(
+            b.get("type") == "image_url" and "image/png" in b["image_url"]["url"]
+            for b in content
+        )
+
+    def test_not_injected_with_multiple_packets(self):
+        """多设备并发时跳过：candidates 只属于其中一个设备，而 track 号在设备间会撞号，
+        套错帧就是把另一个人的图绑到这个 track_id 上。"""
+        content = self._content(
+            candidates=self._cands(1), gallery_snapshot=self._gallery(),
+            packets=[_adaptive_packet(), _adaptive_packet()],
+        )
+        assert self._note_idx(content) is None
+
+    def test_not_injected_without_gallery(self):
+        """gallery 段没渲染出参考图时不注入——否则「上方 gallery」是悬空指代，且比无可比。"""
+        content = self._content(candidates=self._cands(1), gallery_snapshot={})
+        assert self._note_idx(content) is None
+
+    def test_not_injected_when_matching_moot(self):
+        """身份库为空：identities 已被指示只判 unknown/no_person，注入人像帮不到任何事。"""
+        content = self._content(
+            candidates=self._cands(1), gallery_snapshot=self._gallery(), matching_moot=True,
+        )
+        assert self._note_idx(content) is None
+
+    def test_not_injected_without_candidates(self):
+        content = self._content(candidates=[], gallery_snapshot=self._gallery())
+        assert self._note_idx(content) is None
+
+    def test_picks_largest_frame_when_per_frame_boxes_present(self):
+        """有逐帧框时走面积最大那帧，而不是候选自带的末帧 body_crop。"""
+        import base64
+        from dataclasses import replace
+
+        frames = [np.full((480, 640, 3), v, dtype=np.uint8) for v in (20, 210, 60)]
+        pkt = replace(
+            _adaptive_packet(frames=frames),
+            per_frame_track_boxes=[
+                {1: (0, 0, 60, 60)},
+                {1: (0, 0, 240, 330)},   # 面积最大 → fill=210
+                {1: (0, 0, 90, 100)},
+            ],
+        )
+        content = self._content(
+            candidates=self._cands(1), gallery_snapshot=self._gallery(), packet=pkt,
+        )
+        note = self._note_idx(content)
+        img = content[note + 2]                      # note, 绑定文本, 图
+        assert img["type"] == "image_url"
+        raw = base64.b64decode(img["image_url"]["url"].split(",", 1)[1])
+        arr = cv2.imdecode(np.frombuffer(raw, np.uint8), cv2.IMREAD_COLOR)
+        assert abs(int(arr.mean()) - 210) <= 2
+        assert arr.shape[0] == 256                   # 归一高度
+
+    def test_ref_stays_last_image_before_video(self):
+        """开 Smart Crop 时，人像注入不能把全景参考帧从「video 前最后一张图」的位置挤走。
+
+        这是 test_ref_is_last_image_before_video_with_pet_refs 的同款不变式，但走的是**注入
+        真实开启**的路径 —— 那条守卫测试传 candidates=[]，根本进不了注入分支。
+        """
+        from miloco.perception.engine.config import CropEnhanceConfig
+
+        # 区域必须**钉死**：不钉的话裁不裁取决于噪声帧上的运动块与面积闸能否过关，
+        # 是涌现行为 —— 该用例会间歇性地在"全景参考帧根本没渲染"的前提下跑，断言随之漂移。
+        # 同 TestAdaptiveResolution._fixed_region 的做法（patch 的是带拒因的那个函数，
+        # 薄封装 compute_crop_region 不在被测路径上，patch 它不会生效）。
+        with patch(
+            "miloco.perception.engine.omni.prompt_builder._get_video_short_edge",
+            return_value=512,
+        ), patch(
+            "miloco.perception.engine.omni.crop_enhance.crop_enhance_config_from_settings",
+            return_value=CropEnhanceConfig(enabled=True, user_enabled=True),
+        ), patch(
+            "miloco.perception.engine.omni.crop_enhance.compute_crop_region_detail",
+            return_value=((50, 50, 350, 350), "ok"),
+        ):
+            content = self._content(
+                candidates=self._cands(1, 2), gallery_snapshot=self._gallery(),
+            )
+        guide = self._idx(
+            content,
+            lambda b: b.get("type") == "text" and "全景场景参考" in b.get("text", ""),
+        )
+        assert guide is not None, "本用例的前提是 Smart Crop 真生效、全景参考帧已渲染"
+        vid = self._idx(content, lambda b: b.get("type") == "video_url")
+        # vid 为 None 时 content[:None] 会静默变成"整个列表"，让下面的断言测的是别的东西。
+        # 视频块被跳过（编码产物过短）是真实存在的降级路径，这里要它**响**而不是悄悄改语义。
+        assert vid is not None, "本用例的前提是 video 块已渲染"
+        imgs = [i for i, b in enumerate(content[:vid]) if b.get("type") == "image_url"]
+        _dbg = (
+            "layout=" + "".join(
+                "V" if b.get("type") == "video_url"
+                else ("I" if b.get("type") == "image_url" else "t") for b in content)
+            + f" note={self._note_idx(content)} guide={guide} vid={vid} imgs={imgs}"
+            + " texts=" + repr([b.get("text", "")[:22] for b in content
+                                if b.get("type") == "text"])
+        )
+        assert imgs[-1] == guide + 1, _dbg     # 引导语紧跟的那张，仍是 video 前最后一张
+        assert self._note_idx(content) < guide, _dbg  # 人像注入整段在引导语之前
+
+
+def test_video_resize_is_lazy_to_avoid_retaining_the_whole_window():
+    from unittest.mock import patch as _patch
+
+    import miloco.perception.engine.omni.prompt_builder as pb
+
+    frames = [np.zeros((8, 8, 3), dtype=np.uint8) for _ in range(2)]
+    with _patch.object(pb.cv2, "resize", wraps=pb.cv2.resize) as spy:
+        resized = pb._resize_video_frames(frames, 4, 4, pb.cv2.INTER_AREA)
+        assert spy.call_count == 0
+        next(resized)
+        assert spy.call_count == 1

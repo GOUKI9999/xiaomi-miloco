@@ -301,6 +301,10 @@ export interface ScopeCamera {
   // voiceInUse 正交：关着的相机也能预配，仅在被感知时注入生效。多通道相机按 channel 存取。
   perceptionPrompt: string;
   connected: boolean;
+  // 附加诊断信息（默认 undefined）。目前仅 "cross_subnet_nat"：跨网段 + 云端在线 +
+  // 探测可达 + 拉流长期卡在连接中——大概率是路由器 NAT 类型限制拉流，不是暂时抖动。
+  // 云端已离线时不给这条诊断：相机自己掉线了，问题不在路由器 NAT 上。
+  streamError?: "cross_subnet_nat";
 }
 
 // 相机是否满足「开启感知」的全部条件：云端在线 && 局域网可达 && 镜头未关。
@@ -325,7 +329,7 @@ export type HomeId = string;
 // ── 用量统计（📊 用量 tab）─────────────────────────────────────
 // 数据来自 backend admin token-usage 接口（仅 omni/MiMo 调用有计费）：
 //   today      → GET /api/admin/token-usage/buckets  （服务端按桶聚合）
-//   week/month → GET /api/admin/token-usage/daily     （按 date/model/type 聚合）
+//   week/month → GET /api/admin/token-usage/daily     （按 date/model/base_url/type 聚合）
 // 客户端在 src/api/real.ts::realGetUsageStats 里折算成下面的结构。
 // 注意：video/audio/cache 都是 input 的子集（不叠加）；总量 = input + output。
 
@@ -358,9 +362,17 @@ export interface UsageGroup {
   breakdown: TokenBreakdown;
 }
 
-/** 明细表的一行：model × type 组合。 */
+/** 明细表的一行：模型名 × endpoint × 调用类型。同名模型挂两个 endpoint 会各占一行。 */
 export interface UsageRow {
   model: string;
+  /**
+   * 该行用量所用的 endpoint，**完整 URL 原文**。
+   *
+   * 模型身份 = (model, base_url)：同一个模型名可以同时挂在两个 endpoint 上，
+   * 只看模型名分不出哪个 endpoint 用了多少。空串 = 该行早于用量表记录此列（DB schema v3 之前），
+   * 来源无从得知——展示侧直说「旧版本数据未记录 URL」，不做任何推断或回填。
+   */
+  base_url: string;
   type: UsageCallType;
   calls: number;
   /** input + output。 */
@@ -378,13 +390,67 @@ export interface UsageStats {
   totals: TokenBreakdown;
   /** 按调用类型聚合（realtime / on_demand），按 tokens 降序。 */
   by_type: UsageGroup[];
-  /** model × type 明细行，按 tokens 降序。 */
+  /** 明细行，键为「模型名 + endpoint + 调用类型」，按模型名与 endpoint 排序。 */
   rows: UsageRow[];
   /**
-   * 时间序列。today 桶数随 bin 粒度变化（10分=144 / 1时=24 / 3小时=8，默认 1 时）且铺满整天；
+   * 时间序列。today 桶数随 bin 粒度变化（15分=96 / 1时=24 / 3小时=8，默认 1 时）且铺满整天；
    * week=7 天，month=30 天。ts 是 ISO 8601。
    */
-  timeline: { ts: string; tokens: number }[];
+  timeline: UsageTimelinePoint[];
+  /**
+   * 日聚合表里已有的最早 / 最新日期（YYYY-MM-DD）；表为空或接口未给时为 null。
+   *
+   * 清除确认窗据此判断「清到某一天会不会连带删掉那天更早的记录」——日表按整天删，
+   * 但只有边界那天真的落在日表已有的日期区间里才谈得上连带。两头各挡一类落空，
+   * 见 usageTokens.dailyCaveatApplies。
+   */
+  daily_earliest_date: string | null;
+  daily_latest_date: string | null;
+}
+
+/**
+ * 一个桶里、某个「模型名 + endpoint」的用量拆分。
+ *
+ * 桶本身是跨模型合并的，只看桶级字段就回答不了「这一段是哪个 endpoint 在用」。
+ * 模型身份是 (模型名, endpoint) 而不是模型名，所以拆分也按这个二元组折叠——**若**
+ * 只按模型名合并，同名挂在两个地址上的用量就又粘回一起，等于把后端刚拆开的东西
+ * 在前端重新合上。各项之和恒等于桶的对应字段（见 accPoint）。
+ */
+export interface UsageTimelineTarget {
+  model: string;
+  /** 完整 URL 原文；'' = 老数据未记录。 */
+  base_url: string;
+  /** input − video − audio 的残差（含图片、系统提示，非纯文本）。 */
+  text: number;
+  video: number;
+  audio: number;
+  output: number;
+  cache: number;
+}
+
+/**
+ * 时间序列的一个桶。除总量外还带**分模态拆分**，供时间分布图按模态堆叠——
+ * 后端的 bucket / daily 行本来就带 video / audio / cache 列，这里只是别在
+ * 前端把它们加成一个总数就丢掉。
+ *
+ * 口径与 TokenBreakdown 一致：video / audio / cache 都是 input 的子集，
+ * `text` 是 `input − video − audio` 的**残差**——它不只有文本，还含图片
+ * （gallery / 参考帧的 image 块，后端未单列该模态）与系统提示。
+ * 总量口径 tokens = (text + video + audio) + output = input + output。
+ */
+export interface UsageTimelinePoint {
+  ts: string;
+  /** input + output。 */
+  tokens: number;
+  /** input − video − audio 的残差（含图片、系统提示，非纯文本）。 */
+  text: number;
+  video: number;
+  audio: number;
+  output: number;
+  /** 命中缓存的 prompt token（⊆ text + video + audio）。 */
+  cache: number;
+  /** 本桶按「模型名 + endpoint」的拆分。各项之和 == 桶的对应字段。 */
+  targets: UsageTimelineTarget[];
 }
 
 // ── omni 模型配置（在「模型」页内读/写，支持多档案切换） ──────────────
@@ -463,6 +529,177 @@ export interface OmniModelsResult {
   message?: string;
 }
 
+// ── Generic Graph JSON ───────────────────────────────────
+
+export type GraphSource =
+  | "observed"
+  | "configured"
+  | "model_fixed"
+  | "unknown";
+export type GraphStatus =
+  | "ok"
+  | "warning"
+  | "skipped"
+  | "backpressure"
+  | "error"
+  | "inactive"
+  | "unknown";
+export type GraphFreshness = "fresh" | "stale" | "unknown";
+export type GraphKind =
+  | "source"
+  | "buffer"
+  | "transform"
+  | "filter"
+  | "inference"
+  | "encoder"
+  | "external"
+  | "sink"
+  | "generic";
+export type GraphRole =
+  | "input"
+  | "output"
+  | "config"
+  | "flow"
+  | "state"
+  | "detail";
+export type GraphSeverity = "info" | "warning" | "error";
+export type GraphValue = string | number | boolean;
+
+export interface GraphDatum {
+  value: number | null;
+  source: GraphSource;
+}
+
+export interface GraphMedia {
+  width: GraphDatum | null;
+  height: GraphDatum | null;
+  fps: GraphDatum | null;
+  frame_count: GraphDatum | null;
+  duration_ms: GraphDatum | null;
+}
+
+export interface GraphMetric {
+  key: string;
+  label: string;
+  value: GraphValue | null;
+  unit: string | null;
+  source: GraphSource;
+  role: GraphRole;
+  severity: GraphSeverity | null;
+}
+
+export interface GraphWarning {
+  code: string;
+  message: string;
+  severity: GraphSeverity;
+  params: Record<string, GraphValue>;
+}
+
+export interface GraphEvidence {
+  trace_id: string | null;
+  device_trace_id: string | null;
+  observed_at: number | null;
+  age_ms: number | null;
+}
+
+export interface GraphNode {
+  id: string;
+  kind: GraphKind;
+  label: string;
+  group: string | null;
+  rank: number | null;
+  order: number;
+  status: GraphStatus;
+  freshness: GraphFreshness;
+  last_observed_status: GraphStatus | null;
+  standalone: boolean;
+  metrics: GraphMetric[];
+  input: GraphMedia | null;
+  output: GraphMedia | null;
+  warnings: GraphWarning[];
+  evidence: GraphEvidence | null;
+}
+
+export interface GraphEdge {
+  id: string;
+  from: string;
+  to: string;
+  label: string | null;
+  active: boolean;
+  status: GraphStatus;
+  freshness: GraphFreshness;
+  last_observed_status: GraphStatus | null;
+  media: GraphMedia | null;
+  metrics: GraphMetric[];
+  warnings: GraphWarning[];
+  evidence: GraphEvidence | null;
+}
+
+export interface GraphLayout {
+  rank_separation: number;
+  node_separation: number;
+}
+
+export interface GraphGroup {
+  id: string;
+  label: string;
+  order: number;
+}
+
+export interface GraphDefinition {
+  id: string;
+  label: string;
+  direction: "LR" | "TB";
+  layout: GraphLayout;
+  groups: GraphGroup[];
+  nodes: GraphNode[];
+  edges: GraphEdge[];
+}
+
+export interface GraphScope {
+  device_id: string | null;
+  room_name: string | null;
+}
+
+export interface GraphDeviceSummary {
+  device_id: string;
+  room_name: string | null;
+  trace_id: string | null;
+  device_trace_id: string | null;
+  observed_at: number | null;
+  freshness: GraphFreshness;
+  status: GraphStatus;
+}
+
+export interface GraphSummary {
+  latest_trace_id: string | null;
+  latest_device_trace_id: string | null;
+  observed_at: number | null;
+  freshness: GraphFreshness;
+  devices: GraphDeviceSummary[];
+}
+
+export interface GraphResponse {
+  schema_version: 1;
+  generated_at: number;
+  process_started_at: number;
+  stale_after_sec: number;
+  scope: GraphScope;
+  graph: GraphDefinition;
+  summary: GraphSummary;
+}
+
+export interface GraphProtocolWarning {
+  code: "unknown_kind" | "unknown_status";
+  message: string;
+  path: string;
+  value: string;
+}
+
+export type GraphDecodeResult =
+  | { ok: true; graph: GraphResponse; warnings: GraphProtocolWarning[] }
+  | { ok: false; error: string };
+
 /** 提交给后端的 omni 配置(保存/测试)；档案名 label = 唯一 id。 */
 export interface OmniConfigUpdate {
   /** 档案名(唯一 id，非空)。 */
@@ -501,8 +738,10 @@ export type PerfBucket = "1m" | "5m" | "1h" | "1d";
 /** /api/stats?metric=summary 返回。 */
 export interface PerfSummary {
   cycle_count: number;
-  /** 窗口内被 buffer clear 丢的窗口数。cycle_count + dropped_count = 应处理总数。 */
+  /** 窗口内被 buffer 丢弃或跳过的设备窗口数。 */
   dropped_count: number;
+  /** 窗口内实际处理的设备窗口数。 */
+  processed_device_window_count: number;
   skip_rate: number;
   drop_rate: number;
   omni_error_rate: number;
@@ -616,8 +855,9 @@ export interface PerfTraceRow {
   gate_video_pass: number;
   /** 1=audio gate 通过,0=被过滤掉。 */
   gate_audio_pass: number;
-  /** 1=hold 滞回拉起本窗 packet(visual 未变化但距上次通过 ≤ hold_duration_sec);
-   *  与 gate_video_pass 互斥,可与 gate_audio_pass 共存,omni 路由仍走 video。 */
+  /** 1=滞回真把本窗开出来了(此时 omni 路由走 video);与 gate_video_pass 互斥,可与
+   *  gate_audio_pass 共存。零帧窗口恒 0,故不能当「滞回发生频次」用。
+   *  语义约束见 knowledge/03-features/perception-pipeline.md 的 Gate 小节。 */
   gate_hold_pass: number;
   cycle_total_ms: number | null;
   pipeline_total_ms: number | null;
@@ -635,6 +875,11 @@ export interface PerfTraceRow {
   cycle_error_msg: string | null;
   /** traces_v 视图派生:EXISTS(SELECT 1 FROM agent_runs WHERE trace_id=t.trace_id)。 */
   has_agent_turn: number;
+  /**
+   * traces_v 视图派生的「耗时/窗口跨度」比值族。明细表用「实时率」一列显示
+   * rtf_e2e ?? rtf、超过 1 标红,那一行「有没有跟上」就看它;rtf_pipeline /
+   * rtf_stream_e2e / rtf_omni 表上没有对应列,留给调用方按需取。
+   */
   rtf: number | null;
   rtf_pipeline: number | null;
   rtf_e2e: number | null;
@@ -761,12 +1006,33 @@ export interface TaskRecordSummary {
 // 驱动规则摘要：后端 summary 接口（GET /api/tasks/summary）返回的
 // TaskSummaryView 继承 TaskFullView，本就带 rule_briefs，故随列表一并
 // 加载、供详情抽屉直接复用，无需再单独拉 GET /api/tasks/{id}。
+// 规则方向：条件成立时对 task 意味着什么。milestone 由服务端维护、后端已过滤，
+// 不会出现在这里。
+export type TaskRuleDirection = "enter" | "exit" | "session" | "guard";
+
+// 触发源。omni 是摄像头视觉判定，iot 是设备属性变化，record 是累计量达标。
+export type TaskRuleSourceType = "omni" | "iot" | "record";
+
 export interface TaskRuleBrief {
   ruleId: string;
   // 规则的自然语言条件（"孩子在书桌前学习" 之类）
   query: string;
-  // 命中后执行的动作人话摘要
+  direction: TaskRuleDirection;
+  // 触发源。omni 的条件是住户写的自然语言、可改；其余源的条件是服务端按谓词渲染
+  // 出来的一句描述，后端会拒绝对它的 PATCH，所以界面上必须是只读的。
+  sourceType: TaskRuleSourceType;
+  // 命中后执行的动作人话摘要。多条规则的 task 动作不在这里，在 Task.actions 上
   actionsDesc: string[];
+}
+
+// task 的三个动作槽。*_actions 是设备直控，*_desc 交给 Agent。
+export interface TaskBoundaryActions {
+  onEnterDesc: string | null;
+  onExitDesc: string | null;
+  onTargetDesc: string | null;
+  onEnterActionCount: number;
+  onExitActionCount: number;
+  onTargetActionCount: number;
 }
 
 // 任务视图 = 基础字段 + record 进度摘要 + 驱动规则，一次 summary 请求全拿到。
@@ -779,6 +1045,11 @@ export interface Task {
   record: TaskRecordSummary | null;
   // 详情抽屉「有价值的详情」：驱动规则，随 summary 一并返回。
   ruleBriefs: TaskRuleBrief[];
+  // 模式此刻开着还是关着。内存派生，重启一律从 off 起。
+  runtimeState: "off" | "on";
+  // 多条规则的 task 动作只在这里 —— 规则侧的动作 flag 按设计不透传，
+  // 那种 task 的 ruleBriefs.actionsDesc 是空的。
+  actions: TaskBoundaryActions;
 }
 
 // ── 升级检测 / 一键升级（对齐 backend /api/admin/upgrade/*、/version） ──

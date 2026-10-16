@@ -9,6 +9,10 @@ from typing import Any
 import numpy as np
 from numpy.typing import NDArray
 
+from miloco.observability.perception_flow import (
+    PerceptionFlowCycleDiagnostics,
+    PerDeviceFlowDiagnostics,
+)
 from miloco.perception.types import DeviceSnapshot
 
 # =============================================================================
@@ -35,8 +39,8 @@ class GateTrigger:
     # 音频过能量 gate 后,silero VAD 判本窗有真人声。门控 speeches 字段:False 时
     # 下游只剥 speeches(env_sounds / 喂音频不受影响)。audio_active=False 时恒 False。
     speech_active: bool = False
-    # 本窗口由 hold 拉起(visual 不通过、距上次 visual 通过 <= hold_duration_sec)。
-    # _is_audio_only 路由判定上短路:hold=True 不降级到 audio-only,保 video 路由。
+    # 滞回拉起且本窗有帧。给 _is_audio_only 选路用:hold=True 不降级到 audio-only。
+    # 三处 hold 取值的对照见 knowledge/03-features/perception-pipeline.md 的 Gate 小节。
     hold: bool = False
 
 
@@ -70,13 +74,17 @@ class GateTiming:
     vad_ms: float = 0.0
     # silero VAD 本窗人声峰值概率(0-1);audio_active=False 时未评估、为 0。诊断 / 配阈值用。
     speech_prob: float = 0.0
-    # 本窗口是 hold 拉起的(traces_device.gate_hold_pass 落库用)。
-    # passed 属性只表示真通过,hold 不计入;下游不再依赖 passed 决定 packet 是否生成。
+    # 原始滞回判定,只看时间不看有没有帧。给 pipeline 的 HOLD_START / HOLD_EXPIRED /
+    # HOLD_RECOVERED 状态机用 —— 置假会让零帧窗口凭空触发一次 HOLD_EXPIRED。
     hold_pass: bool = False
+    # 滞回真把本窗开出来了(hold_pass 且本窗有帧)。落 traces_device.gate_hold_pass 那一列。
+    # 该列的等价关系与适用范围见 knowledge/03-features/perception-pipeline.md 的 Gate 小节。
+    hold_opened_window: bool = False
     # visual_score 拆分:窗内邻帧 max vs 跨窗(上窗末帧↔本窗首帧)的 max。
     # 诊断用:cross >> intra 持续高,基本是 ISP 长周期漂移(AGC/IR/AWB)误判 motion。
     video_intra_score: float = 0.0
     video_cross_score: float = 0.0
+    checked_frame_count: int = 0
 
     @property
     def total_ms(self) -> float:
@@ -148,6 +156,19 @@ class TrackingResponse:
     #     所以需要逐帧、且需要不成 track 的类别(tracker 只跟 HUMAN,宠物永远进不了 box_info)
     # 无 tracker 的实现(Mock)留空 → crop 侧退化为只用运动块。
     main_det_boxes: list[tuple[int, int, int, int]] = field(default_factory=list)
+    # 本窗口**每一抽帧**上各 track 的框(xyxy 像素);下标 = 帧序,与喂给 analyze 的帧列表同序
+    # (即 IdentityPacket.all_frames,identity.py 把同一个 list 同时交给两边)。
+    # 这是与上面两者并列的**第三套**需求,三者互不能替代:
+    #   - object_info/box_info  逐 track 但只有末帧一个框 —— 贴名字、抽 ReID 够用
+    #   - main_det_boxes        逐帧但**不带 track_id** —— Smart Crop 只要空间并集
+    #   - 本字段                逐帧**且带 track_id** —— 单帧人像注入要回答"某个 track 在窗内
+    #                           哪一帧裁出来最大",上面两者都答不了
+    # **只收本帧真匹配到检测的框**(get_tracking_results 的 detected_this_frame):coasting 帧上
+    # 框是上一次真匹配时的检测框、原地冻结,拿它去裁**当前**帧会裁到人已离开的背景、甚至隔壁
+    # 那个人 —— 而注入是把图绑到 track_id 上,绑错等于直接喂一个错身份证据。同 IdentityEngine
+    # 内各 coasting 闸的口径(见 TrackedObject.detected_this_frame)。
+    # 无 tracker 的实现(Mock)留空 → 注入侧退化为用候选自带的末帧 body_crop。
+    per_frame_track_boxes: list[dict[int, tuple[int, int, int, int]]] = field(default_factory=list)
 
 
 @dataclass
@@ -265,6 +286,10 @@ class IdentityPacket:
     # 透传 TrackingResponse.main_det_boxes（窗口内每抽帧的 human/cat/dog 框，xyxy 像素），
     # 供 Smart Crop 算裁切区域并集。见该字段注释：与 targets/box_info 是两套需求。
     main_det_boxes: list[tuple[int, int, int, int]] = field(default_factory=list)
+    # 透传 TrackingResponse.per_frame_track_boxes(逐抽帧、带 track_id 的框),供单帧人像注入
+    # 选"该 track 窗内裁出面积最大的一帧"。见该字段注释:与 main_det_boxes / box_info 三者
+    # 各服务一套需求。下标与 all_frames 同序。
+    per_frame_track_boxes: list[dict[int, tuple[int, int, int, int]]] = field(default_factory=list)
 
 
 # =============================================================================
@@ -290,6 +315,15 @@ class OmniContext:
     # 该设备自定义「感知须知」prompt（用户/agent 配置，KV CAMERA_PROMPT_MAP_KEY 逐窗实时读取）。
     # 注入 omni system prompt 尾部（video / audio 路由均注入），给模型补充机位环境 / 关注 / 忽略指导。
     camera_prompt: str | None = None
+    # 该机位（合成 did，多通道逐路）的 Smart Crop per-camera 闸，KV CAMERA_CROP_DENY_LIST_KEY
+    # 逐窗实时读取（不在关闭集 = True，故**默认 True**）。与全局双闸
+    # perception.engine.crop_enhance.enabled / user_enabled **相与**才裁切，见
+    # omni/prompt_builder._maybe_encode_adaptive。False = 该机位改走全景路径（不裁切）。
+    # 名字带 per_camera_ 前缀是刻意的：admin API 的 PerceptionConfigBody 有个
+    # smart_crop_enabled，指的是**全局**用户闸（= crop_enhance.user_enabled，见
+    # admin/router.py），与本字段是相与关系的两个不同层级。两者都是 bool，同名的话跨层
+    # 搬字段时接错哪一个不会有任何类型信号。
+    per_camera_crop_enabled: bool = True
 
 
 
@@ -342,6 +376,7 @@ class DevicePipelineResult:
     identity_packet: IdentityPacket | None = None
     omni_output: OmniOutput | None = None
     skipped: bool = False
+    flow_diagnostics: PerDeviceFlowDiagnostics | None = None
 
 
 @dataclass
@@ -388,3 +423,4 @@ class BatchPipelineResult:
 
     rooms: dict[str, RoomPipelineResult] = field(default_factory=dict)
     timing: dict[str, Any] | None = None
+    flow_diagnostics: PerceptionFlowCycleDiagnostics | None = None

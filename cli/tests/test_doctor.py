@@ -8,6 +8,7 @@ import pytest
 from click.testing import CliRunner
 
 from miloco_cli.commands.doctor import (
+    _UDP_PORT_UNREACH_MARK,
     BackendState,
     CameraSummary,
     CheckResult,
@@ -24,6 +25,7 @@ from miloco_cli.commands.doctor import (
     _build_version_result,
     _in_same_subnet,
     _is_virtual_iface,
+    _matching_subnet_ifaces,
     _parse_neigh_linux,
     _parse_ping,
     _probe_udp_send,
@@ -150,6 +152,32 @@ class TestInSameSubnet:
             _iface("eth1", "10.0.0.1", 24),
         ]
         assert _in_same_subnet(ifs, "10.0.0.5") == (True, "eth1")
+
+    def test_overlapping_subnets_picks_most_specific(self):
+        """子网重叠时取最具体的那块(与内核最长前缀匹配一致)。
+
+        真实场景: en0=192.168.18.2/16 覆盖了整个 192.168.0.0/16, 而 en1 是
+        192.168.1.239/24。目标 192.168.1.116 两者都落, 内核走 en1;
+        若按遍历顺序取 en0, 会把正常选路误报成多网卡冲突。
+        """
+        ifs = [
+            _iface("en0", "192.168.18.2", 16),
+            _iface("en1", "192.168.1.239", 24),
+        ]
+        assert _in_same_subnet(ifs, "192.168.1.116") == (True, "en1")
+        assert _matching_subnet_ifaces(ifs, "192.168.1.116") == ["en1", "en0"]
+
+    def test_matching_ifaces_excludes_non_covering(self):
+        ifs = [
+            _iface("en0", "192.168.18.2", 16),
+            _iface("en1", "192.168.1.239", 24),
+        ]
+        # 只落在 /16 里, 不在 en1 的 /24 内
+        assert _matching_subnet_ifaces(ifs, "192.168.99.7") == ["en0"]
+
+    def test_matching_ifaces_empty_when_no_match(self):
+        ifs = [_iface("eth0", "192.168.1.100", 24)]
+        assert _matching_subnet_ifaces(ifs, "10.0.0.1") == []
 
 
 # ─── probe_environment ─────────────────────────────────────────────────────────
@@ -1052,6 +1080,34 @@ class TestAssessReachability:
         results = assess_reachability(_rs(route_iface="eth1"))
         assert results[1].status == Status.WARN
 
+    def test_overlapping_subnets_route_not_warned(self):
+        """子网重叠且路由走了其中一块 → 正常, 不该告警。
+
+        回归 en0(/16) 与 en1(/24) 并存时"路由走 en1 但目标与 en0 同网段"的误报:
+        en1 才是最具体匹配, 内核走它完全正确。
+        """
+        results = assess_reachability(
+            _rs(
+                target_ip="192.168.1.116",
+                same_subnet_iface="en1",
+                same_subnet_ifaces=("en1", "en0"),
+                route_iface="en1",
+                route_src="192.168.1.239",
+            )
+        )
+        assert results[1].status == Status.PASS
+
+    def test_route_outside_all_matching_ifaces_warn(self):
+        """路由接口不在**任何**同网段网卡里 → 才是真异常, 保留告警。"""
+        results = assess_reachability(
+            _rs(
+                same_subnet_iface="en1",
+                same_subnet_ifaces=("en1", "en0"),
+                route_iface="utun3",
+            )
+        )
+        assert results[1].status == Status.WARN
+
     def test_ping_fail_neigh_reachable_warn(self):
         results = assess_reachability(_rs(ping_ok=False, ping_rtt_ms=None,
                                           neigh_state="REACHABLE"))
@@ -1069,7 +1125,54 @@ class TestAssessReachability:
         assert results[3].fix_hint is not None
 
     def test_udp_icmp_port_unreachable_pass(self):
-        results = assess_reachability(_rs(udp_error="ICMP Port Unreachable"))
+        results = assess_reachability(_rs(udp_error=_UDP_PORT_UNREACH_MARK))
+        assert results[3].status == Status.PASS
+
+    def test_l3_pass_when_udp_port_unreachable(self):
+        """ping 失败 + 邻居未知 + UDP 收到端口不可达 → L3 判 PASS(跨网段场景)。
+
+        跨网段时 ICMP echo 常被过滤、ARP 表天然无条目,但 UDP 单播是真实拉流路径,
+        收到「端口未监听」说明包已送达目标 —— 以它为准,不能报三层不可达。
+        """
+        results = assess_reachability(_rs(
+            ping_ok=False, ping_rtt_ms=None, neigh_state=None, neigh_mac=None,
+            udp_send_ok=True, udp_error=_UDP_PORT_UNREACH_MARK,
+        ))
+        assert results[2].status == Status.PASS
+
+    def test_l3_fail_when_udp_sent_but_no_icmp_reply(self):
+        """UDP 发出去但没有任何回应 → 仍判 L3 不可达,别把「发得出去」当可达。"""
+        results = assess_reachability(_rs(
+            ping_ok=False, ping_rtt_ms=None, neigh_state=None, neigh_mac=None,
+            udp_send_ok=True, udp_error=None,
+        ))
+        assert results[2].status == Status.FAIL
+
+    def test_l3_udp_evidence_outranks_arp_entry(self):
+        """同网段目标（ARP 表天然有条目）也要以 UDP 端口不可达为准，判 PASS 而非 WARN。
+
+        判定链顺序即证据强弱：UDP 收到端口不可达（包已达目标主机、目标主动回应）
+        强于「邻居表有条目」（只证明二层见过它）。若 ARP 那条排在前面，同网段路径
+        会永远短路在 WARN 上，新判据只在跨网段生效——与它自称的「铁证」自相矛盾。
+        """
+        results = assess_reachability(_rs(
+            ping_ok=False, ping_rtt_ms=None,
+            neigh_state="REACHABLE", neigh_mac="aa:bb:cc:dd:ee:ff",
+            udp_send_ok=True, udp_error=_UDP_PORT_UNREACH_MARK,
+        ))
+        assert results[2].status == Status.PASS
+
+    def test_l3_and_udp_verdicts_never_contradict(self):
+        """回归:L3 与 UDP 两段结论不得同时出现「不可达」与「有回应」。
+
+        两段共用 ReachabilityState.udp_port_unreachable 这个单一判定入口;若哪天
+        有人把判据拆回手写字面量并改错一处,这条会红。
+        """
+        results = assess_reachability(_rs(
+            ping_ok=False, ping_rtt_ms=None, neigh_state=None, neigh_mac=None,
+            udp_send_ok=True, udp_error=_UDP_PORT_UNREACH_MARK,
+        ))
+        assert results[2].status == Status.PASS
         assert results[3].status == Status.PASS
 
     def test_udp_no_icmp_l3_ok_pass(self):

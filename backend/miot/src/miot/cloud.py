@@ -22,7 +22,13 @@ from cryptography.hazmat.primitives import padding as sym_padding
 from cryptography.hazmat.primitives.asymmetric import padding as asym_padding
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 from cryptography.hazmat.primitives.serialization import load_pem_public_key
+from pydantic import ValidationError
 
+from .action_result import (
+    SOURCE_CLOUD,
+    MIoTActionResult,
+    build_action_result,
+)
 from .common import calc_group_id
 from .const import (
     MIHOME_HTTP_API_PUBKEY,
@@ -52,6 +58,76 @@ from .types import (
 _LOGGER = logging.getLogger(__name__)
 
 TOKEN_EXPIRES_TS_RATIO = 0.7
+
+
+def _cloud_device_to_info(device: Dict[str, Any], urn: str) -> Optional[MIoTDeviceInfo]:
+    """Build an MIoTDeviceInfo from a raw cloud API device dict.
+
+    Pure function — no I/O, no ``self``.  The caller must pre-resolve *urn*.
+    Returns ``None`` when any required field (did, name, model, uid) or *urn*
+    is missing.  Never raises on a malformed device dict, so a single bad
+    entry can't abort parsing of the whole page — the caller just skips it.
+    """
+    did = device.get("did", None)
+    name = device.get("name", None)
+    model = device.get("model", None)
+    uid = device.get("uid", None)
+    if did is None or name is None or model is None or uid is None:
+        return None
+    if not urn:
+        return None
+
+    try:
+        info = MIoTDeviceInfo(
+            did=did,
+            name=name,
+            urn=urn,
+            model=model,
+            uid=str(uid),
+            connect_type=device.get("pid", -1),
+            token=device.get("token", None),
+            online=device.get("isOnline", False),
+            icon=device.get("icon", None),
+            parent_id=device.get("parent_id", None),
+            manufacturer=model.split(".")[0],
+            # 2: xiao-ai, 1: general speaker
+            voice_ctrl=device.get("voice_ctrl", 0),
+            rssi=device.get("rssi", None),
+            pid=device.get("pid", None),
+            # 云端字段确为 "localip"（无下划线，与同函数内 isOnline/orderTime 等驼峰/
+            # 无分隔风格一致），不是 "local_ip"——跨网段相机不在广播可见范围，
+            # local_ip 只能来自这个字段，key 错会让 unicast_targets 恒空、
+            # 跨网段直连静默失效（见 #420）。
+            local_ip=device.get("localip", None),
+            ssid=device.get("ssid", None),
+            bssid=device.get("bssid", None),
+            order_time=device.get("orderTime", 0),
+        )
+    except ValidationError as e:
+        # pid / token 等必填字段在云端返回里缺失时 pydantic 会抛校验错。整页设备
+        # 共用一次解析循环，让一条畸形设备把 ValidationError 抛到循环外，会导致
+        # 整个账号的设备列表拉取失败；退化成跳过这一条更合理。
+        _LOGGER.info("invalid device from cloud, skipped, %s, %s", did, e)
+        return None
+
+    # Post-process owner sub-dict
+    owner = device.get("owner", None)
+    if isinstance(owner, dict) and owner:
+        # 用 .get()：owner 存在但缺子键时按缺省处理，不能让整条设备解析炸掉。
+        userid = owner.get("userid", None)
+        info.owner_id = str(userid) if userid is not None else None
+        info.owner_nickname = owner.get("nickname", None)
+
+    # Post-process extra sub-dict
+    extra = device.get("extra", None)
+    if isinstance(extra, dict) and extra:
+        info.fw_version = extra.get("fw_version", None)
+        info.mcu_version = extra.get("mcu_version", None)
+        info.platform = extra.get("platform", None)
+        info.is_set_pincode = extra.get("isSetPincode", None)
+        info.pincode_type = extra.get("pincodeType", None)
+
+    return info
 
 
 class MIoTOAuth2Client:
@@ -450,6 +526,25 @@ class MIoTHttpClient:
         # _LOGGER.debug("mihome api post, %s%s, %s -> %s", self._base_url, url_path, data, res_obj)
         return res_obj
 
+    async def get_central_cert_async(self, csr: str) -> str:
+        """Submit a CSR and get a central-hub-gateway client cert signed by cloud.
+
+        Used for the local mTLS connection to the central hub gateway. Only
+        meaningful in regions listed in ``SUPPORT_CENTRAL_GATEWAY_CTRL``.
+        """
+        if not isinstance(csr, str):
+            raise MIoTHttpError("invalid params")
+        res_obj: Dict = await self.__mihome_api_post_async(
+            url_path="/app/v2/ha/oauth/get_central_crt",
+            data={"csr": str(base64.b64encode(csr.encode("utf-8")), "utf-8")},
+        )
+        if "result" not in res_obj:
+            raise MIoTHttpError("invalid response result")
+        cert: str = res_obj["result"].get("cert", None)
+        if not isinstance(cert, str):
+            raise MIoTHttpError("invalid cert")
+        return cert
+
     async def get_user_info_async(self) -> MIoTUserInfo:
         """Get user info."""
         http_res = await self._ensure_session().get(
@@ -713,40 +808,11 @@ class MIoTHttpClient:
                     _LOGGER.info("missing the urn field, cloud, %s", device)
                     continue
 
-            device_infos[did] = MIoTDeviceInfo(
-                did=did,
-                name=name,
-                urn=urn,
-                model=model,
-                uid=str(device["uid"]),
-                connect_type=device.get("pid", -1),
-                token=device.get("token", None),
-                online=device.get("isOnline", False),
-                icon=device.get("icon", None),
-                parent_id=device.get("parent_id", None),
-                manufacturer=model.split(".")[0],
-                # 2: xiao-ai, 1: general speaker
-                voice_ctrl=device.get("voice_ctrl", 0),
-                rssi=device.get("rssi", None),
-                pid=device.get("pid", None),
-                local_ip=device.get("local_ip", None),
-                ssid=device.get("ssid", None),
-                bssid=device.get("bssid", None),
-                order_time=device.get("orderTime", 0),
-            )
-            if isinstance(device.get("owner", None), Dict) and device["owner"]:
-                device_infos[did].owner_id = str(device["owner"]["userid"])
-                device_infos[did].owner_nickname = device["owner"]["nickname"]
-            if isinstance(device.get("extra", None), Dict) and device["extra"]:
-                device_infos[did].fw_version = device["extra"].get("fw_version", None)
-                device_infos[did].mcu_version = device["extra"].get("mcu_version", None)
-                device_infos[did].platform = device["extra"].get("platform", None)
-                device_infos[did].is_set_pincode = device["extra"].get(
-                    "isSetPincode", None
-                )
-                device_infos[did].pincode_type = device["extra"].get(
-                    "pincodeType", None
-                )
+            info = _cloud_device_to_info(device, urn)
+            if info is None:
+                _LOGGER.info("failed to build device info, cloud, %s", device)
+                continue
+            device_infos[info.did] = info
 
         # get device icon
         if models:
@@ -963,21 +1029,50 @@ class MIoTHttpClient:
 
         return res_obj["result"]
 
-    async def action_async(self, param: MIoTActionParam) -> Dict:
-        """Action.
+    async def action_async(self, param: MIoTActionParam) -> MIoTActionResult:
+        """Action. 返回**正典形状**（见 ``action_result``）。
+
         params = {"did": "xxxx", "siid": 2, "aiid": 1, "in": []}
         "in": in_list  # [item["value"] for item in in_list]
+
+        云端信封与本地中枢**整体**不同：带 ``miid``/``exe_time``/``net_cost`` 等一串
+        遥测，失败时连 ``out`` 键都没有，``out`` 还是把 piid 拍平的裸标量列表。
+        这里只留 ``exe_time``；``net_cost`` 不取上游的 —— 那个只覆盖"云端→设备"
+        一段，与本地中枢的局域网往返不是同一条路径，直接用会得到假对等。
         """
         # NOTICE: Non-standard action param
+        sent_at = time.monotonic()
         res_obj = await self.__mihome_api_post_async(
             url_path="/app/v2/miotspec/action",
             data={"params": param.model_dump(by_alias=True)},
             timeout=15,
         )
+        latency_ms = int((time.monotonic() - sent_at) * 1000)
         if "result" not in res_obj:
             raise MIoTHttpError("invalid response result")
 
-        return res_obj["result"]
+        result = res_obj["result"]
+        if not isinstance(result, dict):
+            # 旧代码把非 dict 的 result 原样上抛,上层只在 dict 上取 code,等于
+            # 静默无结论。归一到正典形状反而把这件事说清楚。
+            return build_action_result(
+                did=param.did,
+                siid=param.siid,
+                aiid=param.aiid,
+                code=None,
+                source=SOURCE_CLOUD,
+                latency=latency_ms,
+            )
+        return build_action_result(
+            did=param.did,
+            siid=param.siid,
+            aiid=param.aiid,
+            code=result.get("code"),
+            source=SOURCE_CLOUD,
+            out_raw=result.get("out"),
+            exe_time=result.get("exe_time"),
+            latency=latency_ms,
+        )
 
     async def __get_manual_scenes_with_home_id_async(
         self, uid: str, home_id: str, scene_ids: Optional[List[int]] = None

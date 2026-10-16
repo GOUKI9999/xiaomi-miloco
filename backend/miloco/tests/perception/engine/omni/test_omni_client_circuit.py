@@ -14,6 +14,7 @@ from miloco.perception.engine.omni.error_classifier import (
     ClassifiedError,
     ErrorCategory,
 )
+from miloco.perception.engine.omni.provider import build_request_headers, get_adapter
 
 
 class _FakeResp:
@@ -41,7 +42,19 @@ class _FakeResp:
             )
 
 
-def _fake_async_client(resp: _FakeResp | None = None, *, exc: Exception | None = None):
+def _fake_async_client(
+    resp: _FakeResp | None = None,
+    *,
+    exc: Exception | None = None,
+    sent: list[dict] | None = None,
+):
+    """``sent`` 非None 时把每次 post 收到的 kwargs 追加进去(headers 传输层断言用)。
+
+    原来 ``post(*a, **k)`` 直接吞掉 kwargs,所以「call_omni 发出的头」从来没被测过——
+    call_omni 手写一份 headers 还是复用 build_request_headers,现有测试一样绿。传
+    ``sent`` 就能把真正上线的 headers 抓出来断言,不改变 fake 的其余行为。
+    """
+
     class _C:
         def __init__(self, *a, **k):
             pass
@@ -55,6 +68,8 @@ def _fake_async_client(resp: _FakeResp | None = None, *, exc: Exception | None =
         async def post(self, *a, **k):
             if exc:
                 raise exc
+            if sent is not None:
+                sent.append({"url": a[0] if a else k.get("url"), **k})
             return resp
 
     return _C
@@ -67,10 +82,10 @@ def _reset_cb():
     reset_omni_circuit_breaker_for_tests()
 
 
-def _cfg() -> OmniConfig:
+def _cfg(base_url: str = "https://x/v1") -> OmniConfig:
     return OmniConfig(
         model="m",
-        base_url="https://x/v1",
+        base_url=base_url,
         api_key="sk-1",
         temperature=0,
         top_p=1,
@@ -95,6 +110,28 @@ async def test_call_omni_success_records_success(monkeypatch):
     )
     await omni_client.call_omni(_payload(), _cfg())
     assert get_omni_circuit_breaker().snapshot().state == "ok"
+
+
+async def test_call_omni_null_usage_still_records(monkeypatch):
+    """provider 把 usage 显式返回 null 时，记账仍要拿到 dict。
+
+    dict.get(k, default) 的默认值只在**键缺席**时生效；键在而值为 null 时返回 None，
+    而落库那侧第一行就是无保护的 usage.get(...)，传 None 会抛 AttributeError、被
+    fire_record 兜成 warning，整条用量事件静默丢失。把 `or {}` 去掉这条会红。
+    """
+    seen: list[object] = []
+    monkeypatch.setattr(
+        omni_client,
+        "fire_record",
+        lambda model, base_url, usage, type: seen.append(usage),
+    )
+    monkeypatch.setattr(
+        omni_client.httpx,
+        "AsyncClient",
+        _fake_async_client(resp=_FakeResp(200, {"choices": [], "usage": None})),
+    )
+    await omni_client.call_omni(_payload(), _cfg())
+    assert seen == [{}], f"记账收到的不是空 dict，而是 {seen!r}"
 
 
 async def test_call_omni_single_401_does_not_open(monkeypatch):
@@ -210,6 +247,39 @@ async def test_resolve_live_config_no_change_keeps_state(monkeypatch):
     omni_client.resolve_live_omni_config(base)
     # settings 里的 api_key 和 base.api_key 一样(sk-1),triple 不变
     assert cb.snapshot().state == "error"
+
+
+async def test_resolve_live_config_strips_trailing_slash(monkeypatch):
+    """生效配置里的地址要去尾斜杠——它是模型身份的一半，在这里定形。
+
+    写进 settings.model.omni 的来路有四条(web PUT / activate / CLI set / env 或直接改
+    配置文件)，只有 web PUT 那条在落盘时归一化过；激活是把档案里的值逐字段原样拷过去的，
+    而升级前存下的档案完全可能带着尾斜杠。这一处是四条来路的必经收口，也是唯一决定「这次
+    调用记到哪个身份名下」的地方：漏掉的话同一个 endpoint 裂成两个身份，用量对半分、
+    「只清这一项」只清得掉一半，且两者在日表里是独立主键行、滚存后合不回来——全程无报错。
+    """
+    from miloco.config import reset_settings
+
+    reset_settings()
+    if hasattr(omni_client._maybe_reset_breaker_on_config_change, "_last_triple"):
+        del omni_client._maybe_reset_breaker_on_config_change._last_triple
+
+    class _Mo:
+        model = "m1"
+        base_url = "https://x/v1/"  # 激活 / CLI / env / 存量配置都可能是这个形态
+        api_key = "sk-1"
+
+    class _M:
+        omni = _Mo()
+
+    class _S:
+        model = _M()
+
+    monkeypatch.setattr("miloco.config.get_settings", lambda: _S(), raising=True)
+    out = omni_client.resolve_live_omni_config(
+        OmniConfig(model="m1", base_url="https://x/v1", api_key="sk-1")
+    )
+    assert out.base_url == "https://x/v1", f"生效配置没去尾斜杠: {out.base_url!r}"
 
 
 async def test_resolve_live_config_change_resets_breaker(monkeypatch):
@@ -361,3 +431,69 @@ async def test_call_omni_forced_stream_500_records_failure(monkeypatch):
     snap = get_omni_circuit_breaker().snapshot()
     assert snap.state == "warn"
     assert snap.code == "http_error"
+
+
+# ─── call_omni 出站 headers(默认非流式路径的传输层不变量) ──────────────────
+#
+# 不变量:call_omni 默认路径(``body["stream"]`` falsy → 走 client.post)真正发到线上的
+# headers,必须逐项等于 build_request_headers() 的产物。
+#
+# 为什么必须在传输层测:omni_client 没有共享的 post() 辅助、没有 session 对象、没有
+# client 工厂 —— httpx.AsyncClient 在 call_omni 内部就地构造,headers 也就地拼好后
+# 直接传给 client.post。所以「运行时到底发了什么」只能在 client.post 的入参上看,
+# 测纯函数 build_request_headers() 只能证明它自己对自己是对的。
+#
+# 覆盖的是默认运行时路径(realtime / 感知循环驱动),而不是 forced-stream 分支:
+# forced-stream 由 ``body.get("stream", False)`` 决定并转给 _collect_stream_response,
+# 与这里的非流式出口是两个不同的调用点,单独钉住(本文件后半段已有forced-stream 熔断
+# 用例)。非流式是绝大多数 adapter 的常态,也是 OpenCode Go 拒收缺 session 头时最先
+# 崩的那条路。
+
+
+async def test_call_omni_sends_same_headers_as_build_request_headers(monkeypatch):
+    """OpenCode Go endpoint:出站 headers 逐项等于 build_request_headers() 的产物。
+
+    断言**整份字典相等**而不是「含有 x-opencode-session」:子集断言只能守住「少发」,
+    守不住「多发」—— 运行时给所有 endpoint 都塞一个 session 头、或多带一个
+    Content-Type,子集断言一样绿。而这两种漂移都是真实的:多发会让非 OpenCode Go
+    endpoint 带上本不该有的路由头,少发则直接被 OpenCode Go 拒收。相等两头都守。
+    """
+    sent: list[dict] = []
+    monkeypatch.setattr(
+        omni_client.httpx,
+        "AsyncClient",
+        _fake_async_client(resp=_FakeResp(200, {"choices": [], "usage": {}}), sent=sent),
+    )
+    base_url = "https://opencode.ai/zen/go/v1"
+
+    await omni_client.call_omni(_payload(), _cfg(base_url=base_url))
+
+    assert len(sent) == 1
+    runtime_headers = build_request_headers(get_adapter("m"), base_url, "sk-1")
+    assert sent[0]["headers"] == runtime_headers
+    # 显式钉住本 case 的意义:缺这一头 OpenCode Go 即拒收,「相等」的前提是它真在里面。
+    assert sent[0]["headers"]["x-opencode-session"].startswith("ses_")
+
+
+async def test_call_omni_omits_session_header_for_non_opencode_endpoint(monkeypatch):
+    """非 OpenCode Go endpoint:出站不含 x-opencode-session。
+
+    反向守「别顺手给所有 endpoint 都加头」—— 正确形态是「跟 build_request_headers
+    一样」,不是「总是带 session」。运行时对普通 endpoint 不发,发了就是把进程级
+    路由 ID 泄给无关第三方,也是新的分叉。
+    """
+    sent: list[dict] = []
+    monkeypatch.setattr(
+        omni_client.httpx,
+        "AsyncClient",
+        _fake_async_client(resp=_FakeResp(200, {"choices": [], "usage": {}}), sent=sent),
+    )
+    base_url = "https://api.openai.com/v1"
+
+    await omni_client.call_omni(_payload(), _cfg(base_url=base_url))
+
+    assert len(sent) == 1
+    assert "x-opencode-session" not in sent[0]["headers"]
+    assert sent[0]["headers"] == build_request_headers(
+        get_adapter("m"), base_url, "sk-1"
+    )

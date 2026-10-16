@@ -77,9 +77,16 @@ def _make_client_stub():
     c.deinit_async = AsyncMock()
     c.register_user_bind_callback = MagicMock()
     c.register_mips_connect_callback = MagicMock()
+    c.register_subscription_reset_callback = MagicMock()
     c.get_devices_async = AsyncMock(return_value={})
     c.get_cameras_async = AsyncMock(return_value={})
     c.get_manual_scenes_async = AsyncMock(return_value={})
+    # bind path subscribes the device's per-device topics (state + meta),
+    # unbind path unsubscribes them; the stub must be awaitable for both.
+    c.sub_device_state_async = AsyncMock()
+    c.sub_device_meta_async = AsyncMock()
+    c.unsub_device_state_async = AsyncMock()
+    c.unsub_device_meta_async = AsyncMock()
     return c
 
 
@@ -94,7 +101,8 @@ def proxy_env(monkeypatch):
     monkeypatch.setattr(bl_module, "BIND_DEBOUNCE_SEC", 0.05)
     # The greeting goes through DeviceWelcomeService → dispatch_event.
     monkeypatch.setattr(
-        ws_module, "dispatch_event",
+        ws_module,
+        "dispatch_event",
         AsyncMock(return_value=True),
     )
 
@@ -168,6 +176,199 @@ async def test_init_after_deinit_rebuilds_bind_listener(proxy_env):
     # dispatch_event("bind", [msg_text], builder) — items list is arg[1].
     sent = ws_module.dispatch_event.await_args.args[1][0]
     assert did in sent and "新台灯" in sent
+
+    await p.deinit()
+
+
+@pytest.mark.asyncio
+async def test_bind_event_subscribes_device(proxy_env):
+    """A bind push means the device is back in the account: the handler must
+    subscribe state+meta immediately (recorded into the intent mirrors on SDK
+    success) so the trailing refresh_devices reconcile no-ops instead of
+    re-issuing — and a rebind whose broker subscription survived is an
+    idempotent no-op at the SDK."""
+    p, client = proxy_env
+
+    await p.init()
+    # 原地填充、不换集合对象,保住"记账集合只能原地改"的回归检测。
+    state_set = p._subscribed_device_state_dids
+    meta_set = p._subscribed_meta_dids
+    state_set.clear()
+    meta_set.clear()
+
+    await p._on_user_bind_event(
+        MIoTDeviceBindEvent(uid="u", event="bind", did="did-1", raw={"did": "did-1"})
+    )
+
+    assert p._subscribed_device_state_dids == {"did-1"}
+    assert p._subscribed_meta_dids == {"did-1"}
+    assert p._subscribed_device_state_dids is state_set
+    assert p._subscribed_meta_dids is meta_set
+    client.sub_device_state_async.assert_awaited_once_with("did-1")
+    client.sub_device_meta_async.assert_awaited_once_with("did-1")
+
+    await p.deinit()
+
+
+@pytest.mark.asyncio
+async def test_unbind_event_forgets_device_subscriptions(proxy_env):
+    """An unbind push means the device left the account: the handler must drop
+    the did from both intent mirrors (in-place) and unsubscribe (best-effort,
+    outside the lock) — the trailing refresh_devices reconcile then no-ops."""
+    p, client = proxy_env
+
+    await p.init()
+    # Simulate a device already subscribed, then unbound.
+    state_set = p._subscribed_device_state_dids
+    meta_set = p._subscribed_meta_dids
+    state_set.clear()
+    state_set.update({"did-1"})
+    meta_set.clear()
+    meta_set.update({"did-1"})
+
+    await p._on_user_bind_event(
+        MIoTDeviceBindEvent(uid="u", event="unbind", did="did-1", raw={"did": "did-1"})
+    )
+
+    assert p._subscribed_device_state_dids == set()
+    assert p._subscribed_meta_dids == set()
+    assert p._subscribed_device_state_dids is state_set
+    assert p._subscribed_meta_dids is meta_set
+    client.unsub_device_state_async.assert_awaited_once_with("did-1")
+    client.unsub_device_meta_async.assert_awaited_once_with("did-1")
+
+    await p.deinit()
+
+
+@pytest.mark.asyncio
+async def test_subscription_reset_rebuilds_intent_sets(proxy_env):
+    """When the SDK rebuilds its mips instance it calls the reset callback
+    AFTER replay with the post-replay tracked sets; the proxy must rebuild its
+    intent mirrors as faithful copies — so a replay-failed entity (dropped
+    from the SDK set) is retried next reconcile, and a departed entity that
+    replay re-subscribed stays removable."""
+    p, client = proxy_env
+    await p.init()
+    # init() registered the callback — capture it.
+    reset_cb = client.register_subscription_reset_callback.call_args.args[0]
+    assert reset_cb.__self__ is p
+    assert reset_cb.__func__.__name__ == "_on_subscription_reset"
+
+    # 原地填充、不换集合对象,保住"记账集合只能原地改"的回归检测。
+    meta_set = p._subscribed_meta_dids
+    state_set = p._subscribed_device_state_dids
+    scene_set = p._subscribed_scene_home_ids
+    props_set = p._subscribed_props_dids
+    meta_set.clear()
+    meta_set.update({"stale-1"})
+    state_set.clear()
+    state_set.update({"stale-1"})
+    scene_set.clear()
+    scene_set.update({"stale-home"})
+    props_set.clear()
+    props_set.update({"stale-1"})
+
+    await reset_cb({"did-1"}, {"did-1"}, {"home-9"}, {"did-2"})
+
+    assert p._subscribed_meta_dids == {"did-1"}
+    assert p._subscribed_device_state_dids == {"did-1"}
+    assert p._subscribed_scene_home_ids == {"home-9"}
+    assert p._subscribed_props_dids == {"did-2"}
+    # 原地改写不变式的真正断言:重建必须原地改,不能换新集合对象。
+    assert p._subscribed_meta_dids is meta_set
+    assert p._subscribed_device_state_dids is state_set
+    assert p._subscribed_scene_home_ids is scene_set
+    assert p._subscribed_props_dids is props_set
+
+    await p.deinit()
+
+
+@pytest.mark.asyncio
+async def test_init_registers_the_props_push_callback(proxy_env):
+    """漏了这一行，属性推送一条都到不了本层的消费方，且到处都不报错。"""
+    p, client = proxy_env
+    await p.init()
+
+    cb = client.register_device_props_changed_callback.call_args.args[0]
+    assert cb.__self__ is p
+    assert cb.__func__.__name__ == "_on_device_props_changed_event"
+
+    await p.deinit()
+
+
+@pytest.mark.asyncio
+async def test_init_registers_the_central_hub_dev_list_callback(proxy_env):
+    """中枢那份回调由 SDK 持有（它要据此搬属性推送的来源）再扇出来，所以本层
+    必须注册成它的下游 —— 漏了这一行，网关上下线不会触发重拉，设备表停在旧集。
+
+    注册不依赖中枢是否已建好：SDK 在触发时才读这个槽位，而中枢是在 mips 起来
+    之后才懒建的，构造时去 `getattr(client, "central_hub")` 只会拿到 None。
+    """
+    p, client = proxy_env
+    await p.init()
+
+    cb = client.register_dev_list_changed_callback.call_args.args[0]
+    assert cb.__self__ is p
+    assert cb.__func__.__name__ == "_on_central_hub_dev_list_changed"
+
+    await p.deinit()
+
+
+@pytest.mark.asyncio
+async def test_bind_event_forwards_despite_sub_failure(proxy_env):
+    """A failed bind-triggered subscribe must only log — it must NOT abort
+    delivery to _bind_listener.on_event, or this bind's debounce/welcome
+    would never fire. The mirror stays untracked so the trailing
+    refresh_devices reconcile retries the subscribe."""
+    p, client = proxy_env
+    await p.init()
+    client.sub_device_state_async = AsyncMock(side_effect=RuntimeError("mqtt blip"))
+    client.sub_device_meta_async = AsyncMock(side_effect=RuntimeError("mqtt blip"))
+
+    await p._on_user_bind_event(
+        MIoTDeviceBindEvent(uid="u", event="bind", did="did-1", raw={"did": "did-1"})
+    )
+
+    # Both subs attempted despite raising; local bookkeeping NOT recorded
+    # (self-healing: next refresh_devices treats did-1 as to-be-subscribed).
+    client.sub_device_state_async.assert_awaited_once_with("did-1")
+    client.sub_device_meta_async.assert_awaited_once_with("did-1")
+    assert p._subscribed_device_state_dids == set()
+    assert p._subscribed_meta_dids == set()
+    # The bind debounce timer for did-1 was armed — proves on_event ran.
+    assert "did-1" in p._bind_listener._timers
+
+    await p.deinit()
+
+
+@pytest.mark.asyncio
+async def test_unbind_event_forwards_despite_unsub_failure(proxy_env):
+    """A failed unbind-triggered unsubscribe must only log — it must NOT abort
+    delivery to _bind_listener.on_event (which arms the trailing refresh /
+    final-state detection). Local bookkeeping is still cleared: the mirror
+    no longer claims the did, so nothing re-subscribes a departed device."""
+    p, client = proxy_env
+    await p.init()
+    state_set = p._subscribed_device_state_dids
+    meta_set = p._subscribed_meta_dids
+    state_set.clear()
+    state_set.update({"did-1"})
+    meta_set.clear()
+    meta_set.update({"did-1"})
+    client.unsub_device_state_async = AsyncMock(side_effect=RuntimeError("mqtt blip"))
+    client.unsub_device_meta_async = AsyncMock(side_effect=RuntimeError("mqtt blip"))
+
+    await p._on_user_bind_event(
+        MIoTDeviceBindEvent(uid="u", event="unbind", did="did-1", raw={"did": "did-1"})
+    )
+
+    # Both unsubs attempted despite raising; local bookkeeping still cleared.
+    client.unsub_device_state_async.assert_awaited_once_with("did-1")
+    client.unsub_device_meta_async.assert_awaited_once_with("did-1")
+    assert p._subscribed_device_state_dids == set()
+    assert p._subscribed_meta_dids == set()
+    # The bind debounce timer for did-1 was armed — proves on_event ran.
+    assert "did-1" in p._bind_listener._timers
 
     await p.deinit()
 

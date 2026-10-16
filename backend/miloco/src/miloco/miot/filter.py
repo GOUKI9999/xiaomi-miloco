@@ -9,6 +9,9 @@
 
 另有 ``CAMERA_PROMPT_MAP_KEY``（每摄像头自定义「感知须知」prompt，did→文本）——
 唯一的 map 语义 key（JSON object，非集合），供逐设备注入 omni 场景指导。
+
+``CAMERA_CROP_DENY_LIST_KEY``（已关闭 Smart Crop 的相机集合，deny-list / 默认开）同为
+JSON array，但键口径是**合成 did**（逐路，同 prompt），与按整台走的启停 / 拾音不同。
 """
 
 from __future__ import annotations
@@ -17,11 +20,41 @@ import json
 import logging
 from typing import TypeVar
 
+from miot.types import MIoTCameraStatus
+
 from miloco.database.kv_repo import KVRepo, ScopeConfigKeys
 
 logger = logging.getLogger(__name__)
 
 T = TypeVar("T")
+
+
+def is_camera_connected(info: object) -> bool:
+    """相机是否有活着的拉流会话（miss 直连/中继已连上）。
+
+    连上本身就是「局域网可达」的铁证——同网段 direct-connect 会掐死相机的 OTU
+    保活，令 ``lan_online`` 掉 ``False``，但此时相机显然可达。故各处可达判据一律
+    用 ``lan_online or is_camera_connected(info)``，避免正在拉流的相机被误判不可达
+    而拆流 / 拒绝开启。
+
+    优先读 ``MIoTCameraInfo.connected`` 属性——判据单一来源，不存在需要跟着
+    同步的第二份枚举复刻；只有传入对象**没有**该属性（非 ``MIoTCameraInfo``）
+    时才回退到 ``getattr`` 判 ``camera_status``，缺失即返回 ``False``。
+
+    ⚠️ **给非相机功能的提示**：``lan_online`` 目前只在相机路径上被当作决策依据。
+    LAN 层在「所有**已启用**相机都已连上」时会把全局广播发现**降频**到
+    ``MIoTLan.OT_PROBE_INTERVAL_MAX``（45s，见 ``miot/lan.py::__scan_devices``），
+    但**绝不停表**：45s < ``_MIoTLanDevice._KA_TIMEOUT``（100s），集合外的设备
+    （未启用相机、非相机设备）的 ``lan_online`` 仍被持续刷新。若要给非相机设备
+    加以 ``lan_online`` 为硬门的逻辑，只需知道最坏情况下在线态有约 45s 的刷新
+    延迟即可，不会在「所有相机都在拉流」这个毫不相关的条件下静默失效。
+    """
+    # 优先走 MIoTCameraInfo.connected 属性——判据单一来源，避免两处实现分裂；
+    # 非 MIoTCameraInfo 对象（无 connected 属性）回退到 getattr 判 camera_status。
+    try:
+        return bool(info.connected)  # type: ignore[union-attr]
+    except AttributeError:
+        return getattr(info, "camera_status", None) == MIoTCameraStatus.CONNECTED
 
 # 同时投喂给 miloco 感知的摄像头数量上限（前端展示上限也以此为唯一来源，经
 # /api/miot/status 下发）。用户主动 enable 超限直接报错（service.toggle_camera 校验）。
@@ -84,6 +117,20 @@ def voice_allowed_camera_dids(kv_repo: KVRepo) -> set[str]:
     改开关即时生效、不重启感知引擎。读 KV 失败时按空集处理（fail-closed）。
     """
     return set(_load_list(kv_repo, ScopeConfigKeys.CAMERA_VOICE_ALLOW_LIST_KEY))
+
+
+def crop_denied_camera_dids(kv_repo: KVRepo) -> set[str]:
+    """已**关闭** Smart Crop 的相机 did 集合（deny-list / 默认开）；空表示全部机位都开。
+
+    键是**合成 did**（``did:ch{n}``，多通道逐路），同 ``camera_prompts``——"该不该裁"取决于
+    该路镜头的视野，与按整台走的启停 / 拾音不同口径。
+
+    与全局双闸（``perception.engine.crop_enhance.enabled`` / ``user_enabled``）**相与**：
+    全局关则整个能力不可用、本集无意义；全局开时才逐机位看本集。引擎每感知窗实时读取，
+    改开关下一窗即生效、不重启感知引擎。读 KV 失败时按空集处理（fail-open = 继续裁：本项
+    只影响视频编码构图、不涉隐私，与 ``voice_allowed_camera_dids`` 的 fail-closed 相反）。
+    """
+    return set(_load_list(kv_repo, ScopeConfigKeys.CAMERA_CROP_DENY_LIST_KEY))
 
 
 def is_home_allowed(kv_repo: KVRepo, home_id: str | None) -> bool:
@@ -155,7 +202,9 @@ def select_active_camera_dids(
         if not is_home_allowed(kv_repo, getattr(info, "home_id", None)):
             continue
         online = bool(getattr(info, "online", False))
-        lan = bool(getattr(info, "lan_online", False))
+        # 已连上的相机即视为局域网可达：直连会掐死同网段 OTU 保活令 lan_online 掉
+        # False，但连都连上了、可达是显然的，不能因此把正在拉流的相机踢出活跃集拆流。
+        lan = bool(getattr(info, "lan_online", False)) or is_camera_connected(info)
         connectable = (online and lan) if require_lan else online
         if online_only and not connectable:
             continue
@@ -280,6 +329,19 @@ def set_cameras_voice_in_use(
     """批量切换相机拾音启用状态。去重后一次性写入 KV。拾音无投喂上限，不设 cap。"""
     return _toggle_members(
         kv_repo, ScopeConfigKeys.CAMERA_VOICE_ALLOW_LIST_KEY, dids, include=in_use
+    )
+
+
+def set_cameras_crop_in_use(
+    kv_repo: KVRepo, dids: list[str], in_use: bool
+) -> tuple[list[str], bool]:
+    """批量切换相机 Smart Crop 启用状态。``in_use=False`` 即加入**关闭集**（deny-list，
+    故 ``include=not in_use``，同 ``set_camera_in_use``）。``dids`` 为合成 did。
+
+    去重后一次性写入 KV。裁切无投喂上限，不设 cap。
+    """
+    return _toggle_members(
+        kv_repo, ScopeConfigKeys.CAMERA_CROP_DENY_LIST_KEY, dids, include=not in_use
     )
 
 

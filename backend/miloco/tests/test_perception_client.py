@@ -92,7 +92,12 @@ async def test_matched_rules_callback_runs_on_main_loop(proxy):
 
 
 async def test_early_matched_rules_meta_passed_to_update_state(proxy):
-    """早出路径：MatchedRule 上的 room_name / source_device_ids 透传给 update_state。"""
+    """早出路径：MatchedRule 上的 room_name / source_device_ids 透传给 update_state。
+
+    一并钉住本 cycle 的事件 id：早送这一刻是进入边沿真正 fire 动作的那条路（终态主循环
+    见到同一个 pair 会跳过），它拿到的 id 必须与 impl 交回给终态的那个**同一个值**——
+    两边不一致的话，台账会写下一个没有宿主行的 id。
+    """
 
     main_loop = asyncio.get_running_loop()
     seen: list[dict] = []
@@ -114,29 +119,37 @@ async def test_early_matched_rules_meta_passed_to_update_state(proxy):
     fake_mgr.rule_service.update_state = capture
 
     executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="test-infer")
+    ret: list = []
     try:
         with patch("miloco.manager.get_manager", return_value=fake_mgr):
             await main_loop.run_in_executor(
                 executor,
-                lambda: asyncio.run(
+                lambda: ret.append(asyncio.run(
                     proxy._realtime_perceive_impl(
                         _stub_snapshot(), [], 0, 0.0, main_loop, [],
                     )
-                ),
+                )),
             )
     finally:
         executor.shutdown(wait=True)
 
-    assert seen == [{"trigger_room": "客厅", "trigger_dids": ["cam-001"], "caption": "", "device_name": "小米摄像机"}]
+    _, _, _, _, cycle_event_id = ret[0]
+    # id 必须是真 mint 出来的：留空的话台账写空、落库那边另 mint 一个，两处对不上,
+    # 而上面那条「两边同一个值」的断言在 None == None 下照样绿。
+    assert cycle_event_id
+    assert seen == [{
+        "trigger_room": "客厅", "trigger_dids": ["cam-001"], "caption": "",
+        "device_name": "小米摄像机", "trigger_event_id": cycle_event_id,
+    }]
 
 
 async def test_early_send_registers_pair_even_if_update_state_raises(proxy):
     """早送登记必须无条件、排在 update_state 之前（守住 _on_early_matched_rules 那条 invariant）。
 
     early_sent_rule_ids 除了去重，还兼职「抑制终态推退」——pair 并进 matched_pairs 后，
-    终态「未命中喂 False」循环才会放过它。若 update_state 抛异常（生产上 = on_target 规则
-    _schedule_target_timer_if_needed 里那处裸 DB 读，被 pipeline 整窗保护
-    吞掉）时 pair 漏登记，那条循环就会给刚 ENTER 真 fire 的 source 喂一帧 False、置起
+    终态「未命中喂 False」循环才会放过它。若 update_state 抛异常（生产上 = 条件层求值里
+    的裸 DB 读，被 pipeline 整窗保护吞掉）时 pair 漏登记，那条循环就会给刚 ENTER 真
+    fire 的 source 喂一帧 False、置起
     pending_exit、白吃掉单帧抗抖预算（下次真离开只需一帧就确认 EXIT）。这条 invariant 曾被
     「把登记挪到 update_state 之后」这一个改动静默破坏一整轮而全量测试无感——本用例就是针对
     那种改法的哨兵：把 _on_early_matched_rules 里 `early_sent_rule_ids[...] = None` 那行删掉
@@ -166,7 +179,7 @@ async def test_early_send_registers_pair_even_if_update_state_raises(proxy):
     executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="test-infer")
     try:
         with patch("miloco.manager.get_manager", return_value=fake_mgr):
-            _, _, early_sent_rule_ids, _ = await main_loop.run_in_executor(
+            _, _, early_sent_rule_ids, _, _ = await main_loop.run_in_executor(
                 executor,
                 lambda: asyncio.run(
                     proxy._realtime_perceive_impl(
@@ -187,7 +200,11 @@ async def test_early_send_registers_pair_even_if_update_state_raises(proxy):
 
 
 async def test_final_matched_rules_meta_passed_to_update_state(proxy):
-    """全量路径（handle_realtime_perception_result）：meta 同样透传。"""
+    """全量路径（handle_realtime_perception_result）：meta 同样透传。
+
+    cycle_event_id 一并钉住：传了就要原样到 update_state，不传（老调用方）就得是 None
+    ——「不传」这条不是顺带一提，它决定直接调用本方法的既有代码行为不变。
+    """
     seen: list[dict] = []
 
     async def capture(rule_id, source, value, reason=None, **kwargs):
@@ -204,6 +221,7 @@ async def test_final_matched_rules_meta_passed_to_update_state(proxy):
     )
     with patch("miloco.manager.get_manager", return_value=fake_mgr):
         await proxy.handle_realtime_perception_result(result)
+        await proxy.handle_realtime_perception_result(result, cycle_event_id="ev-7")
 
     assert seen == [
         {
@@ -212,7 +230,16 @@ async def test_final_matched_rules_meta_passed_to_update_state(proxy):
             "caption": "",
             "device_name": "",
             "cycle_source_states": {"cam-002": True},
-        }
+            "trigger_event_id": None,
+        },
+        {
+            "trigger_room": "卧室",
+            "trigger_dids": ["cam-002"],
+            "caption": "",
+            "device_name": "",
+            "cycle_source_states": {"cam-002": True},
+            "trigger_event_id": "ev-7",
+        },
     ]
 
 
@@ -354,6 +381,43 @@ async def test_handle_realtime_sends_all_when_no_early_sent(proxy):
 
     disp.assert_awaited_once()
     assert [s.id for s in disp.await_args.args[1]] == [1]
+
+
+async def test_false_push_carries_cycle_event_id(proxy):
+    """喂 False 的那条路径也带本 cycle 的事件 id。
+
+    这条路看起来「只是推状态、不会触发动作」,其实不是:duration 规则的达标 fire
+    由 _evaluate_duration 在每次 update_state 里评,窗口填满的那一刻可以正好落在
+    确认离开的周期(ratio<1 时窗口末尾的 0 被容忍后仍可达标)。那次真派发若不把
+    本轮事件 id 记进 rule state,退出支就挂不回任何一条事件行。
+    """
+    from unittest.mock import AsyncMock
+
+    # 本 batch 下发过 rule_unmatched,但它没命中 → 走喂 False 的循环。
+    result = RealtimePerceptionResult(
+        matched_rules=[],
+        device_rule_map={"cam_A": ["rule_unmatched"]},
+    )
+
+    seen: list[dict] = []
+
+    async def _capture_update(*a, **k):
+        seen.append(k)
+
+    fake_mgr = MagicMock()
+    fake_mgr.rule_service.update_state = _capture_update
+    fake_mgr.rule_service.get_enabled_rule_ids = MagicMock(
+        return_value=["rule_unmatched"]
+    )
+
+    with patch("miloco.manager.get_manager", return_value=fake_mgr), \
+         patch("miloco.perception.client.dispatch_event", new_callable=AsyncMock):
+        await proxy.handle_realtime_perception_result(
+            result, cycle_event_id="ev-cycle-9"
+        )
+
+    assert seen, "未命中且已下发过的 (rule, did) 应当喂到 update_state"
+    assert [k.get("trigger_event_id") for k in seen] == ["ev-cycle-9"]
 
 
 # ─── min_suggestion_urgency 过滤(dispatch→agent 通路)─────────────────────────
@@ -502,7 +566,7 @@ async def test_early_suggestions_urgency_filter(proxy):
                side_effect=_fake_publish), \
          patch("miloco.perception.client.get_settings",
                return_value=_urgency_settings("medium")):
-        _, _, _, early_ids = await proxy._realtime_perceive_impl(
+        _, _, _, early_ids, _cycle_event_id = await proxy._realtime_perceive_impl(
             _stub_snapshot(), [], 0, 0.0, main_loop, [],
         )
 
@@ -811,3 +875,66 @@ async def test_persist_mixed_window_excludes_voice_disabled_transcript():
     assert "开灯" not in kwargs["payload_json"]
     # 原 result 不被原地改
     assert len(result.speeches) == 1
+
+
+async def test_window_duration_survives_engine_dropping_snapshots(proxy):
+    """引擎原地剔空 batch.snapshots 后，窗口时长仍是真实值、不落 0。
+
+    engine/api.py 的 _drop_empty_snapshots 会原地改 batch.snapshots（沿用
+    _strip_unauthorized_voice_audio 的惯例）。窗口时长若在引擎返回之后才算，整批被剔空
+    时 max(..., default=0.0) 会落 0 → [perf] 打 RTF=0.000、traces_cycle 的 rtf 列全走
+    NULL 分支，正好废掉「整批剔空仍留一行 cycle trace」的意义。
+    """
+    from miloco.perception.types import DeviceSnapshot, PerceptionDevice
+
+    batch = BatchedSnapshot(
+        snapshots=[
+            DeviceSnapshot(
+                device=PerceptionDevice(did="cam", name="cam", device_type="camera"),
+                start_timestamp=1000.0,
+                end_timestamp=5000.0,
+            )
+        ],
+        captured_at=0.0,
+    )
+
+    async def engine_realtime(b, *args, **kwargs):
+        b.snapshots[:] = []  # 模拟 _drop_empty_snapshots 整批剔空
+        return RealtimePerceptionResult(skipped=True)
+
+    proxy.perception_engine.realtime_perceive = engine_realtime
+
+    result, *_ = await proxy._realtime_perceive_impl(
+        batch, [], 0, 0.0, asyncio.get_running_loop(), [],
+    )
+
+    assert result is not None
+    assert result.timing["_window_duration_ms"] == 4000.0
+
+
+async def test_realtime_log_excludes_timing(proxy, caplog):
+    """realtime_perceive 日志那份 JSON 不带 timing:per-device key 按相机数展开,
+    正式消费方是 observability traces,日志里只是副本。"""
+    import logging
+
+    from miloco.perception.types import CaptionEntry
+
+    async def engine_realtime(*args, **kwargs):
+        return RealtimePerceptionResult(
+            skipped=False,
+            caption=[CaptionEntry(description="厨房区域空无一人", room_name="厨房")],
+            timing={"厨房/gate_video_1184458598_ms": 7.46},
+        )
+
+    proxy.perception_engine.realtime_perceive = engine_realtime
+
+    with caplog.at_level(logging.INFO, logger="miloco.perception.client"):
+        await proxy._realtime_perceive_impl(
+            _stub_snapshot(), [], 0, 0.0, asyncio.get_running_loop(), [],
+        )
+
+    logged = [r.getMessage() for r in caplog.records if "realtime_perceive:" in r.getMessage()]
+    assert len(logged) == 1
+    assert "gate_video_1184458598_ms" not in logged[0]
+    assert '"timing"' not in logged[0]
+    assert "厨房区域空无一人" in logged[0]

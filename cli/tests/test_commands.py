@@ -244,7 +244,7 @@ def test_config_set_multi_pair_atomic(runner, isolated_config):
             "config",
             "set",
             "model.omni.model",
-            "xiaomi/mimo-v2.5",
+            "mimo-v2.6-flash",
             "model.omni.base_url",
             "https://api.xiaomimimo.com/v1",
             "model.omni.api_key",
@@ -264,7 +264,7 @@ def test_config_set_multi_pair_atomic(runner, isolated_config):
     from miloco_cli.config import load_config
 
     cfg = load_config()
-    assert cfg["model"]["omni"]["model"] == "xiaomi/mimo-v2.5"
+    assert cfg["model"]["omni"]["model"] == "mimo-v2.6-flash"
     assert cfg["model"]["omni"]["base_url"] == "https://api.xiaomimimo.com/v1"
     assert cfg["model"]["omni"]["api_key"] == "sk-xxxxx"
 
@@ -2067,6 +2067,49 @@ def test_scope_camera_disable(runner):
     )
 
 
+# ─── scope camera crop-on / crop-off（Smart Crop 逐机位开关，走 crop 端点）────
+
+
+def test_scope_camera_crop_off(runner):
+    """crop-off → PUT crop 端点 crop_in_use=false。"""
+    with patch("miloco_cli.commands.scope.api_put") as mock_put:
+        mock_put.return_value = _SUCCESS
+        result = runner.invoke(cli, ["scope", "camera", "crop-off", "c1"])
+    assert result.exit_code == 0
+    mock_put.assert_called_once_with(
+        "/api/miot/scope/cameras/crop",
+        {"items": [{"did": "c1", "crop_in_use": False}]},
+    )
+
+
+def test_scope_camera_crop_on_batch(runner):
+    """批量 did 语义与 mic-on/off 同款；合成 did 直接透传给 backend 解析。"""
+    with patch("miloco_cli.commands.scope.api_put") as mock_put:
+        mock_put.return_value = _SUCCESS
+        result = runner.invoke(
+            cli, ["scope", "camera", "crop-on", "c1", "dual:ch0", "dual:ch1"]
+        )
+    assert result.exit_code == 0
+    mock_put.assert_called_once_with(
+        "/api/miot/scope/cameras/crop",
+        {
+            "items": [
+                {"did": "c1", "crop_in_use": True},
+                {"did": "dual:ch0", "crop_in_use": True},
+                {"did": "dual:ch1", "crop_in_use": True},
+            ]
+        },
+    )
+
+
+def test_scope_camera_crop_requires_did(runner):
+    """不给 did 直接报用法错（nargs=-1 + required=True）。"""
+    with patch("miloco_cli.commands.scope.api_put") as mock_put:
+        result = runner.invoke(cli, ["scope", "camera", "crop-off"])
+    assert result.exit_code != 0
+    mock_put.assert_not_called()
+
+
 # ─── scope camera mic-on / mic-off（拾音开关，走 voice 端点）──────────────────
 
 
@@ -2498,3 +2541,27 @@ def test_rule_create_scene_action_string_cooldown_no_traceback(runner):
     assert "Traceback" not in combined
     assert "TypeError" not in combined
     assert result.exit_code == 0
+
+
+def test_rule_list_hides_milestone_rules_by_default(runner):
+    """达标规则是服务端维护的派生物，混在列表里会让人以为自己多建了一条。"""
+    with patch("miloco_cli.client.api_get") as mock:
+        mock.return_value = {"code": 0, "data": []}
+        runner.invoke(cli, ["rule", "list"])
+    params = mock.call_args[0][1]
+    assert params is None or "include_milestone" not in params
+
+
+def test_rule_list_show_milestone_asks_for_them(runner):
+    with patch("miloco_cli.client.api_get") as mock:
+        mock.return_value = {"code": 0, "data": []}
+        runner.invoke(cli, ["rule", "list", "--show-milestone"])
+    assert mock.call_args[0][1]["include_milestone"] == "true"
+
+
+def test_rule_create_milestone_command_is_gone(runner):
+    """只留代建一条产出路径 —— 两条就要回答「哪条说了算」。"""
+    result = runner.invoke(
+        cli, ["rule", "create-milestone", "--task-id", "t", "--name", "n"]
+    )
+    assert result.exit_code != 0

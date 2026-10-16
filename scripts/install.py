@@ -12,7 +12,8 @@
 
 Handles the full installation flow:
   Phase 1: Environment check
-  Phase 2: Package install + supervisor (web 静态资源由 miloco wheel 自带)
+  Phase 2: Package install + 平台进程管理器 (Linux supervisord / macOS 签名启动器)
+           (web 静态资源由 miloco wheel 自带)
   Phase 3: Initialize service (engine warm-up; 仅临时拉起，退出时自动 stop)
   Phase 4: Mi Home account binding
   Phase 5: Omni model configuration
@@ -714,9 +715,71 @@ class Installer:
     def _step_install(self) -> None:
         self._step_header("install.title", "install.subtitle")
         # dev 装本地 dist/；release 装下载归档解压后的缓存目录（见 _get_src_dir）。
-        self._install_from_dir(self._get_src_dir(), reinstall=self.dev)
-        self._install_supervisor()
+        src_dir = self._get_src_dir()
+        self._install_from_dir(src_dir, reinstall=self.dev)
+        if sys.platform == "darwin":
+            # macOS 不用 supervisord：装 vendored 签名启动器 miloco.app，backend 由
+            # launchd → 启动器 → python 拉起以绕过 Local Network Privacy
+            # （见 cli service.py 的 launchd 分支）。
+            self._install_launcher(src_dir)
+        else:
+            self._install_supervisor()
         self._configure_python_bin()
+
+    def _install_launcher(self, src_dir: Path) -> None:
+        tgz = _visible(src_dir.glob("miloco-launcher-darwin*.tar.gz"))
+        if not tgz:
+            # macOS 上后端**必须**由签名启动器拉起,否则 launchd 起不来(service start
+            # 侧是硬失败)。安装侧原先只 warn 然后照样报"安装成功",两侧严重度不一致:
+            # 用户拿到一个装完就起不来的部署,还得自己翻日志才知道是漏了 launcher。
+            # release 路径缺包属于发布包不完整 → 硬失败;dev 路径本地 dist 可能就没
+            # 打这个包(开发者另走 sync-to-remote.sh),保持 warn 不打断。
+            if self.dev:
+                self.ui.warn(self.ui.i18n.t("install.launcher_missing"))
+                return
+            self.ui.fail(self.ui.i18n.t("error.launcher_missing"))
+        app_dir = self.miloco_home / "miloco.app"
+        shutil.rmtree(app_dir, ignore_errors=True)
+        self.miloco_home.mkdir(parents=True, exist_ok=True)
+        with tarfile.open(tgz[0]) as tf:
+            _tarfile_extract_safe(tf, self.miloco_home)  # 保留签名字节
+        exe = app_dir / "Contents" / "MacOS" / "miloco"
+        try:
+            exe.chmod(0o755)
+        except OSError:
+            pass
+        self._verify_launcher_signature(app_dir)
+        self.ui.step_ok(self.ui.i18n.t("install.launcher_ok", str(app_dir)))
+        # macOS 用 launchd 启动器绕过 LNP:首次启动后在系统设置里打开本地网络开关。
+        self.ui.warn(self.ui.i18n.t("install.lnp_hint"))
+
+    def _verify_launcher_signature(self, app_dir: Path) -> None:
+        """校验启动器签名完整性——这是整条 LNP 授权链上唯一的护栏。
+
+        启动器的价值完全建立在"字节不变 → 签名摘要不变 → LNP 授权持续有效"上。
+        归档在传输 / 存储 / 某次误提交里被动过一个字节时,签名失效,用户表现为
+        "中枢一直连不上、日志里只有 Errno 65",而系统设置里 miloco 的开关看起来
+        明明是开着的(旧摘要的授权对不上新二进制)——这是整个方案里最难自查的失败
+        模式。dev 部署脚本(sync-to-remote.sh)一直有这道校验,生产安装路径反而没有,
+        所以补上。
+
+        codesign 本身取不到时只 warn 不 fail:那是环境缺陷而非产物损坏,不该把
+        安装拦死;签名明确校验不过才是硬失败。
+        """
+        try:
+            verify = subprocess.run(
+                ["codesign", "-v", str(app_dir)],
+                capture_output=True,
+                text=True,
+            )
+        except (FileNotFoundError, OSError):
+            self.ui.warn(self.ui.i18n.t("install.launcher_verify_skipped"))
+            return
+        if verify.returncode != 0:
+            detail = (verify.stderr or verify.stdout or "").strip()
+            self.ui.fail(
+                self.ui.i18n.t("error.launcher_signature", str(app_dir), detail)
+            )
 
     def _install_from_dir(self, src_dir: Path, *, reinstall: bool) -> None:
         if not src_dir.is_dir():
@@ -1119,7 +1182,7 @@ class Installer:
         )
 
         if provider == self.ui.i18n.t("model.provider_mimo"):
-            model_name = "xiaomi/mimo-v2.5"
+            model_name = "mimo-v2.6-flash"
             base_url = "https://api.xiaomimimo.com/v1"
         else:
             model_name = self.ui.prompt_input(
@@ -1152,7 +1215,7 @@ class Installer:
     def _quick_configure_mimo(self) -> None:
         self.ui.step(self.ui.i18n.t("model.mimo_quick"))
         self._write_model_config(
-            "xiaomi/mimo-v2.5",
+            "mimo-v2.6-flash",
             "https://api.xiaomimimo.com/v1",
             self.omni_api_key or "",
         )
@@ -1291,8 +1354,34 @@ class Installer:
             )
         pkg = str(tgz_files[0])
 
+        # openclaw >= 2026.8 引入 capability consent：带 capabilities 的插件安装需
+        # --accept-capabilities；老版本无此旗标，探测 install --help 决定是否追加。
+        # 判定只看输出文本（与 sync-to-remote.sh 同口径），退出码/超时不参与匹配；
+        # 超时时已捕获的部分输出也参与匹配——help 文本打印出该旗标即代表支持。
+        accept = []
+        timed_out = False
+        try:
+            probe = subprocess.run(
+                ["openclaw", "plugins", "install", "--help"],
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+            probe_out = f"{probe.stdout}\n{probe.stderr}"
+        except subprocess.TimeoutExpired as exc:
+            timed_out = True
+            out = exc.stdout.decode(errors="replace") if isinstance(exc.stdout, bytes) else (exc.stdout or "")
+            err = exc.stderr.decode(errors="replace") if isinstance(exc.stderr, bytes) else (exc.stderr or "")
+            probe_out = f"{out}\n{err}"
+        if "--accept-capabilities" in probe_out:
+            accept = ["--accept-capabilities"]
+        elif timed_out:
+            # 超时且没匹配到旗标：以空 accept 继续安装，8.x 上会被 consent 门拒——
+            # 提示实际原因免得误判成版本号问题。
+            self.ui.warn(self.ui.i18n.t("plugin.capability_probe_timeout"))
+
         self.ui.run_with_spinner(
-            ["openclaw", "plugins", "install", "--force", pkg],
+            ["openclaw", "plugins", "install", "--force", *accept, pkg],
             self.ui.i18n.t("plugin.installing"),
             text=True,
         )
@@ -1359,7 +1448,7 @@ class Installer:
             scripts/ / skills/，只能整段跳，由 POST_INSTALL_SKIP guard 兜底
           - **幂等重跑**：step 5 (config set) / 6 (.env) / 7 (backend 重启) / 8 (enable)
             —— 都是幂等的，重跑一遍保证状态收敛（代价是 step 7 会多一次 stop+3s+start）
-          - **本模式真正补齐**：1.6/1.75/1.9 env 持久化、4.7 ONNX 模型、8.5 disable 残留
+          - **本模式真正补齐**：1.6/1.75/1.9 env 持久化、4.7 感知模型、8.5 disable 残留
             清理、9 版本记录、10 cron reconcile、收尾 banner「hermes gateway restart」提示
 
         install-hermes.sh 由 build.sh::build_hermes 打进 miloco-hermes-plugin tarball，
@@ -1720,8 +1809,39 @@ class Uninstaller:
         self.ui = ui
         self.miloco_home = miloco_home
 
+    # 与 cli/src/miloco_cli/commands/service.py::_LAUNCHD_LABEL 保持一致。
+    LAUNCHD_LABEL = "com.xiaomi.miloco.backend"
+
+    def _remove_launchagent(self) -> None:
+        """macOS：卸载前拆掉 LaunchAgent job 并删 plist。
+
+        plist 是本安装器引入的**持久产物**且 ``RunAtLoad=true``：不清的话
+        miloco.app 随 miloco_home 一起被删（或 uv tool 卸载后 python_bin 失效）之后，
+        下次登录 launchd 仍会按 plist 去 spawn 一个不存在的二进制，持续产生失败记录，
+        直到用户重装到同一个 MILOCO_HOME 才被覆盖。
+        """
+        if _platform.system() != "Darwin":
+            return
+        plist = (
+            Path.home() / "Library" / "LaunchAgents" / f"{self.LAUNCHD_LABEL}.plist"
+        )
+        target = f"gui/{os.getuid()}/{self.LAUNCHD_LABEL}"
+        try:
+            subprocess.run(
+                ["launchctl", "bootout", target], capture_output=True, timeout=20
+            )
+        except Exception:
+            pass  # 没加载 / 无 launchctl：best-effort，删 plist 才是关键一步
+        if plist.exists():
+            try:
+                plist.unlink()
+                self.ui.ok(f"LaunchAgent removed: {plist}")
+            except OSError as e:
+                self.ui.warn(f"remove LaunchAgent plist failed: {e}")
+
     def run(self) -> None:
         self.ui.info(self.ui.i18n.t("uninstall.title"))
+        self._remove_launchagent()
 
         for pkg, msg_key in [
             ("miloco-cli", "uninstall.cli_removed"),
@@ -1780,7 +1900,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--omni-model",
         dest="omni_model",
-        help="Omni model name (default: xiaomi/mimo-v2.5)",
+        help="Omni model name (default: mimo-v2.6-flash)",
     )
     parser.add_argument(
         "--omni-base-url",
