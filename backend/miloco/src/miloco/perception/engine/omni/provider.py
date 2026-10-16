@@ -219,8 +219,10 @@ class KimiAdapter(MiMoAdapter):
     """Moonshot Kimi OpenAI-compatible adapter.
 
     kimi-k2.6 manages its sampling defaults server-side and documents these
-    fields as non-modifiable.  Omit them for that model while preserving the
-    configured values for other Kimi models.
+    fields as non-modifiable.  Omit them for that model and explicitly disable
+    thinking so its response fits the realtime perception token/time budget.
+    Preserve configured sampling values and default thinking for other Kimi
+    models.
     """
 
     def build_video_block(self, video_base64: str, media: LocalMediaInfo) -> dict[str, Any]:
@@ -255,10 +257,9 @@ class KimiAdapter(MiMoAdapter):
         if "kimi-k2.6" in model.lower():
             body.pop("temperature", None)
             body.pop("top_p", None)
-        # Kimi supports `thinking`, but an explicit disabled value selects a
-        # non-thinking mode with different sampling constraints.  Omit it so
-        # Kimi uses its default thinking mode.
-        body.pop("thinking", None)
+            body["thinking"] = {"type": "disabled"}
+        else:
+            body.pop("thinking", None)
         return body
 
 

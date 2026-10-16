@@ -197,7 +197,7 @@ class TestKimiAdapter:
         )
         assert "temperature" not in body
         assert "top_p" not in body
-        assert "thinking" not in body
+        assert body["thinking"] == {"type": "disabled"}
 
     def test_other_kimi_models_passthrough_sampling(self):
         body = self.adapter.build_request_body(
@@ -208,7 +208,7 @@ class TestKimiAdapter:
         assert body["top_p"] == 0.9
         assert "thinking" not in body
 
-    def test_stream_keeps_usage_options_and_strips_thinking(self):
+    def test_stream_keeps_usage_options_and_disables_thinking(self):
         body = self.adapter.build_request_body(
             _MESSAGES, model="kimi-k2.6",
             max_tokens=512, temperature=0.1, top_p=1.0, stream=True,
@@ -217,7 +217,7 @@ class TestKimiAdapter:
         assert body["stream_options"] == {"include_usage": True}
         assert "temperature" not in body
         assert "top_p" not in body
-        assert "thinking" not in body
+        assert body["thinking"] == {"type": "disabled"}
 
 
 class TestKimiAdapterWireShape:
@@ -225,7 +225,7 @@ class TestKimiAdapterWireShape:
 
     上面的 ``TestKimiAdapter`` 只单测 block 构造，本类补上「block 进到messages 后、
     最终发给 Moonshot 的那个 body 长什么样」这一段——block 单测过不代表组包后形状正确
-    （例如MiMo 私有fps 被带进 video_url.url、或thinking 漏删）。
+    （例如MiMo 私有fps 被带进 video_url.url、或 K2.6 未显式关闭思考）。
 
     ⚠️ 能力边界：这些断言证明 **本仓组包逻辑** 产出预期形状（含 data URI 承载方式），
     **不能证明 Moonshot 线上接受该形状**。后者需真实 Moonshot key + 真实视频/音频的
@@ -294,7 +294,7 @@ class TestKimiAdapterWireShape:
         })
         assert "temperature" not in body
         assert "top_p" not in body
-        assert "thinking" not in body
+        assert body["thinking"] == {"type": "disabled"}
         # 多模态走 OpenAI 兼容族 endpoint，不该被转成 Gemini 原生协议
         assert "contents" not in body
         assert body["messages"][1]["content"][1]["type"] == "video_url"
