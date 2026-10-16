@@ -152,11 +152,16 @@
   "platform.title": "选择运行平台",
   "platform.subtitle": "确定要把插件装给哪个 agent 平台",
   "platform.already_set": "已通过 --agent-platform 指定为 %1",
-  "platform.skip_non_interactive": "非交互模式，默认使用 openclaw",
   "platform.ask": "要把 Miloco 装给哪个 Agent 平台？",
   "platform.openclaw_option": "OpenClaw",
   "platform.hermes_option": "Hermes Agent",
   "platform.selected": "已选择：%1",
+  "platform.non_interactive_requires_explicit": "非交互安装必须由调用方明确指定 agent_platform",
+  "platform.explicit_not_detected": "警告：已显式指定 --agent-platform=%1，但未探测到已安装的 runtime；将按显式指定执行。",
+  "platform.explicit_mismatch": "警告：已显式指定 --agent-platform=%1，但探测到 %2；将按显式指定执行。",
+  "platform.detect_failed": "未检测到任何 agent runtime（既无 Hermes 也无 OpenClaw）：\n  - Hermes：已设置 HERMES_HOME、~/.hermes/ 目录存在，或 ~/.config/systemd/user/hermes-gateway.service 文件存在\n  - OpenClaw：~/.openclaw/ 目录存在，或 ~/.config/systemd/user/openclaw-gateway.service 文件存在\n请先安装 Hermes 或 OpenClaw 后重试，或显式指定 --agent-platform=hermes/openclaw",
+  "platform.legacy_home_warning": "警告：检测到旧 Hermes 数据目录 %1，但当前目录为 %2；旧数据不会自动迁移。",
+  "platform.pointer_overwrite_warning": "警告：默认 runtime 指针当前指向 %1，即将改为 %2。多 Agent 平台并存时，请通过 MILOCO_RUNTIME_ENV 为每个平台指定独立 profile。",
 
   "summary.restart_hermes_desc": "重启 Hermes gateway 以加载新插件"
 }
