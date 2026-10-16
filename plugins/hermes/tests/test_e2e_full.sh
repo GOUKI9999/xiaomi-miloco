@@ -11,12 +11,9 @@ warn() { printf "  ${YELLOW}[!]${NC} %s\n" "$1"; WARN=$((WARN+1)); }
 section() { printf "\n── %s ──\n" "$1"; }
 
 HERMES_HOME="${HERMES_HOME:-$HOME/.hermes}"
-RUNTIME_ENV_FILE="${MILOCO_RUNTIME_ENV:-$HOME/.config/miloco/default.env}"
-if [ -z "${MILOCO_HOME:-}" ] && [ -f "$RUNTIME_ENV_FILE" ]; then
-  # shellcheck disable=SC1090
-  . "$RUNTIME_ENV_FILE"
-fi
-MILOCO_HOME="${MILOCO_HOME:-${HERMES_HOME}/miloco}"
+# shellcheck source=_resolve_runtime_env.sh
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/_resolve_runtime_env.sh"
+resolve_miloco_runtime_env
 export HERMES_HOME MILOCO_HOME
 HERMES_BIN="$HOME/.local/bin/hermes"
 MILOCO_CLI="$HOME/.local/bin/miloco-cli"

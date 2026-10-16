@@ -61,16 +61,23 @@ _HTTP_BUFFER_S = 15.0
 _DEFAULT_HERMES_URL = os.environ.get("HERMES_API_URL", "http://127.0.0.1:8642")
 
 
-def _load_api_key() -> str:
-    """拿 API_SERVER_KEY:优先级 env > ~/.hermes/.env > 空。
+def _hermes_home() -> Path:
+    """返回当前 Hermes 数据目录，支持 ``HERMES_HOME=~/...``。"""
+    return Path(
+        os.environ.get("HERMES_HOME") or (Path.home() / ".hermes")
+    ).expanduser()
 
-    backend supervisor 一般不会 source ~/.hermes/.env,所以从这里 fallback 读。
-    install-hermes.sh Step 6 已保证 ~/.hermes/.env::API_SERVER_KEY 存在。
+
+def _load_api_key() -> str:
+    """拿 API_SERVER_KEY:优先级 env > $HERMES_HOME/.env > 空。
+
+    backend supervisor 一般不会 source Hermes 的 .env，所以从这里 fallback 读。
+    install-hermes.sh 已保证 $HERMES_HOME/.env::API_SERVER_KEY 存在。
     """
     key = os.environ.get("API_SERVER_KEY", "").strip()
     if key:
         return key
-    env_path = Path.home() / ".hermes" / ".env"
+    env_path = _hermes_home() / ".env"
     if env_path.is_file():
         try:
             for line in env_path.read_text(encoding="utf-8").splitlines():
@@ -120,8 +127,7 @@ def _resolve_trace_dir() -> Path:
         from .paths import miloco_home
         return miloco_home() / "trace" / "agent"
     except Exception:
-        hermes_home = os.environ.get("HERMES_HOME") or "~/.hermes"
-        return Path(hermes_home).expanduser() / "miloco" / "trace" / "agent"
+        return _hermes_home() / "miloco" / "trace" / "agent"
 
 
 # ---------------------------------------------------------------------------
@@ -145,7 +151,7 @@ def _resolve_owner_session() -> tuple[Optional[str], Optional[str]]:
     channel 对象的 ``id`` 字段即为 session_id。返回 (session_id, platform)。
     均为 None 表示还没绑过 IM。
     """
-    channel_file = Path.home() / ".hermes" / "channel_directory.json"
+    channel_file = _hermes_home() / "channel_directory.json"
     try:
         data = json.loads(channel_file.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):

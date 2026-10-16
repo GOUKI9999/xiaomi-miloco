@@ -68,6 +68,7 @@ def _fake_home(monkeypatch, installer, tmp_path):
     monkeypatch.delenv("MILOCO_AGENT_PLATFORM", raising=False)
     monkeypatch.delenv("MILOCO_RUNTIME_ENV", raising=False)
     monkeypatch.delenv("HERMES_HOME", raising=False)
+    monkeypatch.setattr(installer.shutil, "which", lambda _name: None)
 
 
 def test_detect_prefers_explicit_platform_env(monkeypatch, installer, tmp_path):
@@ -86,6 +87,40 @@ def test_detect_reads_runtime_pointer_before_heuristics(
     pointer.write_text("MILOCO_AGENT_PLATFORM='openclaw'\n", encoding="utf-8")
 
     assert installer._detect_installed_agent_platform() == "openclaw"
+
+
+def test_detect_openclaw_from_home_without_systemd(
+    monkeypatch, installer, tmp_path
+):
+    """macOS/仅 CLI 安装没有 systemd unit 时也能识别 OpenClaw。"""
+    _fake_home(monkeypatch, installer, tmp_path)
+    (tmp_path / ".openclaw").mkdir()
+
+    assert installer._detect_installed_agent_platform() == "openclaw"
+
+
+def test_detect_openclaw_from_cli_without_systemd_or_home(
+    monkeypatch, installer, tmp_path
+):
+    _fake_home(monkeypatch, installer, tmp_path)
+    monkeypatch.setattr(
+        installer.shutil,
+        "which",
+        lambda name: "/usr/local/bin/openclaw" if name == "openclaw" else None,
+    )
+
+    assert installer._detect_installed_agent_platform() == "openclaw"
+
+
+def test_detect_requires_explicit_platform_when_both_runtimes_exist(
+    monkeypatch, installer, tmp_path
+):
+    """旧安装没有指针且双 runtime 并存时，不按目录顺序静默猜平台。"""
+    _fake_home(monkeypatch, installer, tmp_path)
+    (tmp_path / ".hermes").mkdir()
+    (tmp_path / ".openclaw").mkdir()
+
+    assert installer._detect_installed_agent_platform() is None
 
 
 def test_explicit_platform_is_not_rejected_when_detection_is_missing(

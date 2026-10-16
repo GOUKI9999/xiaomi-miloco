@@ -16,12 +16,9 @@ set -uo pipefail
 HERMES_BIN="$(command -v hermes || true)"
 MILOCO_CLI_BIN="$(command -v miloco-cli || true)"
 HERMES_HOME="${HERMES_HOME:-$HOME/.hermes}"
-RUNTIME_ENV_FILE="${MILOCO_RUNTIME_ENV:-$HOME/.config/miloco/default.env}"
-if [ -z "${MILOCO_HOME:-}" ] && [ -f "$RUNTIME_ENV_FILE" ]; then
-  # shellcheck disable=SC1090
-  . "$RUNTIME_ENV_FILE"
-fi
-MILOCO_HOME="${MILOCO_HOME:-${HERMES_HOME}/miloco}"
+# shellcheck source=_resolve_runtime_env.sh
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/_resolve_runtime_env.sh"
+resolve_miloco_runtime_env
 MILOCO_PYTHON_BIN="${MILOCO_PYTHON_BIN:-}"
 if [ -z "$MILOCO_PYTHON_BIN" ] && [ -f "$MILOCO_HOME/config.json" ]; then
   MILOCO_PYTHON_BIN="$(python3 -c "import json; print(json.load(open('$MILOCO_HOME/config.json')).get('server', {}).get('python_bin', ''))" 2>/dev/null || true)"

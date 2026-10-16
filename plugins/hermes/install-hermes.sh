@@ -154,7 +154,7 @@ if [ "$DIAGNOSE_ONLY" -eq 1 ]; then
     MILOCO_VER="$("$PY" -c 'import subprocess,json; r=subprocess.run(["miloco-cli","version"],capture_output=True,text=True,timeout=5); v=(json.loads(r.stdout).get("version") if r.stdout.strip().startswith("{") else r.stdout.strip()); print(v)' 2>/dev/null || echo unknown)"
     diag "miloco-cli 在 PATH" 1 "$MILOCO_VER"
   else
-    diag "miloco-cli 在 PATH" 0 "上游装：curl -LsSf https://github.com/XiaoMi/xiaomi-miloco/releases/latest/download/install.sh | bash -s -- --agent-prepare"
+    diag "miloco-cli 在 PATH" 0 "上游装：curl -LsSf https://github.com/XiaoMi/xiaomi-miloco/releases/latest/download/install.sh | bash -s -- --agent-prepare --agent-platform=hermes"
   fi
 
   # 4. miloco backend 在跑
@@ -402,7 +402,7 @@ if [ "$NO_START_BACKEND" -eq 0 ] && [ "$POST_INSTALL_ONLY" -eq 0 ]; then
       done
     else
       warn "miloco-cli service start 失败 — 继续装但后续 Step 2 OAuth 一定会 502"
-      warn "手动修：miloco-cli service start  或  重跑上游：curl -LsSf https://github.com/XiaoMi/xiaomi-miloco/releases/latest/download/install.sh | bash -s -- --agent-prepare"
+      warn "手动修：miloco-cli service start  或  重跑上游：curl -LsSf https://github.com/XiaoMi/xiaomi-miloco/releases/latest/download/install.sh | bash -s -- --agent-prepare --agent-platform=hermes"
     fi
   fi
 fi
@@ -434,7 +434,7 @@ SUPERVISORD_CONF="$MILOCO_HOME/supervisord.conf"
   # 情况 3: config.json 缺失（upstream --agent-prepare 没成功或被误删）
   if [ ! -f "$MILOCO_HOME/config.json" ]; then
     warn "半装残留：config.json 缺失（upstream --agent-prepare 似乎没成功）"
-    warn "  修复：curl -LsSf https://github.com/XiaoMi/xiaomi-miloco/releases/latest/download/install.sh | bash -s -- --agent-prepare"
+    warn "  修复：curl -LsSf https://github.com/XiaoMi/xiaomi-miloco/releases/latest/download/install.sh | bash -s -- --agent-prepare --agent-platform=hermes"
   fi
 fi
 
@@ -550,20 +550,28 @@ SHELL_RC_LIST=()
 if [ ${#SHELL_RC_LIST[@]} -gt 0 ]; then
   for _rc in "${SHELL_RC_LIST[@]}"; do
     if grep -q "^export MILOCO_HOME=" "$_rc" 2>/dev/null; then
-      "$PYTHON" - "$_rc" "$MILOCO_HOME" <<'PY'
-import re, sys
-rc, new = sys.argv[1], sys.argv[2]
-text = open(rc, encoding='utf-8').read()
-text = re.sub(r'^export MILOCO_HOME=.*$', f'export MILOCO_HOME="{new}"', text, flags=re.MULTILINE)
-open(rc, 'w', encoding='utf-8').write(text)
-PY
-      info "  $_rc: export MILOCO_HOME 已更新"
+      _rc_action="已更新"
     else
-      echo "" >> "$_rc"
-      echo "# miloco (MILOCO_HOME=$MILOCO_HOME)" >> "$_rc"
-      echo "export MILOCO_HOME=\"$MILOCO_HOME\"" >> "$_rc"
-      info "  $_rc: export MILOCO_HOME 已追加"
+      _rc_action="已追加"
     fi
+    "$PYTHON" - "$_rc" "$MILOCO_HOME" <<'PY'
+import re
+import shlex
+import sys
+
+rc, new = sys.argv[1], sys.argv[2]
+text = open(rc, encoding="utf-8").read()
+rendered = f"export MILOCO_HOME={shlex.quote(new)}"
+pattern = r"^export MILOCO_HOME=.*$"
+if re.search(pattern, text, flags=re.MULTILINE):
+    text = re.sub(pattern, lambda _m: rendered, text, flags=re.MULTILINE)
+else:
+    if text and not text.endswith("\n"):
+        text += "\n"
+    text += f"\n# miloco runtime path\n{rendered}\n"
+open(rc, "w", encoding="utf-8").write(text)
+PY
+    info "  $_rc: export MILOCO_HOME $_rc_action"
   done
 else
   warn "  ~/.zshrc / ~/.bashrc 都不存在,无法持久化 MILOCO_HOME"

@@ -1327,7 +1327,9 @@ class Installer:
         self._enable_conversation_access()
 
     def _step_plugin_hermes(self) -> None:
-        hermes_home = Path(os.environ.get("HERMES_HOME", Path.home() / ".hermes"))
+        hermes_home = Path(
+            os.environ.get("HERMES_HOME") or (Path.home() / ".hermes")
+        ).expanduser()
         if not shutil.which("hermes"):
             self.ui.step_fail(self.ui.i18n.t("plugin.hermes_not_found"))
             return
@@ -1384,8 +1386,8 @@ class Installer:
             scripts/ / skills/，只能整段跳，由 POST_INSTALL_SKIP guard 兜底
           - **幂等重跑**：step 5 (config set) / 6 (.env) / 7 (backend 重启) / 8 (enable)
             —— 都是幂等的，重跑一遍保证状态收敛（代价是 step 7 会多一次 stop+3s+start）
-          - **本模式真正补齐**：环境变量持久化、感知模型配置和 disable 残留清理
-            清理、9 版本记录、10 cron reconcile、收尾 banner「hermes gateway restart」提示
+          - **本模式真正补齐**：环境变量持久化、感知模型配置和 disable 残留清理、
+            9 版本记录、10 cron reconcile、收尾 banner「hermes gateway restart」提示
 
         install-hermes.sh 由 build.sh::build_hermes 打进 miloco-hermes-plugin tarball，
         跟 miloco-plugin 平级。找不到就 warn 跳过（不阻塞主流程）。
@@ -1903,14 +1905,9 @@ def _detect_installed_agent_platform() -> str | None:
 
     判定信号（任一命中即返）：
     - 安装器持久化的 ``MILOCO_AGENT_PLATFORM``（环境变量优先于指针文件）
-    - hermes:
-        - $HERMES_HOME env 已设且目录存在
-        - 或 ~/.hermes/ 目录存在
-        - 或 ~/.config/systemd/user/hermes-gateway.service unit 文件存在
-    - openclaw:
-        - ~/.config/systemd/user/openclaw-gateway.service unit 文件存在
-        - 或 ~/.config/systemd/user/clawdbot-gateway.service unit 文件存在
-    - 都没命中 → None（调用方决定 fallback）
+    - hermes: $HERMES_HOME / ~/.hermes / hermes CLI / systemd unit
+    - openclaw: ~/.openclaw / openclaw CLI / systemd unit
+    - 两边都命中或都未命中 → None（调用方显式指定，避免猜错）
     """
     explicit = os.environ.get("MILOCO_AGENT_PLATFORM", "")
     if explicit in {"hermes", "openclaw"}:
@@ -1920,20 +1917,37 @@ def _detect_installed_agent_platform() -> str | None:
         if platform in {"hermes", "openclaw"}:
             return platform
 
-    hermes_home = os.environ.get("HERMES_HOME", "")
-    if hermes_home and Path(hermes_home).is_dir():
+    hermes_home_env = os.environ.get("HERMES_HOME", "")
+    if hermes_home_env and Path(hermes_home_env).expanduser().is_dir():
         return "hermes"
-    if (Path.home() / ".hermes").is_dir():
-        return "hermes"
+
     user_units = Path.home() / ".config" / "systemd" / "user"
-    if (user_units / "hermes-gateway.service").exists():
-        return "hermes"
-    if (
-        (user_units / "openclaw-gateway.service").exists()
-        or (user_units / "clawdbot-gateway.service").exists()
-    ):
-        return "openclaw"
-    return None
+    hermes_home_detected = any(
+        (
+            (Path.home() / ".hermes").is_dir(),
+            (user_units / "hermes-gateway.service").exists(),
+        )
+    )
+    openclaw_home_detected = any(
+        (
+            (Path.home() / ".openclaw").is_dir(),
+            (user_units / "openclaw-gateway.service").exists(),
+            (user_units / "clawdbot-gateway.service").exists(),
+        )
+    )
+
+    # 目录/unit 比 PATH 中可能残留的 CLI 更可靠；只有两边都没有持久化信号时
+    # 才使用 CLI 兜底。两边同时命中则要求调用方显式选择。
+    if hermes_home_detected or openclaw_home_detected:
+        if hermes_home_detected == openclaw_home_detected:
+            return None
+        return "hermes" if hermes_home_detected else "openclaw"
+
+    hermes_cli = shutil.which("hermes") is not None
+    openclaw_cli = shutil.which("openclaw") is not None
+    if hermes_cli == openclaw_cli:
+        return None
+    return "hermes" if hermes_cli else "openclaw"
 
 
 def _verify_platform_installed(agent_platform: str) -> None:

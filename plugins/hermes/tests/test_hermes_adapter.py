@@ -52,6 +52,7 @@ def test_default_api_key_from_dotenv(monkeypatch, tmp_path: Path):
     backend supervisor 重启时 MILOCO_HOME + API_SERVER_KEY 都从 ~/.hermes/.env 读。
     """
     monkeypatch.delenv("API_SERVER_KEY", raising=False)
+    monkeypatch.delenv("HERMES_HOME", raising=False)
 
     # fake ~/.hermes/.env
     fake_home = tmp_path
@@ -72,11 +73,36 @@ def test_default_api_key_from_dotenv(monkeypatch, tmp_path: Path):
 def test_default_api_key_empty_when_no_source(monkeypatch, tmp_path: Path):
     """env + ~/.hermes/.env 都没 API_SERVER_KEY 时,key 为空(不抛)。"""
     monkeypatch.delenv("API_SERVER_KEY", raising=False)
+    monkeypatch.delenv("HERMES_HOME", raising=False)
     monkeypatch.setattr(Path, "home", lambda: tmp_path)  # 不存在 .env
 
     from miloco_plugin_pkg.hermes_adapter.adapter import _load_api_key
 
     assert _load_api_key() == ""
+
+
+def test_api_key_and_owner_session_follow_custom_hermes_home(
+    monkeypatch, tmp_path: Path
+):
+    hermes_home = tmp_path / "custom-hermes"
+    hermes_home.mkdir()
+    (hermes_home / ".env").write_text(
+        "API_SERVER_KEY=custom-home-key\n", encoding="utf-8"
+    )
+    (hermes_home / "channel_directory.json").write_text(
+        json.dumps({"platforms": {"feishu": [{"id": "oc_custom"}]}}),
+        encoding="utf-8",
+    )
+    monkeypatch.delenv("API_SERVER_KEY", raising=False)
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+
+    from miloco_plugin_pkg.hermes_adapter.adapter import (
+        _load_api_key,
+        _resolve_owner_session,
+    )
+
+    assert _load_api_key() == "custom-home-key"
+    assert _resolve_owner_session() == ("oc_custom", "feishu")
 
 
 # ---------------------------------------------------------------------------

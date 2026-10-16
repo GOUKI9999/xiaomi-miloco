@@ -16,14 +16,9 @@ die()  { echo "FATAL: $1"; exit 1; }
 HERMES_HOME="${HERMES_HOME:-$HOME/.hermes}"
 HERMES="${HERMES_HOME}/hermes"
 MILOCO_CLI="$HOME/.local/bin/miloco-cli"
-# 优先复用安装器写入的 runtime pointer；没有 pointer 时跟随 Hermes 默认目录。
-RUNTIME_ENV_FILE="${MILOCO_RUNTIME_ENV:-$HOME/.config/miloco/default.env}"
-if [ -z "${MILOCO_HOME:-}" ] && [ -f "$RUNTIME_ENV_FILE" ]; then
-  # default.env 由安装器生成，只包含 KEY=VALUE runtime 配置。
-  # shellcheck disable=SC1090
-  . "$RUNTIME_ENV_FILE"
-fi
-MILOCO_HOME="${MILOCO_HOME:-${HERMES_HOME}/miloco}"
+# shellcheck source=_resolve_runtime_env.sh
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/_resolve_runtime_env.sh"
+resolve_miloco_runtime_env
 BACKEND="http://127.0.0.1:1810"
 REPO="$(cd "$(dirname "$0")/../.." && pwd)"
 

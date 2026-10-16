@@ -198,7 +198,9 @@ def _check_versions(ctx: Any) -> Dict[str, Any]:
         if manifest_base and Path(manifest_base).is_dir():
             candidates.append(Path(manifest_base) / "plugin.yaml")
         # 兜底：install-hermes.sh 的装入点（dev / pip 都落这）
-        hermes_home = Path(_os.environ.get("HERMES_HOME") or Path.home() / ".hermes")
+        hermes_home = Path(
+            _os.environ.get("HERMES_HOME") or Path.home() / ".hermes"
+        ).expanduser()
         candidates.append(hermes_home / "plugins" / "miloco" / "miloco-plugin" / "plugin.yaml")
         cur_plugin = "unknown"
         for plugin_yaml in candidates:
@@ -459,4 +461,3 @@ def make_test_push_handler(ctx: Any):
             result = {"ok": False, "error": f"internal error: {exc}"}
         return json.dumps(result, ensure_ascii=False)
     return _handler
-
