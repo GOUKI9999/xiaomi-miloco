@@ -1018,6 +1018,7 @@ async def run_query_pipeline(
     get_identity_engine: Callable[[str, str], "IdentityEngine | None"] | None = None,
     last_captions: dict[str, str] | None = None,
     frame_index_offset: int = 0,
+    label_lookup: dict[str, str] | None = None,
 ) -> dict[str, QueryOutput]:
     """Active query pipeline: skip Gate, run Identity, Omni with query prompt.
 
@@ -1027,10 +1028,8 @@ async def run_query_pipeline(
     Returns dict[room_name, answer_text].
 
     Note: query 路径 omni 调用仍是 **per-room 一次**（产品语义：用户对房间问问题，
-    答案是单份文本）—— 此时 ``prompt_builder._encode_batch_video`` 只编首个有 frames
-    的 device 视频（已知遗留 degenerate：候选列表含同 room 多 device 的 track，但 omni
-    只看到首镜头视频，对非首镜头 track 是"无视觉信息硬猜"）。主路径 realtime_perceive
-    已改 per-device omni 规避；query 路径暂保留，后续若产品要求改多视角输入再升级。
+    答案是单份文本）—— 查询只提供实际编码设备的视频，身份定位线索随该视频来源限制，
+    不能据此推断房间其他视角的人员。多视角输入不在这条路径的能力范围内。
     """
     import uuid
 
@@ -1091,16 +1090,8 @@ async def run_query_pipeline(
         if not room_identity_packets:
             return None
 
-        # Resolve the device whose video will be encoded by build_query_prompt.
-        # _encode_batch_video loops edge_packets and returns the first one _encode_video
-        # can encode — and _encode_video bails with (None, None) only when all_frames is
-        # empty, while push_clip_bytes fires at the tail of _encode_video_mp4 after a
-        # successful encode. So this is the same predicate evaluated twice: attribution
-        # is exact, not best-effort.
-        # Note: neither _encode_batch_video nor _encode_video_mp4 has an except clause
-        # (only try/finally to unlink the temp file), so a PyAV failure on THIS packet
-        # propagates out of build_query_prompt → room task raises → _reraise_first below
-        # → the whole (possibly multi-room) query degrades to answer="".
+        # Select the first device with frames for the artifact context before encoding.
+        # Query identity text is scoped separately by the builder's actual encode result.
         primary_idx = next(
             (i for i, ep in enumerate(room_identity_packets) if ep.all_frames),
             0,
@@ -1120,6 +1111,7 @@ async def run_query_pipeline(
                 identity_packets=room_identity_packets,
                 query=query,
                 last_caption=captions.get(room_name),
+                label_lookup=label_lookup,
             )
             raw_response = await call_omni(
                 payload, resolve_live_omni_config(config.omni), type="on_demand"

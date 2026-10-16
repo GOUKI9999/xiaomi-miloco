@@ -36,6 +36,7 @@ from miloco.perception.engine.identity.gallery_composite import (
     encode_png_bytes,
     hstack_to_height,
 )
+from miloco.perception.engine.identity.names import usable_person_name
 from miloco.perception.engine.types import IdentityPacket, IdentityTarget, OmniContext
 
 from .constants import (
@@ -47,6 +48,7 @@ from .constants import (
     _HISTORY_HEADER,
     _OUTPUT_MODE_FREE,
     _OUTPUT_MODE_JSON,
+    _PERSON_PRESENCE,
     _PRINCIPLE,
     _PRINCIPLE_AUDIO,
     _PRINCIPLE_VIDEO_NO_AUDIO,
@@ -172,6 +174,19 @@ def build_batch_stream_prompt(
     return _build_payload(identity_packets, context, stream=True, label_lookup=label_lookup)
 
 
+_QUERY_PERSON_GROUNDING = (
+    "# 人物在场与称呼\n"
+    + _PERSON_PRESENCE
+    + "- 当前画面中谁在场、在做什么，只据本轮提供的视频判断；检测定位线索、上一窗场景参考、家庭档案和问题里的人名都不证明本轮有人。\n"
+    "- 只有画面确认给出的 bbox 对应真人、且该条为已确认成员线索时，才可沿用对应姓名。"
+    "bbox 标注该设备视频最后一帧的位置，坐标归一化到 [0, 1000]（左上 0,0；右下 1000,1000）。\n"
+    "- 确认有人但无法对应姓名时用“某人 / 陌生人”；身份标签若只是 ID，不把 ID 当人名输出，"
+    "不从家庭档案、历史描述或问题里给未确认身份的目标补姓名。\n"
+    "- 背影、侧身、局部、遮挡或模糊的真人仍算有人；分不清是人还是物时说明“无法确认”，不得据此断言无人。\n"
+    "- 本轮未提供有效视频的设备不能用于确认当前人员；只回答提供画面的范围，不把其他机位的检测结果当作可见事实。"
+)
+
+
 def build_query_prompt(
     identity_packets: list[IdentityPacket],
     query: str,
@@ -182,6 +197,7 @@ def build_query_prompt(
     parts = [
         _ROLE,
         _OUTPUT_MODE_FREE,
+        _QUERY_PERSON_GROUNDING,
         _COMMONSENSE,
     ]
     home_profile = get_home_profile_prefix()
@@ -189,13 +205,13 @@ def build_query_prompt(
         parts.append(home_profile)
     # query 不接 crop(v1 范围外);走 _effective_panorama_short_edge() 兜掉历史 config.json 里
     # 可能残留的 0(早期哨兵),否则 _encode_video_mp4 会算出 scale=0 崩掉按需查询。
-    video_b64, media_info = _encode_batch_video(
+    video_b64, media_info, video_packet_index = _encode_batch_video_with_source(
         identity_packets, short_edge=_effective_panorama_short_edge()
     )
     if not video_b64:
-        # query 路径只有 video 一个媒体块,拼不出就是纯文本问模型"现在怎么样",而 prompt 里
-        # 还注入了上一窗的 last_caption。零帧已由引擎入口的 _drop_frameless_snapshots 挡在
-        # 外面,走到这里说明编码本身失败。event 名与 fused 两条路由一致。
+        video_packet_index = None
+        # 无有效视频时，不注入检测身份标签或上一窗描述，以免它们替代当前画面。
+        # 保留 warning，便于定位编码失败或绕过入口零帧过滤的调用。
         logger.warning(
             "event=fused_no_media_block route=query reason=empty_video room=%s, "
             "本窗口未拼出 video 块、走 text-only",
@@ -203,7 +219,10 @@ def build_query_prompt(
         )
     return {
         "system_prompt": "\n\n".join(parts),
-        "user_content": _build_query_user_content(identity_packets, query, last_caption, label_lookup),
+        "user_content": _build_query_user_content(
+            identity_packets, query, last_caption, label_lookup,
+            video_packet_index=video_packet_index,
+        ),
         "video_base64": video_b64,
         "media_info": media_info,
         "crops": [],
@@ -259,14 +278,14 @@ def build_fused_payload(
 
     if label_lookup is None:
         label_lookup = {
-            pid: format_person_label(s.name, s.role)
+            pid: label
             for pid, s in gallery_snapshot.items()
-            if s.name
+            if (label := format_person_label(s.name, s.role)) is not None
         }
 
     # audio route：无视觉信息，候选作废。与 video 同款 message 隔离（待判断规则/只读历史
     # 各自独立 user 消息）；本轮事实只放"当前时间 + 音频"——audio 无视频，不渲染名册/gallery/
-    # 待识别 track（名册的 bbox 是为"把姓名对应到视频里的人"，audio 场景无意义）。
+    # 待识别 track（名册的 bbox 是为"定位名册项对应的目标"，audio 场景无意义）。
     if _resolve_route(packets) == "audio":
         scene = SceneDescriptor(route="audio", has_identity=False, stream=False)
         system_prompt = build_system_prompt(scene, include_home_profile=False, camera_prompt=context.camera_prompt)
@@ -311,7 +330,8 @@ def build_fused_payload(
 
     # 自适应分辨率(Smart Crop)。prompt 里所有 bbox 都按**全景整帧**归一化到 [0,1000],
     # 裁切生效时一律经 bbox_remap 换算进 crop 坐标系;换算不出来时两侧处置不同:
-    #   - 名册 bbox(已定身份的成员/陌生人)是**先验**:退化成"只给姓名不给位置"仍然正确。
+    #   - 名册 bbox(已定身份的成员/陌生人)是**先验**:换算失败时只撤去位置,
+    #     姓名保留作线索,能否用于描述仍须按人物总原则判断。
     #   - 候选 bbox(待识别 track)是模型把 track_id 对到画面里某个人的**唯一定位锚**:
     #     撤掉就没有锚点,多 track 场景下模型只能凭猜分配姓名 —— 错认代价比分辨率收益高
     #     一个量级,所以候选侧取 all-or-nothing:每个带 bbox 的候选都必须换算得出(非 None),
@@ -562,10 +582,7 @@ def build_system_prompt(
 ) -> str:
     """按场景装配 system prompt。
 
-    结构：``角色 → 输出模式 → # 任务 → # 输出格式(schema) → # 字段说明 → # 提醒判定
-    → # 通用常识 → # 输出实例 → [家庭档案?]``。schema / 字段说明 / 实例 / 任务行均按
-    ``scene`` 选取（audio 场景剥 caption/identity；有身份候选才带 identity 与实例 A），
-    同场景前缀稳定，利于 omni 服务端 prefix cache。
+    模态相关内容按 ``scene`` 选取；通用约束前置，低频上下文置尾，便于复用共享前缀。
 
     流程不再单列「工作流程」段——各任务（含 suggestions 的触发与 urgency 判定）的细则
     全部内联进对应「# 字段说明」的 ``## 字段`` 块。
@@ -589,7 +606,7 @@ def build_system_prompt(
     parts: list[str] = [
         role,
         _OUTPUT_MODE_JSON,
-        principle,
+        "# 总原则\n\n" + principle,
         _render_task_list(scene),
         "# 输出格式\n\n" + _render_schema_section(scene),
         "# 字段说明\n\n" + render_field_spec(scene),
@@ -677,8 +694,8 @@ def _render_examples(scene: SceneDescriptor) -> str:
     examples = []
     if scene.has_identity and scene.has_speech and not scene.identity_match_disabled:
         examples.append(_EXAMPLE_IDENTITY)
-    # 库空时实例 B 用泛称版：此窗无成员铺垫（实例 A 已 gate 掉），caption 示范不该叫专名，
-    # 与「库空不产成员名」收敛一致。库非空照旧用带名版（其"小明"由上方实例 A 的 gallery 铺垫）。
+    # 库空时实例 B 用泛称版，避免示范姓名被当成无依据的命名许可。
+    # 带名版本也须遵守总原则的人物称呼授权。
     examples.append(
         _EXAMPLE_CHAIN_NO_NAME if scene.identity_match_disabled else _EXAMPLE_CHAIN
     )
@@ -814,9 +831,8 @@ def _build_fused_user_content(
                         pid, samples.name, len(face_jpg), _MIN_JPEG_BYTES,
                     )
                     face_jpg = None
-                # 名册/gallery/输出统一用纯真名（角色上下文在「# 家庭档案」里）；
-                # name_to_pid 对纯名有 key，omni 输出 name 即可反查回 UUID
-                prepared.append((pid, samples.name or pid, body_jpg, face_jpg))
+                # 无可用姓名时仍展示 UUID，保留该成员的参考图。
+                prepared.append((pid, usable_person_name(samples.name) or pid, body_jpg, face_jpg))
 
             if give_up_reason is not None:
                 # 整 gallery 放弃 —— 不渲染 gallery 段，本窗口等价于无 gallery 主调用
@@ -897,7 +913,9 @@ def _build_fused_user_content(
         content.append({"type": "text", "text": (
             "上方已识别人物、陌生人及待识别 track 中的 bbox=(x1, y1, x2, y2) 均为视频**最后一帧**中"
             "归一化到 [0, 1000] 区间的位置（左上 0,0；右下 1000,1000），"
-            "用于把姓名 / track_id 对应到视频里的人；画面中的人在窗口内可能移动，靠前的帧以视觉为准。"
+            "用于定位名册项 / track 对应的目标；它不替代本轮画面对‘是否有人’的判断。"
+            "框内若是非人体，不得沿用姓名，也不算有人。"
+            "画面中的人在窗口内可能移动，靠前的帧以视觉为准。"
         )})
 
     # 参考帧图块:引导语与图块同进同退,避免只留文字不留图。
@@ -1117,15 +1135,22 @@ def _build_device_header(
                 lines.append(f"  陌生人：{', '.join(strangers)}")
             lines.append("")
 
-    # 名册含位置时附一句坐标系说明（非 fused 路径用）；fused 路径传 emit_bbox_note=False，
+    # 名册含位置时附说明（非 fused 路径用）；fused 路径传 emit_bbox_note=False，
     # 由 _build_fused_user_content 统一出一句覆盖名册 + 待识别 track，避免两处重复。
     # 「最后一帧」与 fused 侧同口径:bbox 只标末帧位置(engine._normalize_bbox_to_1000 按
     # all_frames[-1] 归一化),视频却跨整个窗口,不写明会让模型拿它去读中间帧。
     # 此路(非 fused/legacy)恒走全景、不接 Smart Crop,故无需坐标换算。
+    #
+    # 两句同门:第二句(空椅坏例的关键防护)若自己判"名册里有没有 bbox",fused 路径就会在名册
+    # 处多出它一份,而 fused 侧的说明句已含同款否证条件 —— 同一判据存两份,改一处忘一处即漂移。
     if emit_bbox_note and any("[bbox=" in ln for ln in lines):
         lines.append(
             "上方已识别人物、陌生人中 [bbox=(x1, y1, x2, y2)] 为该人在视频**最后一帧**中归一化到 [0, 1000] 区间的位置"
-            "（左上 0,0；右下 1000,1000），用于把姓名对应到视频里的人；画面中的人在窗口内可能移动，靠前的帧以视觉为准。"
+            "（左上 0,0；右下 1000,1000），用于定位名册项对应的目标，不替代本轮画面对‘是否有人’的判断；"
+            "画面中的人在窗口内可能移动，靠前的帧以视觉为准。"
+        )
+        lines.append(
+            "名册是定位线索；bbox 若对应非人体，不得沿用姓名，也不算有人。"
         )
     return lines
 
@@ -1165,9 +1190,10 @@ def _build_context_parts(context: OmniContext, *, stream: bool = False) -> list[
 def format_person_label(name: str | None, role: str | None) -> str | None:
     """把真名 + 家庭角色拼成 prompt 显示标签：``真名(角色:爸爸)``；role 为空只显真名。
 
-    name 为空时返回 None，由调用方兜底为 person_id（理论上 backfill 后 name 必有）。
+    name 为空或全空白时返回 None；有效姓名保持原样。
     """
-    if not name:
+    name = usable_person_name(name)
+    if name is None:
         return None
     if role:
         return f"{name}(角色:{role})"
@@ -1821,11 +1847,20 @@ def _encode_batch_video(
     audio route 由 _build_payload 短路，不会进入本函数。
     返回 ``(base64_str, media_info)``。
     """
-    for ep in edge_packets:
+    b64, media_info, _ = _encode_batch_video_with_source(edge_packets, short_edge)
+    return b64, media_info
+
+
+def _encode_batch_video_with_source(
+    edge_packets: list[IdentityPacket],
+    short_edge: int = _VIDEO_SHORT_EDGE,
+) -> tuple[str | None, LocalMediaInfo | None, int | None]:
+    """返回实际编码设备的索引，让查询定位线索与视频共用来源。"""
+    for index, ep in enumerate(edge_packets):
         b64, media_info = _encode_video(ep, short_edge=short_edge)
         if b64 is not None:
-            return b64, media_info
-    return None, None
+            return b64, media_info, index
+    return None, None, None
 
 
 def _encode_batch_crops(edge_packets: list[IdentityPacket]) -> list[dict[str, str]]:
@@ -2160,24 +2195,41 @@ def _build_query_user_content(
     query: str,
     last_caption: str | None,
     label_lookup: "dict[str, str] | None" = None,
+    *,
+    video_packet_index: int | None = None,
 ) -> str:
     parts: list[str] = []
 
+    if video_packet_index is None:
+        parts.append("本轮未提供有效视频，无法确认当前人员或场景。")
     for i, ep in enumerate(edge_packets):
         if len(edge_packets) > 1:
             parts.append(f"--- 设备 {i + 1} ---")
+        if i != video_packet_index:
+            parts.append("本轮未提供该设备视频，不据其检测结果判断当前人物。")
+            continue
+        parts.append("本轮视频来自此设备。")
         if not ep.targets:
-            parts.append("检测结果：未检测到目标")
+            parts.append("检测定位线索：未检测到目标（不代表画面无人）")
         else:
-            parts.append("检测结果：")
+            parts.append("检测定位线索（不代表当前有人）：")
             for t in ep.targets:
-                parts.append(_format_target(t, label_lookup))
+                if (
+                    t.bbox_xyxy_norm is not None
+                    and _is_confirmed_member_pid(t.person_id)
+                    and not t.needs_omni_verify
+                    and not t.suppress_as_prior
+                ):
+                    parts.append("已确认成员线索：" + _render_roster_entry(t, label_lookup))
+                else:
+                    parts.append("目标（不提供可沿用的身份标签）")
         parts.append(f"场景状态：{ep.scene_motion.value}")
         parts.append(f"音频：{ep.audio_analysis.type.value}（能量: {ep.audio_analysis.energy_level:.3f}）")
         parts.append("")
 
-    if last_caption:
-        parts.append(f"当前场景参考：{last_caption}")
+    # 调用方的历史描述对应首设备；编码选到其他设备时不借用其历史。
+    if last_caption and video_packet_index == 0:
+        parts.append(f"上一窗场景参考（仅历史，不证明本轮事实）：{last_caption}")
 
     parts.append(f"\n用户问题：{query}")
     return "\n".join(parts)
