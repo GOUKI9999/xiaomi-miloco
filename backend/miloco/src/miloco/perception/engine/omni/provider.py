@@ -444,6 +444,9 @@ class GeminiAdapter(OmniProviderAdapter):
         # 刷屏,也弱化"名字不含 flash"这个粗判据对 gemini-3-pro 等大概率可用模型的误报噪音。
         if "flash" not in model.lower() and model not in _warned_non_flash_gemini:
             _warned_non_flash_gemini.add(model)
+            # model 来自用户配置,记日志前清掉 CR/LF 防日志注入(CodeQL log-injection)。
+            # 就地包在实参上而不是先赋给中间变量：这一处只为打日志存在，中间变量会让人
+            # 以为它另有用途。
             logger.warning(
                 "[omni] GeminiAdapter 默认发 thinkingConfig.thinkingBudget=0,仅对 gemini-3-flash "
                 "系列验证过;model=%s 若为强制思考模型(如 gemini-2.5-pro)会 400,需按模型放开此项",

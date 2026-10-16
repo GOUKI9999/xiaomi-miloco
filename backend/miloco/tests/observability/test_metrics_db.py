@@ -225,8 +225,77 @@ def test_action_ledger_columns(tmp_path):
         "id", "timestamp", "action_type", "did", "device_name", "room",
         "iid", "value_json", "result_code", "result_msg", "success",
         "error", "trace_id", "source", "source_id", "home_id",
-        "phase", "trigger_event_id",
+        "auth_state", "phase", "trigger_event_id",
     }
+
+
+def test_v4_db_migrates_to_auth_state(tmp_path):
+    """v4 老库补 auth_state 列，历史行留 NULL。
+
+    NULL 表示写入时还没有这个维度，查询侧不得据此推断当时授权正常。
+    """
+    db = tmp_path / "obs.db"
+    conn = connect(db)
+    init_schema(conn)
+    # 退回 v4：删列不便，直接改版本号并模拟一行老数据
+    conn.execute("PRAGMA user_version = 4")
+    conn.execute(
+        "INSERT INTO action_ledger (id, timestamp, action_type, did, success) "
+        "VALUES ('old', 1, 'set_property', 'd1', 1)"
+    )
+    conn.close()
+
+    conn = connect(db)
+    init_schema(conn)
+    assert conn.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION
+    cols = {row[1] for row in conn.execute("PRAGMA table_info(action_ledger)")}
+    assert "auth_state" in cols
+    row = conn.execute(
+        "SELECT auth_state FROM action_ledger WHERE id = 'old'"
+    ).fetchone()
+    assert row[0] is None, "历史行不该被臆测成 ok"
+
+
+def test_v5_db_migrates_to_auth_state(tmp_path):
+    """模拟 v5 库(action_ledger 已带链路两列、无 auth_state,user_version=5)。
+
+    init_schema 应只跑 v6 那一步:补上 auth_state、推到 SCHEMA_VERSION,而**不**
+    重跑 v5 的回填——带链路的行不许被改写成 legacy。
+
+    这一格正是 auth_state 单独占一个版本号的全部理由:并进 v5 的话,已经被链路
+    那次迁移推到 5 的库会落在 ``cur == SCHEMA_VERSION`` 那一档、直接跳过迁移,
+    auth_state 永远补不上;而缺这一列不报错——``_write_action_ledger`` 整体裹着
+    fail-open 的 try/except,台账只会静默停记。
+    """
+    db = tmp_path / "obs.db"
+    conn = connect(db)
+    # 手搭 v5 骨架:与 v4 骨架同形,但 action_ledger 已带链路两列、user_version=5
+    conn.execute("CREATE TABLE traces (trace_id TEXT PRIMARY KEY, timestamp INTEGER)")
+    conn.execute("CREATE TABLE traces_device (device_trace_id TEXT PRIMARY KEY)")
+    conn.execute("CREATE TABLE events (event_id TEXT PRIMARY KEY)")
+    conn.execute("CREATE TABLE agent_runs (run_id TEXT PRIMARY KEY)")
+    conn.execute(
+        "CREATE TABLE action_ledger (id TEXT PRIMARY KEY, timestamp INTEGER, "
+        "action_type TEXT, did TEXT, success INTEGER, source TEXT, "
+        "source_id TEXT, home_id TEXT, phase TEXT, trigger_event_id TEXT)"
+    )
+    conn.execute(
+        "INSERT INTO action_ledger (id, timestamp, action_type, did, success, "
+        "source, home_id, phase, trigger_event_id) "
+        "VALUES ('a1', 111, 'set_property', 'd1', 1, 'rule', 'h1', 'enter', 'ev-1')"
+    )
+    conn.execute("PRAGMA user_version = 5")
+
+    init_schema(conn)
+
+    assert conn.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(action_ledger)")}
+    assert "auth_state" in cols
+    # 只有 v6 跑了:v5 的行没被动过,链路两列还是原值
+    assert conn.execute(
+        "SELECT id, phase, trigger_event_id, auth_state FROM action_ledger "
+        "WHERE id='a1'"
+    ).fetchone() == ("a1", "enter", "ev-1", None)
 
 
 def test_action_ledger_has_timestamp_index(tmp_path):
