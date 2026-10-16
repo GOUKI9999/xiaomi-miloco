@@ -1408,6 +1408,9 @@ interface BackendMeaningfulEvent {
   has_trace?: boolean;
   /** 任一 device 目录下有 ref.jpg → 本事件走了 Smart Crop,有全景参考帧可取. */
   has_ref?: boolean;
+  visual_artifact_kind?: "video" | "images" | "audio" | "none";
+  image_frame_counts?: Record<string, number>;
+  has_audio_artifact?: boolean;
   has_feedback?: boolean;
   feedback_pack_path?: string | null;
   feedback_pack_size?: number | null;
@@ -1450,6 +1453,9 @@ export async function realListActivity(opts?: {
       clip_kind: e.clip_kind,
       has_trace: e.has_trace,
       has_ref: e.has_ref,
+      visual_artifact_kind: e.visual_artifact_kind,
+      image_frame_counts: e.image_frame_counts,
+      has_audio_artifact: e.has_audio_artifact,
       has_feedback: e.has_feedback,
       feedback_pack_path: e.feedback_pack_path,
       feedback_pack_size: e.feedback_pack_size,
@@ -1483,6 +1489,16 @@ export function realOnDemandClipUrl(logId: string, deviceId: string): string {
   return token ? `${base}?token=${encodeURIComponent(token)}` : base;
 }
 
+export function realOnDemandImageUrl(
+  logId: string,
+  deviceId: string,
+  frameIndex: number,
+): string {
+  const token = resolveToken();
+  const base = `/api/perception/on-demand-logs/${encodeURIComponent(logId)}/images/${encodeURIComponent(deviceId)}/${frameIndex}`;
+  return token ? `${base}?token=${encodeURIComponent(token)}` : base;
+}
+
 export async function realSubmitOnDemandFeedback(
   logId: string,
   errorTypes: string[],
@@ -1512,6 +1528,16 @@ export async function realSubmitOnDemandFeedback(
 export function realEventClipUrl(event_id: string, device_id: string): string {
   const token = resolveToken();
   const base = `/api/events/${encodeURIComponent(event_id)}/clip/${encodeURIComponent(device_id)}`;
+  return token ? `${base}?token=${encodeURIComponent(token)}` : base;
+}
+
+export function realEventImageUrl(
+  event_id: string,
+  device_id: string,
+  frame_index: number,
+): string {
+  const token = resolveToken();
+  const base = `/api/events/${encodeURIComponent(event_id)}/images/${encodeURIComponent(device_id)}/${frame_index}`;
   return token ? `${base}?token=${encodeURIComponent(token)}` : base;
 }
 
@@ -1608,6 +1634,9 @@ export function realSubscribeEvents(
         clip_kind: payload.clip_kind,
         has_trace: payload.has_trace,
         has_ref: payload.has_ref,
+        visual_artifact_kind: payload.visual_artifact_kind,
+        image_frame_counts: payload.image_frame_counts,
+        has_audio_artifact: payload.has_audio_artifact,
         has_feedback: payload.has_feedback,
         feedback_pack_path: payload.feedback_pack_path,
         feedback_pack_size: payload.feedback_pack_size,
