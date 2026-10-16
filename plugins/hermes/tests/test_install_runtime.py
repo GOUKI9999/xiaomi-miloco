@@ -128,9 +128,11 @@ def test_explicit_platform_is_not_rejected_when_detection_is_missing(
 ):
     _fake_home(monkeypatch, installer, tmp_path)
 
-    installer._verify_platform_installed("hermes")
+    installer._verify_platform_installed(
+        "hermes", installer.I18n("zh", Path(installer.__file__).parent)
+    )
 
-    assert "以显式指定为准" in capsys.readouterr().err
+    assert "将按显式指定执行" in capsys.readouterr().err
 
 
 def test_write_runtime_pointer_quotes_paths_and_preserves_unknown_lines(

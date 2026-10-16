@@ -151,6 +151,11 @@
   "platform.openclaw_option": "OpenClaw",
   "platform.hermes_option": "Hermes Agent",
   "platform.selected": "已选择：%1",
+  "platform.non_interactive_requires_explicit": "非交互安装必须由调用方明确指定 agent_platform",
+  "platform.explicit_not_detected": "警告：已显式指定 --agent-platform=%1，但未探测到已安装的 runtime；将按显式指定执行。",
+  "platform.explicit_mismatch": "警告：已显式指定 --agent-platform=%1，但探测到 %2；将按显式指定执行。",
+  "platform.detect_failed": "未检测到任何 agent runtime（既无 Hermes 也无 OpenClaw）：\n  - Hermes：已设置 HERMES_HOME、~/.hermes/ 目录存在，或 ~/.config/systemd/user/hermes-gateway.service 文件存在\n  - OpenClaw：~/.openclaw/ 目录存在，或 ~/.config/systemd/user/openclaw-gateway.service 文件存在\n请先安装 Hermes 或 OpenClaw 后重试，或显式指定 --agent-platform=hermes/openclaw",
+  "platform.legacy_home_warning": "警告：检测到旧 Hermes 数据目录 %1，但当前目录为 %2；旧数据不会自动迁移。",
 
   "summary.restart_hermes_desc": "重启 Hermes gateway 以加载新插件"
 }
