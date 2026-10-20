@@ -37,6 +37,7 @@ import { StatusRibbon } from "./components/StatusRibbon";
 import UpgradeNotice from "./components/UpgradeNotice";
 import { HeroNow } from "./components/HeroNow";
 import { DevicesByRoom } from "./components/DevicesByRoom";
+import { buildRoomIndex } from "./lib/roomFilter";
 import { ActivityFeed } from "./components/ActivityFeed";
 import { FamilyStrip } from "./components/FamilyStrip";
 import { PersonDrawer } from "./components/PersonDrawer";
@@ -162,6 +163,10 @@ function MainApp() {
   });
   const deviceNames = useMemo(
     () => Object.fromEntries((devices.data ?? []).map((d) => [d.did, d.name])),
+    [devices.data],
+  );
+  const deviceRooms = useMemo(
+    () => buildRoomIndex(devices.data ?? []),
     [devices.data],
   );
   // 家庭档案（候选区 + 正式区记忆）——家庭 tab 用，成员抽屉与非人面板共享。
@@ -464,6 +469,7 @@ function MainApp() {
               onDemandError={onDemandLogs.error}
               onRetryOnDemand={() => onDemandLogs.reload()}
               deviceNames={deviceNames}
+              deviceRooms={deviceRooms}
             />
           </div>
         );

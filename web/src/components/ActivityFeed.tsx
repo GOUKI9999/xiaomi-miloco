@@ -46,6 +46,13 @@ import {
   type BackendActionRow,
 } from "./ActionsFeed";
 import { TimeLabel } from "./TimeLabel";
+import {
+  ALL_ROOMS,
+  actionMatchesRoom,
+  eventMatchesRoom,
+  filterPerceptionLogs,
+  listRooms,
+} from "../lib/roomFilter";
 import { toast } from "./Toast";
 
 type ActivityTab = "events" | "perception" | "queries";
@@ -69,11 +76,14 @@ interface Props {
   onDemandError?: Error | null;
   onRetryOnDemand: () => void;
   deviceNames?: Record<string, string>;
+  /** did -> 房间名，用于房间筛选；为空时不显示房间下拉。 */
+  deviceRooms?: Record<string, string>;
 }
 
 const PAGE_SIZE = 50;
 const OD_PAGE_SIZE = 50;
 const FILTER_DEBOUNCE_MS = 300;
+const EMPTY_ROOMS: Record<string, string> = {};
 const FEEDBACK_FORM_URL = "https://mi.feishu.cn/share/base/form/shrcnUmo9ez8NwkcpvpJsKSOdgd";
 const EMPTY_OD_LOGS: OnDemandLogEntry[] = [];
 // SSE 事件常成串到达(一次 agent 控制伴随多条事件),每条都全量重拉 500 行动作太重。
@@ -247,9 +257,16 @@ export function ActivityFeed({
   onDemandError,
   onRetryOnDemand,
   deviceNames = {},
+  deviceRooms = EMPTY_ROOMS,
 }: Props) {
   const { t } = useTranslation();
   const [activeTab, setActiveTab] = useState<ActivityTab>("events");
+  // 房间筛选：仅组件内 state；房间列表变化（切家）后选中项不存在则回到全部。
+  const [room, setRoom] = useState<string>(ALL_ROOMS);
+  const rooms = useMemo(() => listRooms(deviceRooms), [deviceRooms]);
+  useEffect(() => {
+    if (room !== ALL_ROOMS && rooms.length > 0 && !rooms.includes(room)) setRoom(ALL_ROOMS);
+  }, [room, rooms]);
   const [perceptionCount, setPerceptionCount] = useState(0);
   const [perceptionHasMore, setPerceptionHasMore] = useState(false);
   const handlePerceptionCount = useCallback((n: number, hasMore: boolean) => {
@@ -602,8 +619,12 @@ export function ActivityFeed({
     () =>
       mergeFeedRows(
         events, actions, showEvents, showActions, appliedSince, appliedBefore, hasMore,
+      ).filter((r) =>
+        r.kind === "event"
+          ? eventMatchesRoom(r.event, room, deviceRooms)
+          : actionMatchesRoom(r.action, room, deviceRooms),
       ),
-    [events, actions, showEvents, showActions, appliedSince, appliedBefore, hasMore],
+    [events, actions, showEvents, showActions, appliedSince, appliedBefore, hasMore, room, deviceRooms],
   );
 
   const noneChecked = !showEvents && !showActions;
@@ -700,6 +721,19 @@ export function ActivityFeed({
                 {t("actions.filterActions")}
               </label>
             </>
+          )}
+          {rooms.length > 0 && (
+            <select
+              value={room}
+              onChange={(e) => setRoom(e.target.value)}
+              aria-label={t("activity.filterRoom")}
+              className="bg-bg-primary border border-border rounded-md px-2 py-1 text-caption text-text-primary hover:border-border-strong focus:outline-none focus:border-brand-primary transition-colors cursor-pointer"
+            >
+              <option value={ALL_ROOMS}>{t("activity.filterRoomAll")}</option>
+              {rooms.map((r) => (
+                <option key={r} value={r}>{r}</option>
+              ))}
+            </select>
           )}
           <TimeRangeFilter
             since={since}
@@ -825,6 +859,8 @@ export function ActivityFeed({
           since={appliedSince}
           before={appliedBefore}
           deviceNames={deviceNames}
+          room={room}
+          deviceRooms={deviceRooms}
           onCountChange={handlePerceptionCount}
         />
       </div>
@@ -848,12 +884,14 @@ export function ActivityFeed({
   );
 }
 
-function PerceptionLogList({ homeId, active, since, before, deviceNames, onCountChange }: {
+function PerceptionLogList({ homeId, active, since, before, deviceNames, room, deviceRooms, onCountChange }: {
   homeId: HomeId;
   active: boolean;
   since?: number;
   before?: number;
   deviceNames: Record<string, string>;
+  room: string;
+  deviceRooms: Record<string, string>;
   onCountChange: (count: number, hasMore: boolean) => void;
 }) {
   const { t } = useTranslation();
@@ -863,6 +901,14 @@ function PerceptionLogList({ homeId, active, since, before, deviceNames, onCount
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<Error | null>(null);
   const fetchGenRef = useRef(0);
+  const visibleLogs = useMemo(
+    () => filterPerceptionLogs(logs, room, deviceRooms),
+    [logs, room, deviceRooms],
+  );
+  // 计数跟随筛选后的可见条数；hasMore 仍表示后端单次上限是否触顶。
+  useEffect(() => {
+    onCountChange(visibleLogs.length, hasMore);
+  }, [visibleLogs, hasMore, onCountChange]);
 
   const reload = useCallback(() => {
     const gen = ++fetchGenRef.current;
@@ -874,7 +920,6 @@ function PerceptionLogList({ homeId, active, since, before, deviceNames, onCount
         setLogs(rows);
         setClampedSince(effectiveSince);
         setHasMore(hasMore);
-        onCountChange(rows.length, hasMore);
       })
       .catch((err: unknown) => {
         if (gen !== fetchGenRef.current) return;
@@ -882,12 +927,11 @@ function PerceptionLogList({ homeId, active, since, before, deviceNames, onCount
         setLogs([]);
         setClampedSince(undefined);
         setHasMore(false);
-        onCountChange(0, false);
       })
       .finally(() => {
         if (gen === fetchGenRef.current) setLoading(false);
       });
-  }, [homeId, since, before, onCountChange]);
+  }, [homeId, since, before]);
 
   useEffect(() => {
     if (!active) return;
@@ -917,7 +961,7 @@ function PerceptionLogList({ homeId, active, since, before, deviceNames, onCount
     );
   }
 
-  if (logs.length === 0) {
+  if (visibleLogs.length === 0) {
     return (
       <div className="text-body text-center py-10 text-text-secondary">
         <div>{t("activity.perceptionEmpty")}</div>
@@ -965,7 +1009,7 @@ function PerceptionLogList({ homeId, active, since, before, deviceNames, onCount
         </button>
       </div>
       <ul className="divide-y divide-border">
-        {logs.map((log) => (
+        {visibleLogs.map((log) => (
           <li key={log.id} className="px-5 py-2.5 hover:bg-bg-tertiary transition-colors list-none">
             <div className="flex flex-col gap-1 sm:grid sm:grid-cols-[70px_1fr] sm:gap-x-3 sm:items-baseline">
               <TimeLabel timestamp={log.timestamp} />

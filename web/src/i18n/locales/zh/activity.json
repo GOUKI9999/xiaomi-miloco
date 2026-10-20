@@ -32,6 +32,8 @@
     "filterToNow": "至现在",
     "filterBeforeDefault": "截止时间(默认至现在)",
     "filterBefore": "截止时间",
+    "filterRoom": "房间",
+    "filterRoomAll": "全部房间",
     "resumeLive": "恢复实时刷新",
     "liveButton": "↻ 实时",
     "videoPlayback": "事件视频回放",

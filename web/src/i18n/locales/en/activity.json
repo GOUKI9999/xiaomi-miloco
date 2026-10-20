@@ -32,6 +32,8 @@
     "filterToNow": "Until now",
     "filterBeforeDefault": "End time (defaults to now)",
     "filterBefore": "End time",
+    "filterRoom": "Room",
+    "filterRoomAll": "All rooms",
     "resumeLive": "Resume live refresh",
     "liveButton": "↻ Live",
     "videoPlayback": "Event video playback",
