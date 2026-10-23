@@ -98,7 +98,7 @@ const I18N = {
     pickCamFirst: "请先选择摄像头",
     missingToken: "缺少 token:经 /api/miot/watch 由后端注入,或 dev 期带 ?token=… query",
     connecting: "连接中…",
-    liveFpsDegraded: "主机处理不过来，已自动降到 {fps} fps",
+    liveFpsDegraded: "当前 {fps} fps · 上限 {max}（主机负载高，已自动降低）",
     connectingCam: "正在连接摄像头…",
     disconnected: (code, reason) => `已断开 (${code})${reason ? " — " + reason : ""}`,
     wsError: "WebSocket 错误",
@@ -137,7 +137,7 @@ const I18N = {
     pickCamFirst: "Please pick a camera first",
     missingToken: "Missing token: injected by the backend via /api/miot/watch, or pass ?token=… in the URL during dev",
     connecting: "Connecting…",
-    liveFpsDegraded: "Host overloaded, auto-lowered to {fps} fps",
+    liveFpsDegraded: "Now {fps} fps · max {max} (lowered automatically, host busy)",
     connectingCam: "Connecting to camera…",
     disconnected: (code, reason) => `Disconnected (${code})${reason ? " — " + reason : ""}`,
     wsError: "WebSocket error",
@@ -374,7 +374,9 @@ function showLiveFps(msg) {
   const el = $("fpsnote");
   if (!el) return;
   if (msg.reason === "degraded" && msg.fps < msg.requested) {
-    el.textContent = t("liveFpsDegraded").replace("{fps}", String(msg.fps));
+    el.textContent = t("liveFpsDegraded")
+      .replace("{fps}", String(msg.fps))
+      .replace("{max}", String(msg.requested));
     el.classList.add("show");
   } else if (msg.fps >= msg.requested) {
     el.classList.remove("show");
