@@ -5,6 +5,7 @@
  * 感知记录按 descriptions 的 key（房间名或 did）。room 为 ALL_ROOMS 时不过滤。
  */
 import type { ActivityEvent, PerceptionLogEntry } from "./types";
+import { buildFoldRows, feedLowerBound, type BuildFoldRowsInput, type FoldRow } from "./feedFold";
 
 export const ALL_ROOMS = "";
 
@@ -42,6 +43,26 @@ export function actionMatchesRoom(
 ): boolean {
   if (room === ALL_ROOMS) return true;
   return (roomOf[action.did] ?? action.room) === room;
+}
+
+/** 房间先筛成员再折叠；保留所选动作已加载的宿主，避免误报为宿主未加载。
+ * 分页地平线仍由未筛选的事件决定，不能因换房间而放出尚未加载区间的动作。 */
+export function buildRoomFeedRows(
+  input: BuildFoldRowsInput,
+  room: string,
+  roomOf: Record<string, string>,
+): FoldRow[] {
+  if (room === ALL_ROOMS) return buildFoldRows(input);
+  const actions = input.actions.filter((a) => actionMatchesRoom(a, room, roomOf));
+  const hosts = new Set(input.showActions ? actions.map((a) => a.trigger_event_id) : []);
+  const events = input.events.filter((e) => eventMatchesRoom(e, room, roomOf) || hosts.has(e.id));
+  return buildFoldRows({
+    ...input,
+    events,
+    actions,
+    sinceMs: feedLowerBound(input.events, input.showEvents, input.sinceMs, input.hasMoreEvents),
+    hasMoreEvents: false,
+  });
 }
 
 /** 只保留属于该房间的来源描述；一条记录的来源都不属于该房间时整条去掉。 */
