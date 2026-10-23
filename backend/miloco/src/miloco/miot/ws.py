@@ -937,8 +937,11 @@ class MIoTVideoStreamManager:
         )
         if reason != "requested":
             logger.warning(
-                "Live fps %s, %s: %d fps (requested %d)",
-                reason, cam_tag(camera_id, channel), state.current_fps, state.target_fps,
+                "Live fps %s, %s: %s fps (requested %s)",
+                safe_log(reason),
+                cam_tag(camera_id, channel),
+                safe_log(state.current_fps),
+                safe_log(state.target_fps),
             )
         msg = json.dumps({
             "type": "live_fps",
