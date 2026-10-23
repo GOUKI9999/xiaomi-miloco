@@ -77,6 +77,37 @@ def test_sustained_drops_step_down_to_one_fps():
     assert state.current_fps == 1
 
 
+def test_full_cycle_steps_down_then_restores_one_step_per_backoff():
+    """20 -> 10 -> 5 -> 3 -> 1 under sustained drops, then back up one step per quiet period."""
+    state = _LiveRateState(target_fps=20, current_fps=20)
+    t = 1000.0
+    down = []
+    for _ in range(6):
+        changes, t = _feed(state, t, 11, 5, drop_every=1)
+        down += [fps for _, fps in changes]
+    assert down == [10, 5, 3, 1]
+    assert state.restore_wait == ws_module._LIVE_RESTORE_INITIAL_S
+
+    up = []
+    waits = []
+    for _ in range(4):
+        changes, t = _feed(state, t, state.restore_wait + 30, 5, drop_every=0)
+        up += [fps for _, fps in changes]
+        waits.append(state.restore_wait)
+    assert up == [3, 5, 10, 20]
+    assert waits == [ws_module._LIVE_RESTORE_INITIAL_S] * 4  # clean restores do not grow the wait
+
+    # a degrade right after a restore doubles the next wait, capped at 1 h
+    _, t = _feed(state, t, 11, 5, drop_every=1)
+    assert state.current_fps == 10
+    assert state.restore_wait == 2 * ws_module._LIVE_RESTORE_INITIAL_S
+    # overload ends right after this degrade: start a clean window
+    state.window_start, state.frames, state.dropped = t, 0, 0
+    changes, t = _feed(state, t, ws_module._LIVE_RESTORE_INITIAL_S + 30, 5, drop_every=0)
+    assert changes == []  # the doubled wait has not elapsed yet
+    changes, t = _feed(state, t, ws_module._LIVE_RESTORE_INITIAL_S, 5, drop_every=0)
+    assert changes == [("restored", 20)]
+
 def test_light_drops_do_not_degrade():
     state = _LiveRateState(target_fps=10, current_fps=10)
     changes, _ = _feed(state, 1000.0, 30, 10, drop_every=5)
