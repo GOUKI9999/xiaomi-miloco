@@ -190,7 +190,8 @@ function MainApp() {
     errorLabel: t("app.loadOnDemandLogsFail", "Failed to load on-demand logs"),
   });
   // Activity 的设备名与房间筛选只需要台账，不等 devices 逐台拉完状态（大户型要二十多秒）。
-  // 与 devices 同源（/api/miot/home），失败提示由 devices 那一路给，这里不重复弹。
+  // 与 devices 同源（/api/miot/home），失败提示由 devices 那一路给，这里不重复弹；
+  // 恢复也跟着 devices：凡是调 devices.reload() 的地方都一并重拉台账。
   const deviceDirectory = useAsync(() => listDeviceDirectory(homeId), [homeId]);
   // 先用上次成功拉到的台账渲染（房间下拉随页面一起出现），拉取成功后再替换并写回缓存；
   // 拉取失败时继续用缓存。
@@ -266,6 +267,7 @@ function MainApp() {
                 cameras.reload();
                 scopeCameras.reload();
                 devices.reload();
+                deviceDirectory.reload();
               }}
             />
           );
@@ -358,6 +360,7 @@ function MainApp() {
               message={t("app.tabDevicesError", { msg: err.message })}
               onRetry={() => {
                 devices.reload();
+                deviceDirectory.reload();
                 scenes.reload();
               }}
             />
@@ -373,6 +376,7 @@ function MainApp() {
               scenes={scenes.data}
               onChanged={() => {
                 devices.reload();
+                deviceDirectory.reload();
                 scenes.reload();
               }}
             />
