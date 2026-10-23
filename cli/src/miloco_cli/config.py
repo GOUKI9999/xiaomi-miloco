@@ -177,7 +177,17 @@ _SCHEMA_PATHS: dict[str, tuple[type, Any, str]] = {
     "camera.decoded_frame_interval": (
         int,
         0,
-        "无人直播/录像时的感知 BGR 回调间隔（毫秒，0-10000）；实时订阅自动全速；0=不限流，重启生效",
+        "无人直播/录像时的感知 BGR 回调间隔（毫秒，0-10000）；实时画面按请求帧率；0=不限流，重启生效",
+    ),
+    "camera.live_default_fps": (
+        int,
+        5,
+        "实时画面默认帧率（1-60，前端未指定时使用）",
+    ),
+    "camera.live_max_fps": (
+        int,
+        20,
+        "实时画面帧率上限（1-60）；越高 CPU 占用越大，低配主机建议 3~5",
     ),
     "perception.engine.input.video_short_edge": (
         int,

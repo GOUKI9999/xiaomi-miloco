@@ -298,7 +298,22 @@ class CameraSettings(BaseModel):
         le=10_000,
         description=(
             "无人直播/录像时的感知 BGR 帧回调最小间隔（毫秒）；"
-            "实时订阅期间自动恢复全帧率，0 始终不限流。"
+            "实时画面期间按观看者请求的帧率解码，0 始终不限流。"
+        ),
+    )
+    live_default_fps: int = Field(
+        default=5,
+        ge=1,
+        le=60,
+        description="实时画面默认帧率（前端未指定 fps 时使用）",
+    )
+    live_max_fps: int = Field(
+        default=20,
+        ge=1,
+        le=60,
+        description=(
+            "实时画面帧率上限；前端请求超过此值时按此值处理。"
+            "帧率越高 CPU 占用越大，低配主机建议 3~5"
         ),
     )
     max_cache_images: int = Field(default=6, description="最大缓存图像数量")

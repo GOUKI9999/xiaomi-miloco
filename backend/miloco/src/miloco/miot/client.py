@@ -1005,13 +1005,14 @@ class MiotProxy:
         callback: Callable[[str, VideoFrame, int, int], Coroutine],
         *,
         full_rate: bool = False,
+        frame_interval_ms: int | None = None,
     ) -> int:
         if camera_id not in self._camera_img_managers:
             logger.warning("Camera %s not found in managers", camera_id)
             return -1
         instance = self._camera_img_managers[camera_id]
         reg_id = await instance.register_decode_video_frame_stream(
-            callback, channel, full_rate=full_rate
+            callback, channel, full_rate=full_rate, frame_interval_ms=frame_interval_ms
         )
         logger.info(
             "Started decode video frame stream, camera_id: %s, channel: %s, reg_id: %d",
@@ -1020,6 +1021,17 @@ class MiotProxy:
             reg_id,
         )
         return reg_id
+
+    async def set_camera_decode_video_frame_interval(
+        self, camera_id: str, channel: int, reg_id: int, frame_interval_ms: int
+    ) -> bool:
+        """Change the decode interval requested by a live registration."""
+        instance = self._camera_img_managers.get(camera_id)
+        if instance is None:
+            return False
+        return await instance.set_decode_video_frame_interval(
+            channel, reg_id, frame_interval_ms
+        )
 
     async def stop_camera_decode_video_stream(
         self, camera_id: str, channel: int, reg_id: int

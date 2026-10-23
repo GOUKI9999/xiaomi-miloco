@@ -5,8 +5,10 @@ import io
 import json
 import logging
 import struct
+import time
 from collections import OrderedDict, deque
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Awaitable, Callable
 
 import av
@@ -15,6 +17,7 @@ from fastapi.websockets import WebSocketState
 from miot.tuning import ENCODE_THREADS
 from miot.types import MIoTCameraCodec
 
+from miloco.config import get_settings
 from miloco.manager import get_manager
 from miloco.miot.transcoder import H264LiveEncoder
 from miloco.utils.common import safe_log
@@ -366,6 +369,74 @@ class _SubscriberSender:
             raise
 
 
+# ── 实时画面帧率 ─────────────────────────────────────────────────────────
+# 每路实时画面按观看者请求的帧率解码（多个观看者取最高），并在编码跟不上时自动降帧：
+# 上游的单飞门在 encode 忙时会丢帧，_LIVE_DEGRADE_WINDOW_S 内丢帧比例超过
+# _LIVE_DEGRADE_DROP_RATIO 就把该路帧率减半（最低 1fps）；连续 _LIVE_RESTORE_QUIET_S
+# 不丢帧再逐级翻倍恢复到请求值。低配主机上选了过高帧率时不会把 CPU 长期打满。
+_LIVE_DEGRADE_WINDOW_S = 10.0
+_LIVE_DEGRADE_DROP_RATIO = 0.3
+_LIVE_DEGRADE_MIN_FRAMES = 5
+_LIVE_RESTORE_QUIET_S = 60.0
+
+
+def resolve_live_fps(requested: int | None) -> int:
+    """Clamp a requested live fps to [1, camera.live_max_fps]; None -> default."""
+    cam = get_settings().camera
+    fps = requested if requested and requested > 0 else cam.live_default_fps
+    return max(1, min(int(fps), int(cam.live_max_fps)))
+
+
+def live_frame_interval_ms(fps: int) -> int:
+    return max(1, round(1000 / max(1, fps)))
+
+
+@dataclass
+class _LiveRateState:
+    """Per camera_tag live frame-rate controller state."""
+
+    target_fps: int
+    current_fps: int
+    window_start: float = 0.0
+    frames: int = 0
+    dropped: int = 0
+    last_drop: float = 0.0
+    last_change: float = 0.0
+
+    def note_frame(self, dropped: bool, now: float) -> str | None:
+        """Account one decoded frame; return "degraded"/"restored" when the rate changes."""
+        if self.window_start == 0.0:
+            self.window_start = now
+        self.frames += 1
+        if dropped:
+            self.dropped += 1
+            self.last_drop = now
+        if now - self.window_start < _LIVE_DEGRADE_WINDOW_S:
+            return None
+        change = None
+        ratio = self.dropped / self.frames if self.frames else 0.0
+        if (
+            self.frames >= _LIVE_DEGRADE_MIN_FRAMES
+            and ratio > _LIVE_DEGRADE_DROP_RATIO
+            and self.current_fps > 1
+        ):
+            self.current_fps = max(1, self.current_fps // 2)
+            change = "degraded"
+        elif (
+            self.current_fps < self.target_fps
+            and now - self.last_drop >= _LIVE_RESTORE_QUIET_S
+            and now - self.last_change >= _LIVE_RESTORE_QUIET_S
+        ):
+            self.current_fps = min(self.target_fps, self.current_fps * 2)
+            change = "restored"
+        self.window_start = now
+        self.frames = 0
+        self.dropped = 0
+        if change:
+            self.last_change = now
+        return change
+
+
 class MIoTVideoStreamManager:
     """MIoT Video WS Manager.
 
@@ -438,6 +509,9 @@ class MIoTVideoStreamManager:
         self._camera_locks = {}
         # 正在 encode+fanout 的 camera_tag 集合(单飞门,见 __video_stream_callback)。
         self._broadcast_inflight: set[str] = set()
+        # camera_tag -> live frame-rate controller (while the stream is subscribed)
+        self._live_rate: dict[str, _LiveRateState] = {}
+        self._live_rate_tasks: set[asyncio.Task] = set()
         logger.info("Init MIoT Video WS Manager (transcode mode, gop=%d)",
                     self._TRANSCODE_GOP)
 
@@ -462,7 +536,7 @@ class MIoTVideoStreamManager:
         return f"{camera_id}.{channel}" in self._camera_seen_keyframe
 
     async def _ensure_sdk_subscription(
-        self, camera_id: str, channel: int, camera_tag: str
+        self, camera_id: str, channel: int, camera_tag: str, fps: int | None = None
     ) -> None:
         """Idempotent: start SDK stream + allocate per-camera encoder.
 
@@ -473,11 +547,13 @@ class MIoTVideoStreamManager:
         self._camera_seen_keyframe.discard(camera_tag)
         self._camera_codec.pop(camera_tag, None)
         self._camera_connect_map.setdefault(camera_tag, {})
+        live_fps = resolve_live_fps(fps)
         try:
             reg_id = await manager.miot_service.start_video_stream(
                 camera_id=camera_id,
                 channel=channel,
                 callback=self.__video_stream_callback,
+                frame_interval_ms=live_frame_interval_ms(live_fps),
             )
         except Exception:
             self._camera_connect_map.pop(camera_tag, None)
@@ -490,6 +566,7 @@ class MIoTVideoStreamManager:
                 "Try `miloco-cli account unbind && account bind`."
             )
         self._camera_reg_id[camera_tag] = reg_id
+        self._live_rate[camera_tag] = _LiveRateState(target_fps=live_fps, current_fps=live_fps)
         self._camera_encoder[camera_tag] = H264LiveEncoder(gop=self._TRANSCODE_GOP)
         logger.info(
             "Start video stream (transcode), %s reg_id=%d",
@@ -550,11 +627,15 @@ class MIoTVideoStreamManager:
                     camera_tag
                 ):
                     continue
+                state = self._live_rate.get(camera_tag)
                 try:
                     reg_id = await manager.miot_service.start_video_stream(
                         camera_id=did,
                         channel=channel,
                         callback=self.__video_stream_callback,
+                        frame_interval_ms=live_frame_interval_ms(
+                            state.current_fps if state else resolve_live_fps(None)
+                        ),
                     )
                 except Exception as e:  # noqa: BLE001
                     logger.error("Resubscribe after rebuild failed, %s: %s",
@@ -587,6 +668,7 @@ class MIoTVideoStreamManager:
             await manager.miot_service.stop_video_stream(
                 camera_id, channel, reg_id
             )
+        self._live_rate.pop(camera_tag, None)
         encoder = self._camera_encoder.pop(camera_tag, None)
         if encoder is not None:
             await encoder.close()
@@ -622,8 +704,12 @@ class MIoTVideoStreamManager:
         token_hash: str,
         camera_id: str,
         channel: int,
+        fps: int | None = None,
     ) -> str:
         """New video stream connection.
+
+        ``fps`` is the live frame rate this viewer asks for (clamped to
+        ``camera.live_max_fps``); a camera serves the highest requested rate.
 
         Body is serialised by ``self._lock_for(camera_tag)`` so the
         is_first_subscriber check, SDK registration, encoder allocation, and
@@ -638,8 +724,11 @@ class MIoTVideoStreamManager:
             # before any browser tab opens doesn't cause us to start a
             # second SDK callback.
             sdk_just_started = not self._has_subscribers(camera_tag)
+            live_fps = resolve_live_fps(fps)
             if sdk_just_started:
-                await self._ensure_sdk_subscription(camera_id, channel, camera_tag)
+                await self._ensure_sdk_subscription(
+                    camera_id, channel, camera_tag, fps=live_fps
+                )
             user_tag = f"{user_name}.{token_hash}"
             self._camera_connect_map[camera_tag].setdefault(user_tag, OrderedDict())
             connection_id = str(self._camera_connect_id)
@@ -655,6 +744,7 @@ class MIoTVideoStreamManager:
                 on_dead=self._evict_stale_connection,
                 maxsize=8,
             )
+            sender.live_fps = live_fps
             self._camera_connect_map[camera_tag][user_tag][connection_id] = sender
             logger.info(
                 "New video stream connection, %s, %s, %s",
@@ -686,6 +776,7 @@ class MIoTVideoStreamManager:
             if cached_codec is not None and not sdk_just_started:
                 # init 走队列与数据帧同序;统一 offer,消灭所有裸 send 路径。
                 sender.offer(_MSG_TEXT, self._build_init_msg(cached_codec))
+            await self._retarget_live_rate(camera_id, channel, camera_tag)
 
         return connection_id
 
@@ -722,6 +813,7 @@ class MIoTVideoStreamManager:
             # Teardown only when *both* WS clients and recorders are gone;
             # otherwise an active recorder would lose its NAL feed mid-clip.
             await self._teardown_if_idle(camera_id, channel, camera_tag)
+            await self._retarget_live_rate(camera_id, channel, camera_tag)
 
     async def register_recorder(
         self,
@@ -775,6 +867,70 @@ class MIoTVideoStreamManager:
         for conn in self._camera_connect_map.get(camera_tag, {}).values():
             out.extend(conn.values())
         return out
+
+    def _requested_live_fps(self, camera_tag: str) -> int:
+        """Highest fps asked by the viewers of this camera (default when none)."""
+        rates = [
+            getattr(sender, "live_fps", 0)
+            for conn in self._camera_connect_map.get(camera_tag, {}).values()
+            for sender in conn.values()
+        ]
+        rates = [r for r in rates if r]
+        return max(rates) if rates else resolve_live_fps(None)
+
+    async def _retarget_live_rate(
+        self, camera_id: str, channel: int, camera_tag: str
+    ) -> None:
+        """Follow the fps requested by current viewers after a connect/disconnect."""
+        state = self._live_rate.get(camera_tag)
+        if state is None:
+            return
+        target = self._requested_live_fps(camera_tag)
+        if target == state.target_fps:
+            return
+        state.target_fps = target
+        state.current_fps = target
+        state.last_change = time.monotonic()
+        await self._apply_live_rate(camera_id, channel, camera_tag, "requested")
+
+    async def _apply_live_rate(
+        self, camera_id: str, channel: int, camera_tag: str, reason: str
+    ) -> None:
+        state = self._live_rate.get(camera_tag)
+        reg_id = self._camera_reg_id.get(camera_tag, -1)
+        if state is None or reg_id < 0:
+            return
+        await manager.miot_service.set_video_stream_interval(
+            camera_id, channel, reg_id, live_frame_interval_ms(state.current_fps)
+        )
+        if reason != "requested":
+            logger.warning(
+                "Live fps %s, %s: %d fps (requested %d)",
+                reason, cam_tag(camera_id, channel), state.current_fps, state.target_fps,
+            )
+        msg = json.dumps({
+            "type": "live_fps",
+            "fps": state.current_fps,
+            "requested": state.target_fps,
+            "reason": reason,
+        })
+        for sender in self._all_senders(camera_tag):
+            sender.offer(_MSG_TEXT, msg)
+
+    def _note_live_frame(
+        self, camera_id: str, channel: int, camera_tag: str, dropped: bool
+    ) -> None:
+        state = self._live_rate.get(camera_tag)
+        if state is None:
+            return
+        change = state.note_frame(dropped, time.monotonic())
+        if change is None:
+            return
+        task = asyncio.create_task(
+            self._apply_live_rate(camera_id, channel, camera_tag, change)
+        )
+        self._live_rate_tasks.add(task)
+        task.add_done_callback(self._live_rate_tasks.discard)
 
     def _all_websockets(self, camera_tag: str) -> list[WebSocket]:
         return [sender.ws for sender in self._all_senders(camera_tag)]
@@ -844,7 +1000,9 @@ class MIoTVideoStreamManager:
         # recorder 喂帧段:feed_bgr await 单线程 clip-enc,CPU 饥饿时录制窗口
         # 内同样可能堆积持帧 task(上界 ~450 帧/15s,有界且先于本 PR 存在)。
         if camera_tag in self._broadcast_inflight:
+            self._note_live_frame(did, channel, camera_tag, dropped=True)
             return
+        self._note_live_frame(did, channel, camera_tag, dropped=False)
         self._broadcast_inflight.add(camera_tag)
         try:
             # Announce the h264 init handshake once per camera_tag, BEFORE the

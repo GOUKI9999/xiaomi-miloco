@@ -135,6 +135,31 @@ class _CameraDeviceState:
     # 订阅完成时刻的 monotonic wall_ms。首帧未到（last_video_frame_ms == 0）时
     # 替代它参与静默判定，给「等首帧」一个上界，见 _FIRST_FRAME_THRESHOLD_MS。
     connected_at_ms: int = 0
+    # 最近一次收进 sync buffer 的视频帧时刻（monotonic ms），感知入口限速用。
+    last_accepted_video_ms: int = 0
+
+
+def _perception_frame_gap_ms() -> int:
+    """Minimum gap between video frames the perception buffer accepts.
+
+    Perception only consumes ``max(input.fps, input.omni_fps)`` frames per second,
+    but the decoder may run much faster (e.g. a live viewer raises it to the live
+    frame rate). Every frame put into the sync buffer is kept until its window is
+    drained, so frames beyond the perception rate are dropped at the entry point
+    instead of piling up. 10% slack avoids aliasing against the camera frame clock.
+    Returns 0 (accept everything) when the rate cannot be determined.
+    """
+    try:
+        engine_input = get_settings().perception.engine.get("input", {}) or {}
+        fps = max(
+            float(engine_input.get("fps", 0) or 0),
+            float(engine_input.get("omni_fps", 0) or 0),
+        )
+    except Exception:  # noqa: BLE001
+        return 0
+    if fps <= 0:
+        return 0
+    return int(1000 / fps * 0.9)
 
 
 class CameraDeviceAdapter(BaseDeviceAdapter):
@@ -846,6 +871,17 @@ class CameraDeviceAdapter(BaseDeviceAdapter):
                     # 避免 stale 回调虚高 SOURCE 节点的处理速率指标。
                     h.skip_rolling()
                     return
+                gap_ms = _perception_frame_gap_ms()
+                now_ms = _monotonic_ms()
+                if (
+                    gap_ms > 0
+                    and state.last_accepted_video_ms
+                    and now_ms - state.last_accepted_video_ms < gap_ms
+                ):
+                    # 比感知采样更密的帧（如实时画面提速时）不进 buffer，避免整帧堆积。
+                    h.skip_rolling()
+                    return
+                state.last_accepted_video_ms = now_ms
                 wall_ms, unix_ms = self._calibrate(state, ts)
                 decode_latency_ms = self._compute_decode_latency(
                     recv_unix_ms, decoded_unix_ms
