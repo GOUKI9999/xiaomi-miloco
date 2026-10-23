@@ -315,6 +315,35 @@ describe("FoldMembers — 收起的出口在页脚,以及焦点落点", () => {
   });
 });
 
+describe("FoldMembers — 降级徽标穿得过折叠", () => {
+  /** 成员行的降级徽标由 ActionRow 画。折叠把动作行藏进成员表之后,这枚徽标是住户
+   *  唯一还能看到「当时授权已被拒、指令没发出去」的地方——所以它必须在**成员表内**
+   *  被找到,而不是只在未折叠态那一份渲染里。 */
+  const degradedBranch = () => {
+    const b = branch();
+    b.actions = b.actions.map((a, i) => (i === 0 ? { ...a, auth_state: "degraded" as const } : a));
+    return b;
+  };
+  const warningBadges = (html: string) =>
+    tagsIn(html, "span").filter((a) => (a["class"] ?? "").split(" ").includes("text-warning"));
+
+  it("标了 degraded 的成员在成员表里带这枚徽标", () => {
+    const members = membersOf(
+      renderToStaticMarkup(<FoldMembers branch={degradedBranch()} specs={new Map()} onToggle={noop} />),
+    );
+    expect(warningBadges(members), "降级徽标应当恰好一枚").toHaveLength(1);
+    expect(members).toContain("授权失效 · 已拒绝");
+    expectNoRawKeys(members);
+  });
+
+  it("没标的行不画它——null 是「当时还没这个维度」,不是「当时授权正常」", () => {
+    const members = membersOf(
+      renderToStaticMarkup(<FoldMembers branch={branch()} specs={new Map()} onToggle={noop} />),
+    );
+    expect(warningBadges(members)).toHaveLength(0);
+  });
+});
+
 describe("StrengthToggle — 两档、roving tabindex", () => {
   it("单选组、两枚 radio,选中的那枚才在 Tab 序列里", () => {
     const html = renderToStaticMarkup(<StrengthToggle strength="strong" onChange={noop} />);

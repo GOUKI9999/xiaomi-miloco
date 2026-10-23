@@ -9,13 +9,15 @@ v2:新增 action_ledger 表(agent 控制设备 / 播 TTS / 触发场景的持久
 
 v5:action_ledger 补链路两列 phase / trigger_event_id,并把迁移前的老行回填
 phase='legacy'——「写在链路记录之前」与「确实没有触发源」必须能分开。
+v6:action_ledger 补 auth_state(下发当时的米家授权状态)——只看 success /
+result_code 分不清「设备真的没响应」与「当时授权已失效、根本没发」。
 """
 from __future__ import annotations
 
 import sqlite3
 from pathlib import Path
 
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 
 _TRACES_SCHEMA = """
 CREATE TABLE IF NOT EXISTS traces (
@@ -139,6 +141,9 @@ CREATE INDEX IF NOT EXISTS idx_agent_runs_success ON agent_runs(success) WHERE s
 # 触发时还是退出时的那一支;trigger_event_id 指向触发它的事件行,是「动作折叠到
 # 事件之下」的唯一依据。非规则路径(人手直控、动态槽走 agent)两列均 NULL;
 # phase='legacy' 专指迁移前写入的老行——那时还没有链路可记。
+# auth_state 是下发当时的米家授权状态(v6)：ok | degraded。degraded 表示授权已被
+# 云端拒绝、下发被拒、请求根本没发出——只看 success/result_code 与「设备没响应」
+# 长得一样。迁移前的老行留 NULL,查询侧不得据此推断当时授权正常。
 _ACTION_LEDGER_SCHEMA = """
 CREATE TABLE IF NOT EXISTS action_ledger (
   id            TEXT    NOT NULL PRIMARY KEY,
@@ -157,6 +162,7 @@ CREATE TABLE IF NOT EXISTS action_ledger (
   source        TEXT,
   source_id     TEXT,
   home_id       TEXT,
+  auth_state    TEXT,
   phase         TEXT,
   trigger_event_id TEXT
 );
@@ -322,6 +328,25 @@ def _migrate_v5_action_link(conn: sqlite3.Connection) -> None:
     )
 
 
+def _migrate_v6_action_auth_state(conn: sqlite3.Connection) -> None:
+    """v5 → v6:给 action_ledger 补下发时的米家授权状态列 auth_state(幂等)。
+
+    授权被云端拒绝后设备控制会被直接拒绝、请求不再发出。只看 success/result_code
+    无法区分「设备真的没响应」与「当时授权已失效、根本没发」——事后排查「那晚灯
+    到底开没开」会卡在这里。老行为 NULL,表示写入时还没有这个维度,查询侧不得据此
+    推断当时授权正常。
+
+    单独占一个版本号,不并进上面那一步:v5 已经被链路两列用掉了,而 init_schema
+    在 ``cur == SCHEMA_VERSION`` 时直接返回、根本不进迁移——并进 v5 的话,已经被
+    链路那次迁移推到 5 的库会连这一步一起跳过,auth_state 永远补不上。缺这一列
+    不会报错:``_write_action_ledger`` 整体裹着 fail-open 的 try/except,写入失败
+    只留一条 warning,台账静默停记——而「分清被拒与没响应」正是加这一列的全部理由。
+    """
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(action_ledger)")}
+    if "auth_state" not in cols:
+        conn.execute("ALTER TABLE action_ledger ADD COLUMN auth_state TEXT")
+
+
 # 步进迁移注册表:{target_version: fn}。fn 以 additive DDL 为主,须幂等
 # (v5 例外:另含一次老行回填,同样幂等)。
 _MIGRATIONS = {
@@ -329,4 +354,5 @@ _MIGRATIONS = {
     3: _migrate_v3_action_source,
     4: _migrate_v4_action_home,
     5: _migrate_v5_action_link,
+    6: _migrate_v6_action_auth_state,
 }

@@ -30,7 +30,6 @@ import uuid
 from pathlib import Path
 from typing import Any, Optional
 
-
 # ---- 异常类 -------------------------------------------------------------
 # 对齐 backend AgentPlatformAdapter 契约：dispatcher 专 catch 此异常做特殊处理。
 # adapter 在 backend 同进程加载，可以 import base 模块。
@@ -62,16 +61,27 @@ _HTTP_BUFFER_S = 15.0
 _DEFAULT_HERMES_URL = os.environ.get("HERMES_API_URL", "http://127.0.0.1:8642")
 
 
-def _load_api_key() -> str:
-    """拿 API_SERVER_KEY:优先级 env > ~/.hermes/.env > 空。
+def _hermes_home() -> Path:
+    """返回当前 Hermes 数据目录，支持 ``HERMES_HOME=~/...``。
 
-    backend supervisor 一般不会 source ~/.hermes/.env,所以从这里 fallback 读。
-    install-hermes.sh Step 6 已保证 ~/.hermes/.env::API_SERVER_KEY 存在。
+    与 ``paths.hermes_home`` 保持一致；adapter 可独立部署到
+    ``agent_platform/hermes``，此时 paths.py 不一定可导入，故保留本地实现。
+    """
+    return Path(
+        os.environ.get("HERMES_HOME") or (Path.home() / ".hermes")
+    ).expanduser()
+
+
+def _load_api_key() -> str:
+    """拿 API_SERVER_KEY:优先级 env > $HERMES_HOME/.env > 空。
+
+    backend supervisor 一般不会 source Hermes 的 .env，所以从这里 fallback 读。
+    install-hermes.sh 已保证 $HERMES_HOME/.env::API_SERVER_KEY 存在。
     """
     key = os.environ.get("API_SERVER_KEY", "").strip()
     if key:
         return key
-    env_path = Path.home() / ".hermes" / ".env"
+    env_path = _hermes_home() / ".env"
     if env_path.is_file():
         try:
             for line in env_path.read_text(encoding="utf-8").splitlines():
@@ -123,13 +133,13 @@ def _mtime_or_zero(path: Path) -> float:
 def _resolve_trace_dir() -> Path:
     """``$MILOCO_HOME/trace/agent/`` —— plugin trace.py 写盘位置。
 
-    默认 settings.directories.miloco_home 解析失败时回退 ``~/.openclaw/miloco``。
+    默认 settings.directories.miloco_home 解析失败时回退 Hermes 的数据目录。
     """
     try:
         from .paths import miloco_home
         return miloco_home() / "trace" / "agent"
     except Exception:
-        return Path("~/.openclaw/miloco/trace/agent").expanduser()
+        return _hermes_home() / "miloco" / "trace" / "agent"
 
 
 # ---------------------------------------------------------------------------
@@ -153,7 +163,7 @@ def _resolve_owner_session() -> tuple[Optional[str], Optional[str]]:
     channel 对象的 ``id`` 字段即为 session_id。返回 (session_id, platform)。
     均为 None 表示还没绑过 IM。
     """
-    channel_file = Path.home() / ".hermes" / "channel_directory.json"
+    channel_file = _hermes_home() / "channel_directory.json"
     try:
         data = json.loads(channel_file.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):

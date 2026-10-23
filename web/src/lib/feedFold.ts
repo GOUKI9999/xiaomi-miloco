@@ -42,6 +42,11 @@ export interface FoldActionLike extends ActionLike {
   phase?: string | null;
   /** v5:宿主事件主键。null = 这条动作没有触发源(或早于链路记录)。 */
   trigger_event_id?: string | null;
+  /** v6:下发当时的米家授权状态。'degraded' = 授权已被云端拒绝,这条下发被拒、
+   *  请求未发出;老行为 null(写入时还没有这个维度,不能据此推断当时授权正常)。
+   *  两档强度都要画它——强档收进事件行后,这一行是住户唯一还能看到「当时已被拒」
+   *  的地方。 */
+  auth_state?: "ok" | "degraded" | null;
 }
 
 /** 挂不上宿主时那枚 chip 的种类。三种意思完全不同,不能合并:

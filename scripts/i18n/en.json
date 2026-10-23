@@ -152,11 +152,16 @@
   "platform.title": "Agent platform",
   "platform.subtitle": "Choose which agent runtime to install the plugin for",
   "platform.already_set": "Already specified as %1 via --agent-platform",
-  "platform.skip_non_interactive": "Non-interactive mode, defaulting to openclaw",
   "platform.ask": "Which agent platform should Miloco be installed for?",
   "platform.openclaw_option": "OpenClaw",
   "platform.hermes_option": "Hermes Agent",
   "platform.selected": "Platform selected: %1",
+  "platform.non_interactive_requires_explicit": "Non-interactive installation requires the caller to specify agent_platform",
+  "platform.explicit_not_detected": "Warning: --agent-platform=%1 was specified, but no installed runtime was detected; using the explicit value.",
+  "platform.explicit_mismatch": "Warning: --agent-platform=%1 was specified, but %2 was detected; using the explicit value.",
+  "platform.detect_failed": "No agent runtime was detected (neither Hermes nor OpenClaw):\n  - Hermes: HERMES_HOME is set, ~/.hermes/ exists, or ~/.config/systemd/user/hermes-gateway.service exists\n  - OpenClaw: ~/.openclaw/ exists, or ~/.config/systemd/user/openclaw-gateway.service exists\nInstall Hermes or OpenClaw first, or pass --agent-platform=hermes/openclaw",
+  "platform.legacy_home_warning": "Warning: legacy Hermes data directory %1 was found, but the current directory is %2; legacy data will not be migrated.",
+  "platform.pointer_overwrite_warning": "Warning: the default runtime pointer currently targets %1 and will be replaced with %2. For multiple agent platforms, set MILOCO_RUNTIME_ENV to a dedicated profile for each platform.",
 
   "summary.restart_hermes_desc": "restart Hermes gateway to pick up the new plugin"
 }

@@ -20,14 +20,97 @@ from __future__ import annotations
 
 import json
 import os
+import shlex
 import tempfile
 from copy import deepcopy
 from pathlib import Path
 from typing import Any
 
 
+def _default_runtime_env() -> Path:
+    """返回当前用户的默认 runtime 指针文件路径。"""
+    return Path.home() / ".config" / "miloco" / "default.env"
+
+
+def _read_env_file(path: Path) -> dict[str, str]:
+    """读取格式受限的 ``KEY=VALUE`` 环境文件。
+
+    解析规则需与 ``scripts/install.py::_read_runtime_pointer`` 保持一致；
+    Hermes 安装脚本中也有等价写入逻辑，因为独立安装脚本不能
+    导入 CLI 包。
+    """
+    if not path.is_file():
+        return {}
+    out: dict[str, str] = {}
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return {}
+    for raw in lines:
+        line = raw.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        try:
+            assignment = shlex.split(line, comments=False, posix=True)
+        except ValueError:
+            continue
+        if len(assignment) != 1 or "=" not in assignment[0]:
+            continue
+        key, _, value = assignment[0].partition("=")
+        key = key.strip()
+        if not key or not (key[0].isalpha() or key[0] == "_"):
+            continue
+        if not all(c.isalnum() or c == "_" for c in key):
+            continue
+        out[key] = value
+    return out
+
+
+def _runtime_env_candidates() -> list[Path]:
+    candidates: list[Path] = []
+    if runtime_env := os.environ.get("MILOCO_RUNTIME_ENV"):
+        candidates.append(Path(runtime_env).expanduser())
+    default = _default_runtime_env()
+    if default not in candidates:
+        candidates.append(default)
+    return candidates
+
+
+def read_runtime_env() -> dict[str, str]:
+    """读取默认指针，并将可选 profile 覆盖到默认值之上。
+
+    Linux supervisord 会接收这里解析出的全部键；macOS LaunchAgent 仅透传
+    ``MILOCO_*`` 及代理/CA 白名单键。跨平台 profile 应优先使用 ``MILOCO_*``。
+    """
+    merged: dict[str, str] = {}
+    for path in reversed(_runtime_env_candidates()):
+        merged.update(_read_env_file(path))
+    return merged
+
+
+def bootstrap_runtime_env() -> None:
+    """在解析配置路径前加载已安装的 runtime 指针。
+
+    ``MILOCO_HOME`` 未设置时无法通过 ``$MILOCO_HOME/.env`` 找到自身，因此
+    安装器会写入稳定的用户级指针 ``~/.config/miloco/default.env``。
+    ``MILOCO_RUNTIME_ENV`` 可用于服务管理器或多平台 profile 的显式覆盖。
+    """
+    if os.environ.get("MILOCO_HOME"):
+        return
+
+    values = read_runtime_env()
+    home = values.get("MILOCO_HOME")
+    if home:
+        for key, value in values.items():
+            os.environ.setdefault(key, value)
+        os.environ["MILOCO_HOME"] = home
+
+
 def miloco_home() -> Path:
-    """返回 ``$MILOCO_HOME``，未设置则落回 ``~/.openclaw/miloco``。"""
+    """加载 runtime 指针后返回 ``$MILOCO_HOME``。"""
+    if env := os.environ.get("MILOCO_HOME"):
+        return Path(env).expanduser()
+    bootstrap_runtime_env()
     if env := os.environ.get("MILOCO_HOME"):
         return Path(env).expanduser()
     return Path.home() / ".openclaw" / "miloco"
@@ -105,6 +188,11 @@ _SCHEMA_PATHS: dict[str, tuple[type, Any, str]] = {
         str,
         "",
         "仅 Gemini：每帧视觉 token 预算档位（\"\"/\"low\"=省，\"high\"=小目标更清但 4× token），下一周期生效",
+    ),
+    "perception.engine.input.omni_visual_input_mode": (
+        str,
+        "video",
+        "Omni 视觉输入模式（video=视频，image=图片）",
     ),
     # 本表这两个是 Smart Crop 的**全局**闸，相与后仍只是必要条件——还要该机位自己的
     # per-camera 闸也开（`miloco-cli scope camera crop-on/crop-off` 逐路配，默认开），
@@ -422,6 +510,13 @@ def _coerce(path: str, raw: str) -> Any:
             raise ValueError(
                 f"{path} 仅支持 low / high（留空=默认 low），收到 {raw!r}。"
                 f"注：Gemini media_resolution 有效档位只有 low/high，medium 等同 low。"
+            )
+        return norm
+    if path == "perception.engine.input.omni_visual_input_mode":
+        norm = raw.strip().lower()
+        if norm not in ("video", "image"):
+            raise ValueError(
+                f"{path} 仅支持 video / image，收到 {raw!r}"
             )
         return norm
     # min_suggestion_urgency 与 backend PerceptionSettings 的 Literal 对齐——CLI 先兜住,

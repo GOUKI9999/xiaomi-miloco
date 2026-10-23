@@ -5,8 +5,10 @@
 fire_record / trace）与 provider 无关。
 
 adapter 职责：
-  - build_video_block / build_audio_block —— 构建 OpenAI 规范的多模态 content block
-    （内部 IR 恒为 OpenAI 形态，供 trace / 摘要复用）。
+  - build_video_block / build_audio_block / build_image_block —— 构建 OpenAI 规范的
+    多模态 content block（内部 IR 恒为 OpenAI 形态，供 trace / 摘要复用）。video / audio
+    各 provider 字段有别故由子类覆写；image 块所有 provider 同构（标准 ``image_url``），
+    默认实现落在基类，provider 有特化需求时再覆写。
   - build_request_body —— 把 OpenAI messages 转成 provider 的线上请求体。
   - endpoint / auth_headers —— provider 的请求 URL 与鉴权头。
   - parse_response / parse_stream_chunk —— 把 provider 响应反解析回 OpenAI 形态
@@ -18,6 +20,7 @@ OpenAI 兼容族（MiMo / Qwen）继承 ``OpenAICompatAdapter``，协议方法�
 
 from __future__ import annotations
 
+import base64
 import logging
 import uuid
 from abc import ABC, abstractmethod
@@ -98,6 +101,23 @@ class OmniProviderAdapter(ABC):
     @abstractmethod
     def build_audio_block(self, audio_base64: str, media: LocalMediaInfo) -> dict[str, Any]:
         """构建 audio-only content block（恒为 OpenAI 形态）。"""
+
+    def build_image_block(self, data: bytes) -> dict[str, Any]:
+        """构建单帧图片 content block（image 序列模式逐帧调用，恒为 OpenAI 形态）。
+
+        ``data`` 是一张 JPEG 的原始字节（见 ``prompt_builder.EncodedImageFrame.data``），
+        方法内部负责 base64 + data URI 封装。
+
+        与 video / audio 不同，图片块在各 provider 间同构——OpenAI 兼容族原生吃
+        ``image_url``，Gemini 的 ``_content_to_parts`` 也把 ``image_url`` 统一转成
+        ``inline_data``（与 crop 图块同路）。故默认实现落在基类、非抽象；某 provider
+        若要特化（额外字段 / 非 jpeg / 尺寸上限）再在子类覆写。
+        """
+        b64 = base64.b64encode(data).decode()
+        return {
+            "type": "image_url",
+            "image_url": {"url": f"data:image/jpeg;base64,{b64}"},
+        }
 
     @abstractmethod
     def build_request_body(
@@ -496,6 +516,9 @@ class GeminiAdapter(OmniProviderAdapter):
         # 刷屏,也弱化"名字不含 flash"这个粗判据对 gemini-3-pro 等大概率可用模型的误报噪音。
         if "flash" not in model.lower() and model not in _warned_non_flash_gemini:
             _warned_non_flash_gemini.add(model)
+            # model 来自用户配置,记日志前清掉 CR/LF 防日志注入(CodeQL log-injection)。
+            # 就地包在实参上而不是先赋给中间变量：这一处只为打日志存在，中间变量会让人
+            # 以为它另有用途。
             logger.warning(
                 "[omni] GeminiAdapter 默认发 thinkingConfig.thinkingBudget=0,仅对 gemini-3-flash "
                 "系列验证过;model=%s 若为强制思考模型(如 gemini-2.5-pro)会 400,需按模型放开此项",

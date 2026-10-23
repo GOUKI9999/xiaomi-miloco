@@ -20,6 +20,7 @@ import type {
   HomeEntrySource,
   HomeEntryType,
   HomeStatus,
+  MiotAuthorizeResult,
   Features,
   PerceptionCamera,
   Person,
@@ -70,6 +71,10 @@ interface MiotStatus {
   user_info?: { uid: string; nickname: string; icon?: string };
   /** 最多投喂数(后端 MAX_ENABLED_CAMERAS)，随状态下发。 */
   max_enabled_cameras?: number;
+  /** 授权健康度。与 is_bound 正交：令牌续期被云端拒绝、但 access_token 还没
+   *  到期时 is_bound 仍是 true，只看它会漏报。老后端不返回此字段。 */
+  auth_state?: "ok" | "degraded";
+  auth_degraded_since?: number | null;
 }
 
 // 太短 / 全标点 / 数字 ID / 全是零宽字符 的 nickname 不算可读名字
@@ -214,6 +219,14 @@ export async function realHomeStatus(): Promise<HomeStatus> {
     ).catch(() => null),
   ]);
 
+  // 三路全灭 = 后端不可达，不是「未绑定」也不是「未失效」。单路失败仍按原逻辑
+  // 降级（那是局部故障，其余数据还有意义）；全灭时必须抛错，让上层保留上一份
+  // 数据——否则会合成一份「成功的假状态」（未绑定、设备数 0、失效档消失），
+  // 状态条在后端重启的十几秒里退回黄色「未连」，红色失效提示也被一并吞掉。
+  if (!miot && !home && !engine) {
+    throw new Error("home status unavailable: all upstream calls failed");
+  }
+
   // areas 里偶尔混入 home_id（纯数字字符串），过滤掉
   const realAreas = (home?.data.areas ?? []).filter(
     (a) => !/^\d+$/.test(a.name),
@@ -225,6 +238,10 @@ export async function realHomeStatus(): Promise<HomeStatus> {
       accountName: cleanAccountName(miot?.data.user_info?.nickname),
       userIcon: miot?.data.user_info?.icon,
       userUid: miot?.data.user_info?.uid,
+      // 请求整个失败时 miot 为 null——此时不该报「授权异常」，那是网络问题不是
+      // 授权问题。只有后端明确说 degraded 才算。老后端没有这个字段，同样按 ok。
+      authDegraded: miot?.data.auth_state === "degraded",
+      authDegradedSince: miot?.data.auth_degraded_since ?? undefined,
       devicesCount: home?.data.devices.length ?? 0,
       roomsCount: realAreas.length,
     },
@@ -1214,11 +1231,19 @@ export async function realBindMiot(): Promise<{ oauthUrl: string }> {
 export async function realAuthorizeMiot(
   code: string,
   state: string,
-): Promise<void> {
-  await apiFetch<Normal<unknown>>("/api/miot/authorize", {
+): Promise<MiotAuthorizeResult> {
+  const r = await apiFetch<
+    Normal<{ account_changed?: boolean; scope_preserved?: boolean } | null>
+  >("/api/miot/authorize", {
     method: "POST",
     body: JSON.stringify({ code, state }),
   });
+  // 老后端不返回这两个字段（data 为 null）：取不到就按原行为走——当成换了账号、
+  // 配置未保留，于是照旧跑选家流程。宁可多问一次，不要静默跳过而把配置丢了。
+  return {
+    accountChanged: r.data?.account_changed ?? true,
+    scopePreserved: r.data?.scope_preserved ?? false,
+  };
 }
 
 export async function realUnbindMiot(): Promise<void> {
@@ -1383,6 +1408,9 @@ interface BackendMeaningfulEvent {
   has_trace?: boolean;
   /** 任一 device 目录下有 ref.jpg → 本事件走了 Smart Crop,有全景参考帧可取. */
   has_ref?: boolean;
+  visual_artifact_kind?: "video" | "images" | "audio" | "none";
+  image_frame_counts?: Record<string, number>;
+  has_audio_artifact?: boolean;
   has_feedback?: boolean;
   feedback_pack_path?: string | null;
   feedback_pack_size?: number | null;
@@ -1425,6 +1453,9 @@ export async function realListActivity(opts?: {
       clip_kind: e.clip_kind,
       has_trace: e.has_trace,
       has_ref: e.has_ref,
+      visual_artifact_kind: e.visual_artifact_kind,
+      image_frame_counts: e.image_frame_counts,
+      has_audio_artifact: e.has_audio_artifact,
       has_feedback: e.has_feedback,
       feedback_pack_path: e.feedback_pack_path,
       feedback_pack_size: e.feedback_pack_size,
@@ -1458,6 +1489,16 @@ export function realOnDemandClipUrl(logId: string, deviceId: string): string {
   return token ? `${base}?token=${encodeURIComponent(token)}` : base;
 }
 
+export function realOnDemandImageUrl(
+  logId: string,
+  deviceId: string,
+  frameIndex: number,
+): string {
+  const token = resolveToken();
+  const base = `/api/perception/on-demand-logs/${encodeURIComponent(logId)}/images/${encodeURIComponent(deviceId)}/${frameIndex}`;
+  return token ? `${base}?token=${encodeURIComponent(token)}` : base;
+}
+
 export async function realSubmitOnDemandFeedback(
   logId: string,
   errorTypes: string[],
@@ -1487,6 +1528,16 @@ export async function realSubmitOnDemandFeedback(
 export function realEventClipUrl(event_id: string, device_id: string): string {
   const token = resolveToken();
   const base = `/api/events/${encodeURIComponent(event_id)}/clip/${encodeURIComponent(device_id)}`;
+  return token ? `${base}?token=${encodeURIComponent(token)}` : base;
+}
+
+export function realEventImageUrl(
+  event_id: string,
+  device_id: string,
+  frame_index: number,
+): string {
+  const token = resolveToken();
+  const base = `/api/events/${encodeURIComponent(event_id)}/images/${encodeURIComponent(device_id)}/${frame_index}`;
   return token ? `${base}?token=${encodeURIComponent(token)}` : base;
 }
 
@@ -1583,6 +1634,9 @@ export function realSubscribeEvents(
         clip_kind: payload.clip_kind,
         has_trace: payload.has_trace,
         has_ref: payload.has_ref,
+        visual_artifact_kind: payload.visual_artifact_kind,
+        image_frame_counts: payload.image_frame_counts,
+        has_audio_artifact: payload.has_audio_artifact,
         has_feedback: payload.has_feedback,
         feedback_pack_path: payload.feedback_pack_path,
         feedback_pack_size: payload.feedback_pack_size,

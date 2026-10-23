@@ -17,12 +17,11 @@ from __future__ import annotations
 
 import json
 import logging
-import os
 from pathlib import Path
 from typing import Any, Dict, Optional
 
 from . import tools_notify as tn
-from .paths import miloco_home
+from .paths import hermes_home, miloco_home
 
 logger = logging.getLogger(__name__)
 
@@ -130,9 +129,9 @@ def _check_cron_jobs() -> Dict[str, Any]:
 
 
 def _check_skills_installed() -> Dict[str, Any]:
-    """检查 miloco-* skill 是否装到 ~/.hermes/skills/（至少 16 个）。"""
+    """检查 miloco-* skill 是否装到 $HERMES_HOME/skills/（至少 16 个）。"""
     min_expected = 16
-    skills_dir = Path.home() / ".hermes" / "skills"
+    skills_dir = hermes_home() / "skills"
     if not skills_dir.is_dir():
         return {"ok": False, "installed": 0, "expected": min_expected, "fix": "重跑 install-hermes.sh"}
     installed = sorted(
@@ -189,14 +188,14 @@ def _check_versions(ctx: Any) -> Dict[str, Any]:
             cur_miloco = f"err:{exc}"
     # plugin 版本（从装好的 plugin.yaml 读）
     try:
-        import os as _os
         manifest_base = getattr(getattr(ctx, "manifest", None), "path", "")
         candidates = []
         if manifest_base and Path(manifest_base).is_dir():
             candidates.append(Path(manifest_base) / "plugin.yaml")
         # 兜底：install-hermes.sh 的装入点（dev / pip 都落这）
-        hermes_home = Path(_os.environ.get("HERMES_HOME") or Path.home() / ".hermes")
-        candidates.append(hermes_home / "plugins" / "miloco" / "miloco-plugin" / "plugin.yaml")
+        candidates.append(
+            hermes_home() / "plugins" / "miloco" / "miloco-plugin" / "plugin.yaml"
+        )
         cur_plugin = "unknown"
         for plugin_yaml in candidates:
             if plugin_yaml and plugin_yaml.is_file():
@@ -561,5 +560,3 @@ def make_test_push_handler(ctx: Any):
             result = {"ok": False, "error": f"internal error: {exc}"}
         return json.dumps(result, ensure_ascii=False)
     return _handler
-
-
