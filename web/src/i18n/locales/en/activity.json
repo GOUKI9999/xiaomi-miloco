@@ -80,6 +80,7 @@
     "perceptionClamped": "No start time set — showing the last 7 days (from {{from}}); set a start time above to look further back",
     "perceptionLimited": "Hit the per-query row cap — showing only the newest {{n}} rows of this window; move the end time above earlier to look further back",
     "perceptionEmpty": "No valid visual descriptions in this time range",
+    "perceptionEmptyRoom": "No valid visual descriptions for the selected room in this time range",
     "perceptionLoadFailed": "Failed to load perception logs: {{msg}}",
     "tabOnDemand": "Queries",
     "odLoaded": "{{n}} loaded{{more}}",

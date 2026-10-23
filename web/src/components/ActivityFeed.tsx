@@ -71,6 +71,7 @@ import {
 import { TimeLabel } from "./TimeLabel";
 import {
   ALL_ROOMS,
+  actionMatchesRoom,
   buildRoomFeedRows,
   filterPerceptionLogs,
   listRooms,
@@ -697,12 +698,16 @@ export function ActivityFeed({
   const { actionsClipped, actionsTruncated } = useMemo(() => {
     if (!showActions) return { actionsClipped: false, actionsTruncated: false };
     const lower = feedLowerBound(events, showEvents, appliedSince, hasMore);
-    const clipped = actions.some((a) => a.timestamp < lower);
+    // 加号承诺的是本房间翻页能显出的动作；别的房间被地平线压住不算数。
+    // 500 上限是取数时的全局事实（在房间筛选之前生效），所以 truncated 仍看全量。
+    const clipped = actions.some(
+      (a) => a.timestamp < lower && actionMatchesRoom(a, room, deviceRooms),
+    );
     const truncated =
       actions.length >= ACTIONS_LIMIT &&
       Math.min(...actions.map((a) => a.timestamp)) > lower;
     return { actionsClipped: clipped || truncated, actionsTruncated: truncated };
-  }, [actions, showActions, events, showEvents, appliedSince, hasMore]);
+  }, [actions, showActions, events, showEvents, appliedSince, hasMore, room, deviceRooms]);
 
   // 两条流各自带自己的 "+",不再用合并总数糊弄过去。
   const loadedDetail = [
@@ -891,6 +896,13 @@ export function ActivityFeed({
                 />
                 {t("actions.filterActions")}
               </label>
+              {/* 折叠开关 + 强度。与上面两个 checkbox 不是一回事:那两个决定"有哪些流",
+                  这两枚决定"动作怎么画"——勾着事件、勾着动作,动作可以各自一行(关掉折叠),
+                  也可以折进事件(开着折叠,再分两档)。三种画法都保留全部数据,所以它们放在
+                  筛选旁边而不是筛选里面。
+                  关掉折叠时强度控件**整个不渲染**:未折叠态没有"折叠强度"这回事,留着一个
+                  不生效的控件就是在问一个当前不成立的问题(它的 aria-controls 也随之不写,
+                  见 FeedFold 的 STRENGTH_CTL_ID)。 */}
               <FoldToggle folded={folded} onChange={setFolded} />
               {folded && <StrengthToggle strength={strength} onChange={setStrength} />}
             </>
@@ -1227,7 +1239,9 @@ function PerceptionLogList({ homeId, active, since, before, deviceNames, room, d
   if (visibleLogs.length === 0) {
     return (
       <div className="text-body text-center py-10 text-text-secondary">
-        <div>{t("activity.perceptionEmpty")}</div>
+        <div>
+          {t(room === ALL_ROOMS ? "activity.perceptionEmpty" : "activity.perceptionEmptyRoom")}
+        </div>
         {clampedSince !== undefined && (
           <div className="mt-1 text-caption text-text-tertiary">
             {t("activity.perceptionClamped", {
