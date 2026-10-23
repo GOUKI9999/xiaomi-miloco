@@ -929,6 +929,29 @@ export async function realDeviceSpecs(): Promise<
   return byDid;
 }
 
+/** 设备台账里的名称与房间（Activity 房间筛选 / 设备名映射用）。
+ *  只读 /api/miot/home（与 realListDevices 共用 5s 缓存），不逐台拉 /status：
+ *  78 台设备逐台拉状态要二十多秒，房间下拉不能等它。
+ *  未分配房间记为空串，与设备列表的「N rooms」口径一致，不进入房间选项。 */
+export interface DeviceDirectoryEntry {
+  did: string;
+  name: string;
+  room: string;
+}
+
+export async function realListDeviceDirectory(): Promise<DeviceDirectoryEntry[]> {
+  const r = await fetchMiotHome();
+  const unassigned = i18n.t("miot.unassigned");
+  return r.data.devices.map((d) => {
+    const room = cleanRoom(d.room);
+    return {
+      did: d.did,
+      name: cleanDeviceName(d.name),
+      room: room === unassigned ? "" : room,
+    };
+  });
+}
+
 export async function realListDevices(): Promise<Device[]> {
   const r = await fetchMiotHome();
   const devices = r.data.devices;

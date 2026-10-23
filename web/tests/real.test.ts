@@ -17,6 +17,7 @@ import {
   realListActivity,
   realListPerceptionLogs,
   realListDevices,
+  realListDeviceDirectory,
   realGetUsageStats,
   realGetOmniConfig,
   realUpdateOmniConfig,
@@ -123,6 +124,41 @@ describe("realListDevices — device status contract", () => {
       statusText: "Unlocked",
       statusKind: "unlocked",
     });
+  });
+});
+
+describe("realListDeviceDirectory — room filter source", () => {
+  it("reads names and rooms from /api/miot/home without per-device status calls", async () => {
+    // 跳过 fetchMiotHome 的 5s 缓存，避免拿到上一个用例的 home 数据。
+    const now = vi.spyOn(Date, "now").mockReturnValue(Date.now() + 3_600_000);
+    mockFetchByUrl({
+      "/api/miot/home": {
+        code: 0,
+        message: "ok",
+        data: {
+          devices: [
+            { did: "cam-1", name: ".的客厅摄像头", online: true, model: "m", room: "客厅" },
+            { did: "plug-1", name: "Plug", online: true, model: "m", room: "123456" },
+            { did: "lamp-1", name: "Lamp", online: true, model: "m" },
+          ],
+          areas: [],
+          scenes: [],
+          persons: [],
+        },
+      },
+    });
+    try {
+      const dir = await realListDeviceDirectory();
+      expect(dir).toEqual([
+        { did: "cam-1", name: "客厅摄像头", room: "客厅" },
+        { did: "plug-1", name: "Plug", room: "" },
+        { did: "lamp-1", name: "Lamp", room: "" },
+      ]);
+      const urls = vi.mocked(globalThis.fetch).mock.calls.map((c) => String(c[0]));
+      expect(urls.some((u) => u.includes("/status"))).toBe(false);
+    } finally {
+      now.mockRestore();
+    }
   });
 });
 

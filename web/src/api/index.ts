@@ -325,6 +325,14 @@ export async function listDevices(homeId?: HomeId): Promise<Device[]> {
   return impl.realListDevices();
 }
 
+/** did / 名称 / 房间的轻量台账，不含设备状态，首屏几秒内可用。 */
+export async function listDeviceDirectory(
+  homeId?: HomeId,
+): Promise<realImpl.DeviceDirectoryEntry[]> {
+  if (!isPrimary(homeId)) return [];
+  return impl.realListDeviceDirectory();
+}
+
 /** did → 该设备的 spec 表。日志页把台账里的 iid 翻成人话用。
  *  与设备控制页共用同一个 /api/miot/home 取数与缓存，不额外拉每台设备的状态。 */
 export async function listDeviceSpecs(

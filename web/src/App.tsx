@@ -10,6 +10,7 @@ import {
   listOnDemandLogs,
   listCameras,
   listDevices,
+  listDeviceDirectory,
   listHomeEntries,
   listPersons,
   listPets,
@@ -187,13 +188,16 @@ function MainApp() {
   const onDemandLogs = useAsync(() => listOnDemandLogs(homeId), [homeId], {
     errorLabel: t("app.loadOnDemandLogsFail", "Failed to load on-demand logs"),
   });
+  // Activity 的设备名与房间筛选只需要台账，不等 devices 逐台拉完状态（大户型要二十多秒）。
+  // 与 devices 同源（/api/miot/home），失败提示由 devices 那一路给，这里不重复弹。
+  const deviceDirectory = useAsync(() => listDeviceDirectory(homeId), [homeId]);
   const deviceNames = useMemo(
-    () => Object.fromEntries((devices.data ?? []).map((d) => [d.did, d.name])),
-    [devices.data],
+    () => Object.fromEntries((deviceDirectory.data ?? []).map((d) => [d.did, d.name])),
+    [deviceDirectory.data],
   );
   const deviceRooms = useMemo(
-    () => buildRoomIndex(devices.data ?? []),
-    [devices.data],
+    () => buildRoomIndex(deviceDirectory.data ?? []),
+    [deviceDirectory.data],
   );
   // 家庭档案（候选区 + 正式区记忆）——家庭 tab 用，成员抽屉与非人面板共享。
   const home = useAsync(() => listHomeEntries(homeId), [homeId], {
