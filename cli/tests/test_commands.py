@@ -3,6 +3,7 @@
 import json
 from unittest.mock import patch
 
+import click
 import pytest
 from click.testing import CliRunner
 
@@ -244,7 +245,7 @@ def test_config_set_multi_pair_atomic(runner, isolated_config):
             "config",
             "set",
             "model.omni.model",
-            "xiaomi/mimo-v2.5",
+            "mimo-v2.6-flash",
             "model.omni.base_url",
             "https://api.xiaomimimo.com/v1",
             "model.omni.api_key",
@@ -264,7 +265,7 @@ def test_config_set_multi_pair_atomic(runner, isolated_config):
     from miloco_cli.config import load_config
 
     cfg = load_config()
-    assert cfg["model"]["omni"]["model"] == "xiaomi/mimo-v2.5"
+    assert cfg["model"]["omni"]["model"] == "mimo-v2.6-flash"
     assert cfg["model"]["omni"]["base_url"] == "https://api.xiaomimimo.com/v1"
     assert cfg["model"]["omni"]["api_key"] == "sk-xxxxx"
 
@@ -1929,6 +1930,168 @@ def test_service_stop_not_running(runner, tmp_path, monkeypatch):
     assert data["message"] == "not running"
 
 
+def test_service_stop_not_ready_unbound_port_sigkills_after_shutdown(runner, monkeypatch):
+    """未就绪 + 端口还没监听（= 已证还没进 serve 阶段）分支（Linux/supervisord）：
+    必须**先 shutdown 再直接 SIGKILL** —— 反了 autorestart=true 会立刻把它拉起来；
+    先 kill 是为了不等它（启动期的 SIGTERM 要秒级才轮到处理）。收的方式是按进程名
+    全扫，因为这类后端可能还没被 supervisord 记上 PID、也还没监听端口，只按 pid/
+    端口找会漏，漏下的会继续初始化到 bind 端口（等于"报了 stopped 后端又起来"）。"""
+    from types import SimpleNamespace
+
+    import miloco_cli.commands.service as svc_mod
+
+    order: list[str] = []
+
+    def _ctl(*args, **kwargs):
+        order.append(" ".join(str(a) for a in args))
+        return SimpleNamespace(returncode=0, stdout="888", stderr="")
+
+    with (
+        patch.object(svc_mod, "_backend_ready", return_value=False),
+        patch.object(svc_mod, "_supervisord_is_running", return_value=True),
+        patch.object(svc_mod, "_get_backend_pid_from_supervisor", return_value=777),
+        patch.object(svc_mod, "_find_miloco_backend_pids", return_value=[777]),
+        patch.object(svc_mod, "_supervisorctl", side_effect=_ctl),
+        patch.object(svc_mod, "_kill_now", side_effect=lambda pid: order.append(f"kill {pid}")),
+        patch.object(svc_mod, "_terminate", side_effect=lambda pid, grace=6.0: order.append(f"term {pid}")),
+        patch.object(svc_mod, "_find_supervisord_pids", return_value=[]),
+        patch.object(svc_mod, "_find_pid_by_port", return_value=None),  # 端口未绑定
+        patch.object(svc_mod, "_is_port_in_use", return_value=False),
+    ):
+        result = runner.invoke(cli, ["service", "stop"])
+
+    assert result.exit_code == 0
+    assert "kill 777" in order, f"未就绪+端口未绑定时必须直接 SIGKILL，实际 order={order}"
+    assert order.index("shutdown") < order.index("kill 777")
+
+
+def test_service_stop_control_channel_down_reaps_before_killing(runner, monkeypatch):
+    """控制通道失联（sock/conf 缺失但守护进程还活着）时，shutdown 那一步整个被跳过 ——
+    必须先 reap 守护进程再杀后端：否则 autorestart=true 会把刚杀掉的子进程立刻重生，
+    而新生的那个已不归任何人管（按端口也找不到，还没 bind），正是本函数要消灭的
+    「报了 stopped 后端又起来」。"""
+    from types import SimpleNamespace
+
+    import miloco_cli.commands.service as svc_mod
+
+    order: list[str] = []
+
+    with (
+        patch.object(svc_mod, "_backend_ready", return_value=False),
+        patch.object(svc_mod, "_supervisord_is_running", return_value=False),  # 控制通道失联
+        patch.object(svc_mod, "_find_miloco_backend_pids", return_value=[777]),
+        patch.object(svc_mod, "_find_supervisord_pids", return_value=[555]),  # 守护进程还活着
+        patch.object(svc_mod, "_supervisorctl", return_value=SimpleNamespace(returncode=0, stdout="", stderr="")),
+        patch.object(svc_mod, "_terminate", side_effect=lambda pid, grace=6.0: order.append(f"term {pid}")),
+        patch.object(svc_mod, "_kill_now", side_effect=lambda pid: order.append(f"kill {pid}")),
+        patch.object(svc_mod, "_find_pid_by_port", return_value=None),
+        patch.object(svc_mod, "_is_port_in_use", return_value=False),
+    ):
+        result = runner.invoke(cli, ["service", "stop"])
+
+    assert result.exit_code == 0
+    assert order.index("term 555") < order.index("kill 777"), f"必须先 reap 守护进程：{order}"
+
+
+def test_service_stop_not_ready_never_terminates_foreign_port_holder(runner, monkeypatch):
+    """未就绪档的端口兜底 grace 已被压成≈0（事实 SIGKILL），所以必须先验归属：端口被
+    用户其它服务占用时绝不能被收掉。就绪档保持原样（本 PR 不动那条路）。"""
+    import miloco_cli.commands.service as svc_mod
+
+    def _run(miloco_owned: bool) -> list[int]:
+        killed: list[int] = []
+        with (
+            patch.object(svc_mod, "_backend_ready", return_value=False),
+            patch.object(svc_mod, "_supervisord_is_running", return_value=False),
+            patch.object(svc_mod, "_find_miloco_backend_pids", return_value=[]),
+            patch.object(svc_mod, "_find_supervisord_pids", return_value=[]),
+            patch.object(svc_mod, "_find_pid_by_port", return_value=999),
+            patch.object(svc_mod, "_is_miloco_backend_proc", return_value=miloco_owned),
+            patch.object(
+                svc_mod,
+                "_terminate",
+                side_effect=lambda pid, grace=6.0: killed.append(pid),
+            ),
+            patch.object(svc_mod, "_is_port_in_use", return_value=False),
+        ):
+            result = runner.invoke(cli, ["service", "stop"])
+        assert result.exit_code == 0
+        return killed
+
+    assert _run(miloco_owned=False) == [], "不该动占了端口的用户进程"
+    assert _run(miloco_owned=True) == [999], "能证明是 miloco 的端口占用者仍要收"
+
+
+def test_service_stop_not_ready_shutdown_rpc_shares_budget(runner, monkeypatch):
+    """未就绪时 supervisorctl shutdown 的 RPC 超时必须吃共享预算：它自带的 8s 上限会
+    把「探活 ≤1s + 预算 3s」的上界顶成 9s，越过调用方 5s 的硬失败线。就绪路径仍用 8s。"""
+    from types import SimpleNamespace
+
+    import miloco_cli.commands.service as svc_mod
+
+    timeouts: list[float] = []
+
+    def _ctl(*args, **kwargs):
+        if args and args[0] == "shutdown":
+            timeouts.append(kwargs.get("timeout", 8.0))
+        return SimpleNamespace(returncode=0, stdout="888", stderr="")
+
+    with (
+        patch.object(svc_mod, "_backend_ready", return_value=False),
+        patch.object(svc_mod, "_supervisord_is_running", return_value=True),
+        patch.object(svc_mod, "_get_backend_pid_from_supervisor", return_value=None),
+        patch.object(svc_mod, "_find_miloco_backend_pids", return_value=[]),
+        patch.object(svc_mod, "_supervisorctl", side_effect=_ctl),
+        patch.object(svc_mod, "_terminate", return_value=None),
+        patch.object(svc_mod, "_find_supervisord_pids", return_value=[]),
+        patch.object(svc_mod, "_find_pid_by_port", return_value=None),
+        patch.object(svc_mod, "_is_port_in_use", return_value=False),
+    ):
+        result = runner.invoke(cli, ["service", "stop"])
+
+    assert result.exit_code == 0
+    assert timeouts, "未就绪时 shutdown 必须显式带 timeout"
+    assert all(t <= svc_mod._STOP_BUDGET_S for t in timeouts), timeouts
+
+
+def test_service_stop_not_ready_bound_port_keeps_bounded_grace(runner, monkeypatch):
+    """未就绪但**端口已绑定**（忙/卡，可能真收了点东西）时不能直接砍：仍走有界优雅
+    （_terminate），且 grace 只能花总预算的剩余部分。"""
+    from types import SimpleNamespace
+
+    import miloco_cli.commands.service as svc_mod
+
+    graces: list[float] = []
+    order: list[str] = []
+
+    def _ctl(*args, **kwargs):
+        order.append(" ".join(str(a) for a in args))
+        return SimpleNamespace(returncode=0, stdout="888", stderr="")
+
+    with (
+        patch.object(svc_mod, "_backend_ready", return_value=False),
+        patch.object(svc_mod, "_supervisord_is_running", return_value=True),
+        patch.object(svc_mod, "_get_backend_pid_from_supervisor", return_value=777),
+        patch.object(svc_mod, "_find_miloco_backend_pids", return_value=[777]),
+        patch.object(svc_mod, "_supervisorctl", side_effect=_ctl),
+        patch.object(svc_mod, "_kill_now", side_effect=lambda pid: order.append(f"kill {pid}")),
+        patch.object(
+            svc_mod,
+            "_terminate",
+            side_effect=lambda pid, grace=6.0: graces.append(grace),
+        ),
+        patch.object(svc_mod, "_find_supervisord_pids", return_value=[]),
+        patch.object(svc_mod, "_find_pid_by_port", return_value=777),  # 端口已绑定
+        patch.object(svc_mod, "_is_port_in_use", return_value=False),
+    ):
+        result = runner.invoke(cli, ["service", "stop"])
+
+    assert result.exit_code == 0
+    assert not [x for x in order if x.startswith("kill")], "端口已绑定时不该直接 SIGKILL"
+    assert graces, "端口已绑定的未就绪后端仍要有界优雅地收"
+    assert all(0.0 <= g <= svc_mod._STOP_BUDGET_S for g in graces)
+
+
 def test_generate_supervisor_conf_injects_timezone_from_config(runner, tmp_path, monkeypatch):
     """config.json 有 timezone → 生成的 supervisord.conf environment 行带 TZ + MILOCO_TIMEZONE。"""
     import miloco_cli.commands.service as svc_mod
@@ -1970,6 +2133,52 @@ def test_generate_supervisor_conf_omits_timezone_when_unset(runner, tmp_path, mo
     assert ',TZ="' not in conf
     assert "MILOCO_TIMEZONE" not in conf
     assert 'MILOCO_SUPERVISED="1"' in conf
+
+
+def test_generate_supervisor_conf_escapes_runtime_env_values(
+    runner, tmp_path, monkeypatch
+):
+    """runtime env 中的百分号、引号和反斜杠不能破坏 supervisor 配置。"""
+    import miloco_cli.commands.service as svc_mod
+
+    monkeypatch.setattr(
+        svc_mod,
+        "_read_runtime_env",
+        lambda: {"MILOCO_SECRET": '100%"quoted\\path'},
+    )
+
+    svc_mod._generate_supervisor_conf("/x/python -m miloco")
+    conf = svc_mod._supervisor_conf().read_text()
+
+    assert "MILOCO_SECRET='100%%\"quoted\\path'" in conf
+
+
+def test_supervisor_env_item_preserves_backslashes_and_rejects_inline_comments():
+    """supervisord 的双引号路径不能折叠反斜杠，内联注释只能明确拒绝。"""
+    from supervisor.datatypes import dict_of_key_value_pairs
+
+    import miloco_cli.commands.service as svc_mod
+
+    value = r"C:\certs\client"
+    item = svc_mod._supervisor_env_item("MILOCO_TOKEN", value)
+    assert item == f"MILOCO_TOKEN='{value}'"
+    assert dict_of_key_value_pairs(item + ",")["MILOCO_TOKEN"] == value
+
+    for invalid in ("abc #1", "abc ;1"):
+        with pytest.raises(click.ClickException, match="内联注释"):
+            svc_mod._supervisor_env_item("MILOCO_TOKEN", invalid)
+
+
+def test_supervisor_env_item_preserves_comma_in_value():
+    """值内含逗号时，supervisord 必须将引号内内容还原为单值。"""
+    from supervisor.datatypes import dict_of_key_value_pairs
+
+    import miloco_cli.commands.service as svc_mod
+
+    value = "a,b,c"
+    item = svc_mod._supervisor_env_item("MILOCO_LIST", value)
+
+    assert dict_of_key_value_pairs(item + ",")["MILOCO_LIST"] == value
 
 
 def test_service_logs_dir_not_found(runner, tmp_path, monkeypatch):

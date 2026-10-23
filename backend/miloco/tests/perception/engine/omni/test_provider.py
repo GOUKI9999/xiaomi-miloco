@@ -1,5 +1,7 @@
 """Tests for Omni Provider Adapter."""
 
+import base64
+
 from miloco.perception.engine.omni import provider
 from miloco.perception.engine.omni.provider import (
     GeminiAdapter,
@@ -7,6 +9,7 @@ from miloco.perception.engine.omni.provider import (
     MiMoAdapter,
     OpenAICompatAdapter,
     QwenOmniAdapter,
+    build_request_headers,
     get_adapter,
 )
 
@@ -21,9 +24,38 @@ _AUDIO_MEDIA = LocalMediaInfo(
 _MESSAGES = [{"role": "user", "content": "test"}]
 
 
+class TestBuildRequestHeaders:
+    adapter = MiMoAdapter()
+
+    def test_opencode_go_gets_stable_session_header(self):
+        first = build_request_headers(
+            self.adapter, "https://opencode.ai/zen/go/v1", "secret-key"
+        )
+        second = build_request_headers(
+            self.adapter, "https://opencode.ai/zen/go/v1/", "secret-key"
+        )
+
+        assert first["x-opencode-session"] == second["x-opencode-session"]
+        assert first["x-opencode-session"].startswith("ses_")
+        assert len(first["x-opencode-session"]) == 36
+        assert "secret-key" not in first["x-opencode-session"]
+        assert first["User-Agent"].startswith("xiaomi-miloco/")
+        assert first["Authorization"] == "Bearer secret-key"
+
+    def test_other_endpoints_do_not_get_opencode_header(self):
+        for base_url in (
+            "https://api.openai.com/v1",
+            "https://opencode.ai/zen/v1",
+            "https://opencode.ai.evil.example/zen/go/v1",
+            "http://opencode.ai/zen/go/v1",
+        ):
+            headers = build_request_headers(self.adapter, base_url, "secret-key")
+            assert "x-opencode-session" not in headers
+
+
 class TestGetAdapter:
     def test_mimo_default(self):
-        assert isinstance(get_adapter("xiaomi/mimo-v2.5"), MiMoAdapter)
+        assert isinstance(get_adapter("mimo-v2.6-flash"), MiMoAdapter)
 
     def test_mimo_unknown(self):
         assert isinstance(get_adapter("some-unknown-model"), MiMoAdapter)
@@ -43,17 +75,20 @@ class TestGetAdapter:
     def test_gemini(self):
         assert isinstance(get_adapter("gemini-3-flash-preview"), GeminiAdapter)
 
+    def test_gemini_36_flash(self):
+        assert isinstance(get_adapter("gemini-3.6-flash"), GeminiAdapter)
+
     def test_gemini_case_insensitive(self):
         assert isinstance(get_adapter("Gemini-3-Pro"), GeminiAdapter)
 
     def test_openai_compat_family(self):
         # MiMo / Qwen 都归 OpenAI 兼容族；Gemini 不是。
-        assert isinstance(get_adapter("xiaomi/mimo-v2.5"), OpenAICompatAdapter)
+        assert isinstance(get_adapter("mimo-v2.6-flash"), OpenAICompatAdapter)
         assert isinstance(get_adapter("qwen3.5-omni-flash"), OpenAICompatAdapter)
         assert not isinstance(get_adapter("gemini-3-flash-preview"), OpenAICompatAdapter)
 
     def test_singleton(self):
-        assert get_adapter("xiaomi/mimo-v2.5") is get_adapter("xiaomi/mimo-v2.5")
+        assert get_adapter("mimo-v2.6-flash") is get_adapter("mimo-v2.6-flash")
         assert get_adapter("qwen3.5-omni-flash") is get_adapter("qwen3.5-omni-plus")
         assert get_adapter("gemini-3-flash") is get_adapter("gemini-3-pro")
 
@@ -68,14 +103,25 @@ class TestMiMoAdapter:
         assert block["media_resolution"] == "max"
         assert block["video_url"]["url"].startswith("data:video/mp4;base64,")
 
-    def test_audio_block(self):
+    def test_audio_block_has_format(self):
+        """根因回归守护:audio 块缺 format 是 2026-07-29 422×3 → OPEN_CONFIG 停摆的起点。"""
         block = self.adapter.build_audio_block("BBBB", _AUDIO_MEDIA)
         assert block["type"] == "input_audio"
+        assert block["input_audio"]["format"] == "m4a"
         assert block["input_audio"]["data"].startswith("data:audio/m4a;base64,")
+
+    def test_image_block_default_jpeg_data_uri(self):
+        # image 块各 provider 同构,走基类默认实现;入参是原始 JPEG 字节,方法内部 base64。
+        block = self.adapter.build_image_block(b"\xff\xd8rawjpeg")
+        assert block["type"] == "image_url"
+        prefix = "data:image/jpeg;base64,"
+        url = block["image_url"]["url"]
+        assert url.startswith(prefix)
+        assert base64.b64decode(url[len(prefix):]) == b"\xff\xd8rawjpeg"
 
     def test_request_body_non_stream(self):
         body = self.adapter.build_request_body(
-            _MESSAGES, model="xiaomi/mimo-v2.5",
+            _MESSAGES, model="mimo-v2.6-flash",
             max_tokens=512, temperature=0.1, top_p=0.95, stream=False,
         )
         assert body["stream"] is False
@@ -84,7 +130,7 @@ class TestMiMoAdapter:
 
     def test_request_body_stream(self):
         body = self.adapter.build_request_body(
-            _MESSAGES, model="xiaomi/mimo-v2.5",
+            _MESSAGES, model="mimo-v2.6-flash",
             max_tokens=512, temperature=0.1, top_p=0.95, stream=True,
         )
         assert body["stream"] is True
@@ -241,18 +287,34 @@ class TestGeminiAdapter:
         assert video_part["video_metadata"] == {"fps": 1}
         assert "video_metadata" not in video_part["inline_data"]
 
-    def test_request_body_image_and_audio_inline_data(self):
+    def test_request_body_multiple_images_and_audio_inline_data(self):
         messages = [{"role": "user", "content": [
-            {"type": "image_url", "image_url": {"url": "data:image/png;base64,IMG"}},
+            {"type": "image_url", "image_url": {"url": "data:image/jpeg;base64,IMG1"}},
+            {"type": "image_url", "image_url": {"url": "data:image/jpeg;base64,IMG2"}},
             self.adapter.build_audio_block("AUD", _AUDIO_MEDIA),
         ]}]
         body = self.adapter.build_request_body(
-            messages, model="gemini-3-flash",
+            messages, model="gemini-3.6-flash",
             max_tokens=512, temperature=0.1, top_p=0.95,
         )
         parts = body["contents"][0]["parts"]
-        assert parts[0]["inline_data"] == {"mime_type": "image/png", "data": "IMG"}
-        assert parts[1]["inline_data"] == {"mime_type": "audio/mp4", "data": "AUD"}
+        assert parts[0]["inline_data"] == {"mime_type": "image/jpeg", "data": "IMG1"}
+        assert parts[1]["inline_data"] == {"mime_type": "image/jpeg", "data": "IMG2"}
+        assert parts[2]["inline_data"] == {"mime_type": "audio/mp4", "data": "AUD"}
+
+    def test_image_block_round_trips_through_request_body_to_inline_data(self):
+        # image 块下沉 adapter 的前提:build_image_block 产出的通用 image_url 块,经 Gemini
+        # 原生转换(_content_to_parts)能正确落成 inline_data。端到端钉住这条路,防止将来
+        # 有人改 build_image_block 形态却漏了 Gemini 侧转换。
+        block = self.adapter.build_image_block(b"\xff\xd8rawjpeg")
+        messages = [{"role": "user", "content": [block]}]
+        body = self.adapter.build_request_body(
+            messages, model="gemini-3.6-flash",
+            max_tokens=512, temperature=0.1, top_p=0.95,
+        )
+        part = body["contents"][0]["parts"][0]
+        assert part["inline_data"]["mime_type"] == "image/jpeg"
+        assert base64.b64decode(part["inline_data"]["data"]) == b"\xff\xd8rawjpeg"
 
     def test_parse_response_to_openai_shape(self):
         raw = {

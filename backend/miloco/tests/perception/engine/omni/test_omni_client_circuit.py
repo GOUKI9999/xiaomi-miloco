@@ -14,6 +14,7 @@ from miloco.perception.engine.omni.error_classifier import (
     ClassifiedError,
     ErrorCategory,
 )
+from miloco.perception.engine.omni.provider import build_request_headers, get_adapter
 
 
 class _FakeResp:
@@ -41,7 +42,19 @@ class _FakeResp:
             )
 
 
-def _fake_async_client(resp: _FakeResp | None = None, *, exc: Exception | None = None):
+def _fake_async_client(
+    resp: _FakeResp | None = None,
+    *,
+    exc: Exception | None = None,
+    sent: list[dict] | None = None,
+):
+    """``sent`` 非None 时把每次 post 收到的 kwargs 追加进去(headers 传输层断言用)。
+
+    原来 ``post(*a, **k)`` 直接吞掉 kwargs,所以「call_omni 发出的头」从来没被测过——
+    call_omni 手写一份 headers 还是复用 build_request_headers,现有测试一样绿。传
+    ``sent`` 就能把真正上线的 headers 抓出来断言,不改变 fake 的其余行为。
+    """
+
     class _C:
         def __init__(self, *a, **k):
             pass
@@ -55,6 +68,8 @@ def _fake_async_client(resp: _FakeResp | None = None, *, exc: Exception | None =
         async def post(self, *a, **k):
             if exc:
                 raise exc
+            if sent is not None:
+                sent.append({"url": a[0] if a else k.get("url"), **k})
             return resp
 
     return _C
@@ -67,10 +82,10 @@ def _reset_cb():
     reset_omni_circuit_breaker_for_tests()
 
 
-def _cfg() -> OmniConfig:
+def _cfg(base_url: str = "https://x/v1") -> OmniConfig:
     return OmniConfig(
         model="m",
-        base_url="https://x/v1",
+        base_url=base_url,
         api_key="sk-1",
         temperature=0,
         top_p=1,
@@ -210,11 +225,11 @@ async def test_call_omni_bad_response_non_dict(monkeypatch):
     assert snap.state == "warn" and snap.code == "bad_response"
 
 
-# ─── resolve_live_omni_config × 三元组变化 ──────────────────────────────────
+# ─── resolve_live_omni_config × 指纹变化 ────────────────────────────────────
 
 
 async def test_resolve_live_config_no_change_keeps_state(monkeypatch):
-    """三元组不变时不动熔断。"""
+    """指纹不变时不动熔断。"""
     from miloco.config import reset_settings
 
     reset_settings()
@@ -224,13 +239,13 @@ async def test_resolve_live_config_no_change_keeps_state(monkeypatch):
     assert cb.snapshot().state == "error"
 
     # 第一次调用建立 cache
-    if hasattr(omni_client._maybe_reset_breaker_on_config_change, "_last_triple"):
-        del omni_client._maybe_reset_breaker_on_config_change._last_triple
+    if hasattr(omni_client._maybe_reset_breaker_on_config_change, "_last_fingerprint"):
+        del omni_client._maybe_reset_breaker_on_config_change._last_fingerprint
     base = OmniConfig(model="m1", base_url="https://x/v1", api_key="sk-1")
     omni_client.resolve_live_omni_config(base)
     # 第二次调用同样值:不 reset
     omni_client.resolve_live_omni_config(base)
-    # settings 里的 api_key 和 base.api_key 一样(sk-1),triple 不变
+    # settings 里的 api_key 和 base.api_key 一样(sk-1),指纹不变
     assert cb.snapshot().state == "error"
 
 
@@ -246,8 +261,8 @@ async def test_resolve_live_config_strips_trailing_slash(monkeypatch):
     from miloco.config import reset_settings
 
     reset_settings()
-    if hasattr(omni_client._maybe_reset_breaker_on_config_change, "_last_triple"):
-        del omni_client._maybe_reset_breaker_on_config_change._last_triple
+    if hasattr(omni_client._maybe_reset_breaker_on_config_change, "_last_fingerprint"):
+        del omni_client._maybe_reset_breaker_on_config_change._last_fingerprint
 
     class _Mo:
         model = "m1"
@@ -268,15 +283,16 @@ async def test_resolve_live_config_strips_trailing_slash(monkeypatch):
 
 
 async def test_resolve_live_config_change_resets_breaker(monkeypatch):
-    """settings.model.omni 三元组变化时清熔断。"""
+    """settings.model.omni 指纹变化时清熔断。"""
     from miloco.config import reset_settings
 
     reset_settings()
     cb = get_omni_circuit_breaker()
-    omni_client._maybe_reset_breaker_on_config_change._last_triple = (
+    omni_client._maybe_reset_breaker_on_config_change._last_fingerprint = (
         "m1",
         "https://x/v1",
         "sk-OLD",
+        "video",  # 视觉输入模式也是指纹的一维, 缺了这维 prev 长度对不上
     )
     for _ in range(3):
         await cb.record_failure(ClassifiedError("bad_key", "m", ErrorCategory.CONFIG))
@@ -311,6 +327,70 @@ async def test_resolve_live_config_change_resets_breaker(monkeypatch):
 
     await asyncio.sleep(0)
     assert cb.snapshot().state == "ok"
+
+
+def _settings_with_mode(mode: str):
+    """settings 替身: 只带熔断指纹用到的字段, 模式可换。"""
+
+    class _Mo:
+        model = "m1"
+        base_url = "https://x/v1"
+        api_key = "sk-1"
+
+    class _M:
+        omni = _Mo()
+
+    class _P:
+        engine = {"input": {"omni_visual_input_mode": mode}}
+
+    class _S:
+        model = _M()
+        perception = _P()
+
+    return _S()
+
+
+async def test_resolve_live_config_mode_change_resets_breaker(monkeypatch):
+    """只有视觉输入模式变了也要清熔断, 没变则不许清。
+
+    熔断是两种模式共用一个计数器的: 视频模式连挂到阈值后切到图片模式, 新模式会被上一
+    模式的失败计数挡在门外, 表现出来是"切了模式还是不通" —— 而这恰恰是拿这个开关做
+    A/B 时最需要区分的一次切换。指纹里少了这一维, 上述现象静默发生、没有任何报错信号。
+
+    指纹不手写: 先经生产路径建立一次("模式没变不清"这一条只有真跑出来的 prev 才验得
+    了 —— 手写的 prev 长度与变异后的指纹对不上, 会"因为长度不同"而清掉, 测试看着绿),
+    再只改模式调第二次。
+    """
+    import asyncio
+
+    import miloco.perception.engine.omni.omni_client as oc
+    from miloco.config import reset_settings
+
+    reset_settings()
+    if hasattr(oc._maybe_reset_breaker_on_config_change, "_last_fingerprint"):
+        del oc._maybe_reset_breaker_on_config_change._last_fingerprint
+
+    cb = get_omni_circuit_breaker()
+    base = OmniConfig(model="m1", base_url="https://x/v1", api_key="sk-1")
+
+    monkeypatch.setattr(
+        "miloco.config.get_settings", lambda: _settings_with_mode("video"), raising=True
+    )
+    oc.resolve_live_omni_config(base)  # 建立指纹
+    for _ in range(3):
+        await cb.record_failure(ClassifiedError("bad_key", "m", ErrorCategory.CONFIG))
+    assert cb.snapshot().state == "error"
+
+    oc.resolve_live_omni_config(base)  # 同模式: 指纹不变
+    await asyncio.sleep(0)
+    assert cb.snapshot().state == "error", "模式没变却把熔断清了"
+
+    monkeypatch.setattr(
+        "miloco.config.get_settings", lambda: _settings_with_mode("image"), raising=True
+    )
+    oc.resolve_live_omni_config(base)  # 只切模式
+    await asyncio.sleep(0)
+    assert cb.snapshot().state == "ok", "切了视觉输入模式却没清熔断"
 
 
 # ─── forced-stream 路径熔断器记录(review #1 回归防护) ──────────────────────
@@ -416,3 +496,69 @@ async def test_call_omni_forced_stream_500_records_failure(monkeypatch):
     snap = get_omni_circuit_breaker().snapshot()
     assert snap.state == "warn"
     assert snap.code == "http_error"
+
+
+# ─── call_omni 出站 headers(默认非流式路径的传输层不变量) ──────────────────
+#
+# 不变量:call_omni 默认路径(``body["stream"]`` falsy → 走 client.post)真正发到线上的
+# headers,必须逐项等于 build_request_headers() 的产物。
+#
+# 为什么必须在传输层测:omni_client 没有共享的 post() 辅助、没有 session 对象、没有
+# client 工厂 —— httpx.AsyncClient 在 call_omni 内部就地构造,headers 也就地拼好后
+# 直接传给 client.post。所以「运行时到底发了什么」只能在 client.post 的入参上看,
+# 测纯函数 build_request_headers() 只能证明它自己对自己是对的。
+#
+# 覆盖的是默认运行时路径(realtime / 感知循环驱动),而不是 forced-stream 分支:
+# forced-stream 由 ``body.get("stream", False)`` 决定并转给 _collect_stream_response,
+# 与这里的非流式出口是两个不同的调用点,单独钉住(本文件后半段已有forced-stream 熔断
+# 用例)。非流式是绝大多数 adapter 的常态,也是 OpenCode Go 拒收缺 session 头时最先
+# 崩的那条路。
+
+
+async def test_call_omni_sends_same_headers_as_build_request_headers(monkeypatch):
+    """OpenCode Go endpoint:出站 headers 逐项等于 build_request_headers() 的产物。
+
+    断言**整份字典相等**而不是「含有 x-opencode-session」:子集断言只能守住「少发」,
+    守不住「多发」—— 运行时给所有 endpoint 都塞一个 session 头、或多带一个
+    Content-Type,子集断言一样绿。而这两种漂移都是真实的:多发会让非 OpenCode Go
+    endpoint 带上本不该有的路由头,少发则直接被 OpenCode Go 拒收。相等两头都守。
+    """
+    sent: list[dict] = []
+    monkeypatch.setattr(
+        omni_client.httpx,
+        "AsyncClient",
+        _fake_async_client(resp=_FakeResp(200, {"choices": [], "usage": {}}), sent=sent),
+    )
+    base_url = "https://opencode.ai/zen/go/v1"
+
+    await omni_client.call_omni(_payload(), _cfg(base_url=base_url))
+
+    assert len(sent) == 1
+    runtime_headers = build_request_headers(get_adapter("m"), base_url, "sk-1")
+    assert sent[0]["headers"] == runtime_headers
+    # 显式钉住本 case 的意义:缺这一头 OpenCode Go 即拒收,「相等」的前提是它真在里面。
+    assert sent[0]["headers"]["x-opencode-session"].startswith("ses_")
+
+
+async def test_call_omni_omits_session_header_for_non_opencode_endpoint(monkeypatch):
+    """非 OpenCode Go endpoint:出站不含 x-opencode-session。
+
+    反向守「别顺手给所有 endpoint 都加头」—— 正确形态是「跟 build_request_headers
+    一样」,不是「总是带 session」。运行时对普通 endpoint 不发,发了就是把进程级
+    路由 ID 泄给无关第三方,也是新的分叉。
+    """
+    sent: list[dict] = []
+    monkeypatch.setattr(
+        omni_client.httpx,
+        "AsyncClient",
+        _fake_async_client(resp=_FakeResp(200, {"choices": [], "usage": {}}), sent=sent),
+    )
+    base_url = "https://api.openai.com/v1"
+
+    await omni_client.call_omni(_payload(), _cfg(base_url=base_url))
+
+    assert len(sent) == 1
+    assert "x-opencode-session" not in sent[0]["headers"]
+    assert sent[0]["headers"] == build_request_headers(
+        get_adapter("m"), base_url, "sk-1"
+    )
