@@ -40,6 +40,7 @@ import UpgradeNotice from "./components/UpgradeNotice";
 import { HeroNow } from "./components/HeroNow";
 import { DevicesByRoom } from "./components/DevicesByRoom";
 import { buildRoomIndex } from "./lib/roomFilter";
+import { readDeviceDirectory, saveDeviceDirectory } from "./lib/deviceDirectoryCache";
 import { ActivityFeed } from "./components/ActivityFeed";
 import { FamilyStrip } from "./components/FamilyStrip";
 import { PersonDrawer } from "./components/PersonDrawer";
@@ -191,14 +192,18 @@ function MainApp() {
   // Activity 的设备名与房间筛选只需要台账，不等 devices 逐台拉完状态（大户型要二十多秒）。
   // 与 devices 同源（/api/miot/home），失败提示由 devices 那一路给，这里不重复弹。
   const deviceDirectory = useAsync(() => listDeviceDirectory(homeId), [homeId]);
+  // 先用上次成功拉到的台账渲染（房间下拉随页面一起出现），拉取成功后再替换并写回缓存；
+  // 拉取失败时继续用缓存。
+  const cachedDirectory = useMemo(() => readDeviceDirectory(homeId), [homeId]);
+  useEffect(() => {
+    if (deviceDirectory.data) saveDeviceDirectory(homeId, deviceDirectory.data);
+  }, [deviceDirectory.data, homeId]);
+  const directory = deviceDirectory.data ?? cachedDirectory;
   const deviceNames = useMemo(
-    () => Object.fromEntries((deviceDirectory.data ?? []).map((d) => [d.did, d.name])),
-    [deviceDirectory.data],
+    () => Object.fromEntries((directory ?? []).map((d) => [d.did, d.name])),
+    [directory],
   );
-  const deviceRooms = useMemo(
-    () => buildRoomIndex(deviceDirectory.data ?? []),
-    [deviceDirectory.data],
-  );
+  const deviceRooms = useMemo(() => buildRoomIndex(directory ?? []), [directory]);
   // 家庭档案（候选区 + 正式区记忆）——家庭 tab 用，成员抽屉与非人面板共享。
   const home = useAsync(() => listHomeEntries(homeId), [homeId], {
     errorLabel: t("app.loadHomeEntriesFail"),
