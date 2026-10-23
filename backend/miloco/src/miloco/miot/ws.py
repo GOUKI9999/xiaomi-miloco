@@ -372,13 +372,15 @@ class _SubscriberSender:
 # ── 实时画面帧率 ─────────────────────────────────────────────────────────
 # 每路实时画面按观看者请求的帧率解码（多个观看者取最高），并在编码跟不上时自动降帧：
 # 上游的单飞门在 encode 忙时会丢帧，_LIVE_DEGRADE_WINDOW_S 内丢帧比例超过
-# _LIVE_DEGRADE_DROP_RATIO 就把该路帧率减半（最低 1fps）。恢复刻意保守（监控服务不该和
+# _LIVE_DEGRADE_DROP_RATIO 就把该路帧率降一档（LIVE_FPS_STEPS，最低 1fps）。恢复刻意保守（监控服务不该和
 # 其它进程反复抢 CPU）：降帧后至少 _LIVE_RESTORE_INITIAL_S 不丢帧才升一档；升档后若又被迫
 # 降帧，下次等待翻倍，上限 _LIVE_RESTORE_MAX_S；观看者改变请求帧率时才重置等待。
 _LIVE_DEGRADE_WINDOW_S = 10.0
 _LIVE_DEGRADE_DROP_RATIO = 0.3
 _LIVE_DEGRADE_MIN_FRAMES = 5
 _LIVE_RESTORE_INITIAL_S = 600.0
+# 降帧/恢复沿这些档位逐级移动，与前端帧率上限的选项一致（web/src/lib/liveFps.ts）。
+LIVE_FPS_STEPS = (1, 3, 5, 10, 20)
 _LIVE_RESTORE_MAX_S = 3600.0
 
 
@@ -387,6 +389,18 @@ def resolve_live_fps(requested: int | None) -> int:
     cam = get_settings().camera
     fps = requested if requested and requested > 0 else cam.live_default_fps
     return max(1, min(int(fps), int(cam.live_max_fps)))
+
+
+def step_down_fps(fps: int) -> int:
+    """Next lower live fps step (1 is the floor)."""
+    lower = [s for s in LIVE_FPS_STEPS if s < fps]
+    return lower[-1] if lower else 1
+
+
+def step_up_fps(fps: int, target: int) -> int:
+    """Next higher live fps step, never above the requested target."""
+    higher = [s for s in LIVE_FPS_STEPS if s > fps]
+    return min(target, higher[0]) if higher else target
 
 
 def live_frame_interval_ms(fps: int) -> int:
@@ -424,7 +438,7 @@ class _LiveRateState:
             and ratio > _LIVE_DEGRADE_DROP_RATIO
             and self.current_fps > 1
         ):
-            self.current_fps = max(1, self.current_fps // 2)
+            self.current_fps = step_down_fps(self.current_fps)
             change = "degraded"
             if self.last_restore:
                 # 升档后又撑不住：退避翻倍，避免周期性抢占 CPU
@@ -434,7 +448,7 @@ class _LiveRateState:
             and now - self.last_drop >= self.restore_wait
             and now - self.last_change >= self.restore_wait
         ):
-            self.current_fps = min(self.target_fps, self.current_fps * 2)
+            self.current_fps = step_up_fps(self.current_fps, self.target_fps)
             change = "restored"
             self.last_restore = now
         self.window_start = now

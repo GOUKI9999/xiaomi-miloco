@@ -46,14 +46,34 @@ def _feed(state, start, seconds, fps, drop_every):
     return changes, start + n / fps
 
 
-def test_sustained_drops_halve_rate_down_to_one_fps():
+def test_steps_match_the_web_selector_options():
+    assert ws_module.LIVE_FPS_STEPS == (1, 3, 5, 10, 20)
+
+
+def test_step_helpers_move_one_selector_step():
+    assert ws_module.step_down_fps(20) == 10
+    assert ws_module.step_down_fps(5) == 3
+    assert ws_module.step_down_fps(3) == 1
+    assert ws_module.step_down_fps(1) == 1
+    assert ws_module.step_down_fps(7) == 5
+    assert ws_module.step_up_fps(1, 20) == 3
+    assert ws_module.step_up_fps(3, 20) == 5
+    assert ws_module.step_up_fps(10, 20) == 20
+    assert ws_module.step_up_fps(5, 7) == 7
+    assert ws_module.step_up_fps(20, 20) == 20
+
+
+def test_sustained_drops_step_down_to_one_fps():
     state = _LiveRateState(target_fps=20, current_fps=20)
     changes, t = _feed(state, 1000.0, 11, 20, drop_every=2)
     assert changes == [("degraded", 10)]
     changes, t = _feed(state, t, 11, 10, drop_every=2)
     assert changes == [("degraded", 5)]
+    seen = []
     for _ in range(5):
-        _, t = _feed(state, t, 11, 5, drop_every=1)
+        changes, t = _feed(state, t, 11, 5, drop_every=1)
+        seen += [fps for _, fps in changes]
+    assert seen == [3, 1]
     assert state.current_fps == 1
 
 

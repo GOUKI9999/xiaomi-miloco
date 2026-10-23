@@ -4,6 +4,9 @@
  * 帧率越高，后端每路都要多解码、多重新编码，低配主机（如 4 核赛扬）开 4 路时
  * 3~5 fps 已接近上限；后端还会按 camera.live_max_fps 钳位，处理不过来时自动降帧。
  * 选择只存浏览器本地，经 iframe 的 ?fps= 传给 watch 页。
+ *
+ * 选项同时是后端自动降帧/恢复的档位（backend miloco/miot/ws.py 的 LIVE_FPS_STEPS），
+ * 两边需保持一致：降帧时逐级下移，恢复时逐级上移，不会出现选项以外的帧率。
  */
 export const LIVE_FPS_OPTIONS = [1, 3, 5, 10, 20] as const;
 export const DEFAULT_LIVE_FPS = 5;
