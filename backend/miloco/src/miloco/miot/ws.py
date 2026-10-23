@@ -372,12 +372,14 @@ class _SubscriberSender:
 # ── 实时画面帧率 ─────────────────────────────────────────────────────────
 # 每路实时画面按观看者请求的帧率解码（多个观看者取最高），并在编码跟不上时自动降帧：
 # 上游的单飞门在 encode 忙时会丢帧，_LIVE_DEGRADE_WINDOW_S 内丢帧比例超过
-# _LIVE_DEGRADE_DROP_RATIO 就把该路帧率减半（最低 1fps）；连续 _LIVE_RESTORE_QUIET_S
-# 不丢帧再逐级翻倍恢复到请求值。低配主机上选了过高帧率时不会把 CPU 长期打满。
+# _LIVE_DEGRADE_DROP_RATIO 就把该路帧率减半（最低 1fps）。恢复刻意保守（监控服务不该和
+# 其它进程反复抢 CPU）：降帧后至少 _LIVE_RESTORE_INITIAL_S 不丢帧才升一档；升档后若又被迫
+# 降帧，下次等待翻倍，上限 _LIVE_RESTORE_MAX_S；观看者改变请求帧率时才重置等待。
 _LIVE_DEGRADE_WINDOW_S = 10.0
 _LIVE_DEGRADE_DROP_RATIO = 0.3
 _LIVE_DEGRADE_MIN_FRAMES = 5
-_LIVE_RESTORE_QUIET_S = 60.0
+_LIVE_RESTORE_INITIAL_S = 600.0
+_LIVE_RESTORE_MAX_S = 3600.0
 
 
 def resolve_live_fps(requested: int | None) -> int:
@@ -402,6 +404,8 @@ class _LiveRateState:
     dropped: int = 0
     last_drop: float = 0.0
     last_change: float = 0.0
+    last_restore: float = 0.0
+    restore_wait: float = _LIVE_RESTORE_INITIAL_S
 
     def note_frame(self, dropped: bool, now: float) -> str | None:
         """Account one decoded frame; return "degraded"/"restored" when the rate changes."""
@@ -422,13 +426,17 @@ class _LiveRateState:
         ):
             self.current_fps = max(1, self.current_fps // 2)
             change = "degraded"
+            if self.last_restore:
+                # 升档后又撑不住：退避翻倍，避免周期性抢占 CPU
+                self.restore_wait = min(_LIVE_RESTORE_MAX_S, self.restore_wait * 2)
         elif (
             self.current_fps < self.target_fps
-            and now - self.last_drop >= _LIVE_RESTORE_QUIET_S
-            and now - self.last_change >= _LIVE_RESTORE_QUIET_S
+            and now - self.last_drop >= self.restore_wait
+            and now - self.last_change >= self.restore_wait
         ):
             self.current_fps = min(self.target_fps, self.current_fps * 2)
             change = "restored"
+            self.last_restore = now
         self.window_start = now
         self.frames = 0
         self.dropped = 0
@@ -835,8 +843,12 @@ class MIoTVideoStreamManager:
         camera_tag = f"{camera_id}.{channel}"
         async with self._lock_for(camera_tag):
             if not self._has_subscribers(camera_tag):
-                await self._ensure_sdk_subscription(camera_id, channel, camera_tag)
+                await self._ensure_sdk_subscription(
+                    camera_id, channel, camera_tag,
+                    fps=get_settings().camera.live_max_fps,
+                )
             self._camera_recorders.setdefault(camera_tag, []).append(recorder)
+            await self._retarget_live_rate(camera_id, channel, camera_tag)
             logger.info(
                 "Recorder attached, %s, active_count=%d",
                 camera_tag, len(self._camera_recorders[camera_tag]),
@@ -860,6 +872,7 @@ class MIoTVideoStreamManager:
                 if not lst:
                     self._camera_recorders.pop(camera_tag, None)
             await self._teardown_if_idle(camera_id, channel, camera_tag)
+            await self._retarget_live_rate(camera_id, channel, camera_tag)
 
     def _all_senders(self, camera_tag: str) -> list["_SubscriberSender"]:
         """该相机的全部订阅者发送通道快照。"""
@@ -876,6 +889,9 @@ class MIoTVideoStreamManager:
             for sender in conn.values()
         ]
         rates = [r for r in rates if r]
+        if self._camera_recorders.get(camera_tag):
+            # 录像片段（如成员录入）只持续十几秒，按上限帧率录，保证可用帧数
+            rates.append(resolve_live_fps(get_settings().camera.live_max_fps))
         return max(rates) if rates else resolve_live_fps(None)
 
     async def _retarget_live_rate(
@@ -891,6 +907,8 @@ class MIoTVideoStreamManager:
         state.target_fps = target
         state.current_fps = target
         state.last_change = time.monotonic()
+        state.last_restore = 0.0
+        state.restore_wait = _LIVE_RESTORE_INITIAL_S
         await self._apply_live_rate(camera_id, channel, camera_tag, "requested")
 
     async def _apply_live_rate(

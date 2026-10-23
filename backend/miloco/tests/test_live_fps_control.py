@@ -64,14 +64,42 @@ def test_light_drops_do_not_degrade():
     assert state.current_fps == 10
 
 
-def test_rate_recovers_stepwise_after_quiet_period():
+def test_rate_recovers_only_after_a_long_quiet_period():
     state = _LiveRateState(target_fps=20, current_fps=20)
     _, t = _feed(state, 1000.0, 11, 20, drop_every=2)
     assert state.current_fps == 10
-    changes, t = _feed(state, t, 55, 10, drop_every=0)
+    changes, t = _feed(state, t, 9 * 60, 10, drop_every=0)
     assert changes == []
-    changes, t = _feed(state, t, 20, 10, drop_every=0)
+    changes, t = _feed(state, t, 2 * 60, 10, drop_every=0)
     assert changes == [("restored", 20)]
+
+
+def test_restore_backoff_doubles_after_each_failed_restore():
+    state = _LiveRateState(target_fps=20, current_fps=20)
+    _, t = _feed(state, 1000.0, 11, 20, drop_every=2)
+    assert state.restore_wait == ws_module._LIVE_RESTORE_INITIAL_S
+    _, t = _feed(state, t, 11 * 60, 10, drop_every=0)
+    assert state.current_fps == 20
+    _, t = _feed(state, t, 11, 20, drop_every=2)
+    assert state.current_fps == 10
+    assert state.restore_wait == 2 * ws_module._LIVE_RESTORE_INITIAL_S
+    for _ in range(5):
+        state.last_restore = t
+        state.current_fps = 20
+        _, t = _feed(state, t, 11, 20, drop_every=2)
+    assert state.restore_wait == ws_module._LIVE_RESTORE_MAX_S
+
+
+def test_recorder_requests_max_rate_while_attached(camera_settings):
+    mgr = ws_module.MIoTVideoStreamManager()
+    tag = "cam.0"
+    mgr._camera_connect_map[tag] = {"u": {"1": SimpleNamespace(live_fps=5)}}
+    assert mgr._requested_live_fps(tag) == 5
+    mgr._camera_recorders[tag] = [object()]
+    assert mgr._requested_live_fps(tag) == 20
+    mgr._camera_recorders.pop(tag)
+    mgr._camera_connect_map.pop(tag)
+    assert mgr._requested_live_fps(tag) == 5
 
 
 def test_perception_gap_follows_engine_input_fps(monkeypatch):
