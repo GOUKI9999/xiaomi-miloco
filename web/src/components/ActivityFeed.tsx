@@ -732,14 +732,14 @@ export function ActivityFeed({
     [openKeys, openBranch, closeBranch],
   );
 
-  /** 跳到某一行并闪一下。弱档的徽标、以及"已展开但滚出视口"的徽标都走这里。 */
+  /** 跳到某一行并闪一下。已展开但滚出视口的徽标，以及回返角标都走这里。 */
   const locate = useCallback((scrollId: string, flashId: string = scrollId) => {
     setPending({ scroll: scrollId, flash: flashId, block: "center" });
   }, []);
 
   /** 事件行上那枚徽标被激活。同一个控件在两种情形下是两件事,判据只能是"看得见吗":
-   *  弱档恒为定位;强档未展开则就地展开,已展开且展开面还在视口里则收起,已展开但滚走了
-   *  则把它滚回来 —— 那时点一下是收起一个自己看不见的东西,画面毫无变化。 */
+   *  动作分组(弱档)跳到支行并展开，焦点落到第一条动作；并入事件(强档)未展开则就地展开，
+   *  已展开且展开面还在视口里则收起，已展开但滚走了则把它滚回来，避免收起看不见的内容。 */
   const activateBadge = useCallback(
     (branch: FoldBranch, hostKey: string) => {
       if (strength !== "strong") {
