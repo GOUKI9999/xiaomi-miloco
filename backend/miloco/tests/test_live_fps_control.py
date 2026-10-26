@@ -165,6 +165,17 @@ def test_perception_gap_follows_engine_input_fps(monkeypatch):
     assert adapter_module._perception_frame_gap_ms() == 0
 
 
+@pytest.mark.parametrize(
+    ("base", "omni", "gap"), [(3, 2, 225), (4, 3, 150), (1, 3, 300)]
+)
+def test_perception_gap_follows_omni_adjusted_fps(monkeypatch, base, omni, gap):
+    settings = SimpleNamespace(
+        perception=SimpleNamespace(engine={"input": {"fps": base, "omni_fps": omni}})
+    )
+    monkeypatch.setattr(adapter_module, "get_settings", lambda: settings)
+    assert adapter_module._perception_frame_gap_ms() == gap
+
+
 def test_encoder_forces_idr_by_time(monkeypatch):
     clock = {"t": 100.0}
     monkeypatch.setattr(transcoder_module.time, "monotonic", lambda: clock["t"])

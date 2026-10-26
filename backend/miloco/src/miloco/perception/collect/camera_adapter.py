@@ -142,7 +142,8 @@ class _CameraDeviceState:
 def _perception_frame_gap_ms() -> int:
     """Minimum gap between video frames the perception buffer accepts.
 
-    Perception only consumes ``max(input.fps, input.omni_fps)`` frames per second,
+    Perception consumes ``adjust_fps_for_omni(input.fps, input.omni_fps)`` frames
+    per second (the engine raises fps to an omni_fps multiple when needed),
     but the decoder may run much faster (e.g. a live viewer raises it to the live
     frame rate). Every frame put into the sync buffer is kept until its window is
     drained, so frames beyond the perception rate are dropped at the entry point
@@ -150,11 +151,12 @@ def _perception_frame_gap_ms() -> int:
     Returns 0 (accept everything) when the rate cannot be determined.
     """
     try:
+        from miloco.perception.engine.omni.provider import adjust_fps_for_omni
+
         engine_input = get_settings().perception.engine.get("input", {}) or {}
-        fps = max(
-            float(engine_input.get("fps", 0) or 0),
-            float(engine_input.get("omni_fps", 0) or 0),
-        )
+        base = int(float(engine_input.get("fps", 0) or 0))
+        omni = int(float(engine_input.get("omni_fps", 0) or 0))
+        fps = max(adjust_fps_for_omni(base, omni), base, omni)
     except Exception:  # noqa: BLE001
         return 0
     if fps <= 0:

@@ -373,7 +373,7 @@ function liveFpsQuery() {
 function showLiveFps(msg) {
   const el = $("fpsnote");
   if (!el) return;
-  if (msg.reason === "degraded" && msg.fps < msg.requested) {
+  if (msg.fps < msg.requested) {
     el.textContent = t("liveFpsDegraded")
       .replace("{fps}", String(msg.fps))
       .replace("{max}", String(msg.requested));
