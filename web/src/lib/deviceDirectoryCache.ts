@@ -35,3 +35,12 @@ export function saveDeviceDirectory(homeId: string, entries: DeviceDirectoryEntr
     /* 写不了就只在本会话生效 */
   }
 }
+
+/** 换家或换米家账号前调用：整页刷新后不能拿上一个家的台账先渲染，退回"等 fetch"。 */
+export function clearDeviceDirectory(homeId: string): void {
+  try {
+    localStorage.removeItem(DEVICE_DIRECTORY_KEY_PREFIX + homeId);
+  } catch {
+    /* 删不掉最多是 reload 后多渲染一次旧台账，拉取成功后即被替换 */
+  }
+}

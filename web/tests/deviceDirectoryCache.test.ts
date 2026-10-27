@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   DEVICE_DIRECTORY_KEY_PREFIX,
+  clearDeviceDirectory,
   readDeviceDirectory,
   saveDeviceDirectory,
 } from "@/lib/deviceDirectoryCache";
@@ -46,9 +47,17 @@ describe("deviceDirectoryCache", () => {
     expect(readDeviceDirectory("home-1")).toBeUndefined();
   });
 
+  it("clear removes the cached directory so the next load waits for the fetch", () => {
+    saveDeviceDirectory("primary", entries);
+    clearDeviceDirectory("primary");
+    expect(readDeviceDirectory("primary")).toBeUndefined();
+    expect(() => clearDeviceDirectory("never-saved")).not.toThrow();
+  });
+
   it("works without localStorage", () => {
     vi.stubGlobal("localStorage", undefined);
     expect(() => saveDeviceDirectory("home-1", entries)).not.toThrow();
+    expect(() => clearDeviceDirectory("home-1")).not.toThrow();
     expect(readDeviceDirectory("home-1")).toBeUndefined();
   });
 });

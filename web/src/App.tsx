@@ -40,7 +40,11 @@ import UpgradeNotice from "./components/UpgradeNotice";
 import { HeroNow } from "./components/HeroNow";
 import { DevicesByRoom } from "./components/DevicesByRoom";
 import { buildRoomIndex } from "./lib/roomFilter";
-import { readDeviceDirectory, saveDeviceDirectory } from "./lib/deviceDirectoryCache";
+import {
+  clearDeviceDirectory,
+  readDeviceDirectory,
+  saveDeviceDirectory,
+} from "./lib/deviceDirectoryCache";
 import { ActivityFeed } from "./components/ActivityFeed";
 import { FamilyStrip } from "./components/FamilyStrip";
 import { PersonDrawer } from "./components/PersonDrawer";
@@ -191,8 +195,18 @@ function MainApp() {
   });
   // Activity 的设备名与房间筛选只需要台账，不等 devices 逐台拉完状态（大户型要二十多秒）。
   // 与 devices 同源（/api/miot/home），失败提示由 devices 那一路给，这里不重复弹；
-  // 恢复也跟着 devices：凡是调 devices.reload() 的地方都一并重拉台账。
+  // 恢复也跟着 devices：设备数据一律经 reloadDeviceData() 重拉，两路不会漏掉一路。
   const deviceDirectory = useAsync(() => listDeviceDirectory(homeId), [homeId]);
+  const reloadDeviceData = () => {
+    devices.reload();
+    deviceDirectory.reload();
+  };
+  // 换家 / 换米家账号后整页刷新：先清台账缓存，否则刷新后会先用上一个家的房间和设备名渲染
+  // （homeId 恒为 "primary"，缓存 key 区分不了家）。
+  const reloadWithFreshDevices = () => {
+    clearDeviceDirectory(homeId);
+    window.location.reload();
+  };
   // 先用上次成功拉到的台账渲染（房间下拉随页面一起出现），拉取成功后再替换并写回缓存；
   // 拉取失败时继续用缓存。
   const cachedDirectory = useMemo(() => readDeviceDirectory(homeId), [homeId]);
@@ -266,8 +280,7 @@ function MainApp() {
                 persons.reload();
                 cameras.reload();
                 scopeCameras.reload();
-                devices.reload();
-                deviceDirectory.reload();
+                reloadDeviceData();
               }}
             />
           );
@@ -359,8 +372,7 @@ function MainApp() {
             <TabPanelError
               message={t("app.tabDevicesError", { msg: err.message })}
               onRetry={() => {
-                devices.reload();
-                deviceDirectory.reload();
+                reloadDeviceData();
                 scenes.reload();
               }}
             />
@@ -375,8 +387,7 @@ function MainApp() {
               devices={devices.data}
               scenes={scenes.data}
               onChanged={() => {
-                devices.reload();
-                deviceDirectory.reload();
+                reloadDeviceData();
                 scenes.reload();
               }}
             />
@@ -529,7 +540,7 @@ function MainApp() {
         onChange={setActiveTab}
         miot={status.data?.miot}
         onOpenMiotBind={() => setMiotBindOpen(true)}
-        onMiotChanged={() => window.location.reload()}
+        onMiotChanged={reloadWithFreshDevices}
         onOpenSettings={() => setSettingsOpen(true)}
       />
 
@@ -570,7 +581,7 @@ function MainApp() {
             } catch {
               /* sessionStorage 不可用降级 */
             }
-            window.location.reload();
+            reloadWithFreshDevices();
           }}
         />
 
@@ -662,7 +673,7 @@ function MainApp() {
             onChange={setActiveTab}
             miot={status.data?.miot}
             onOpenMiotBind={() => setMiotBindOpen(true)}
-            onMiotChanged={() => window.location.reload()}
+            onMiotChanged={reloadWithFreshDevices}
             onOpenSettings={() => setSettingsOpen(true)}
           />
         </div>
@@ -716,7 +727,7 @@ function MainApp() {
           } catch {
             /* sessionStorage 不可用降级,不影响 reload */
           }
-          window.location.reload();
+          reloadWithFreshDevices();
         }}
       />
 
