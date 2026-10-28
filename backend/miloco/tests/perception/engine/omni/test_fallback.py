@@ -1,8 +1,11 @@
 from types import SimpleNamespace
+from unittest.mock import AsyncMock, Mock
 
 import httpx
 import pytest
 from miloco.perception.engine.config import OmniConfig
+from miloco.perception.engine.identity.dispatcher import IdentityQueryItem
+from miloco.perception.engine.omni import omni as orchestrator
 from miloco.perception.engine.omni import omni_client
 from miloco.perception.engine.omni.circuit_breaker import CircuitOpenError
 from miloco.perception.engine.omni.omni_client import (
@@ -11,6 +14,7 @@ from miloco.perception.engine.omni.omni_client import (
     _is_fallback_eligible,
     resolve_fallback_omni_configs,
 )
+from miloco.perception.engine.types import OmniContext
 
 
 def _http_error(status: int) -> OmniError:
@@ -266,3 +270,91 @@ async def test_stream_does_not_fallback_after_partial_output(monkeypatch):
             pass
 
     assert calls == ["primary"]
+
+
+def _fused_engine():
+    candidates = [IdentityQueryItem(track_id=7, bbox_xyxy_norm=(100, 100, 400, 900))]
+    library = Mock()
+    library.list_persons.return_value = []
+    return SimpleNamespace(
+        library=library,
+        take_fused_pending=Mock(
+            return_value=SimpleNamespace(candidates=candidates, gallery_snapshot={})
+        ),
+        config=SimpleNamespace(
+            stranger=SimpleNamespace(distinguish=True), confidence_cutoff=0.5
+        ),
+        deliver_fused_response=AsyncMock(),
+        deliver_fused_failure=AsyncMock(),
+    )
+
+
+def _patch_fused_payload(monkeypatch, fallbacks):
+    built_for: list[str] = []
+
+    def fake_build(**kwargs):
+        built_for.append(type(kwargs["adapter"]).__name__)
+        return {"messages": [{"role": "user", "content": "window"}]}
+
+    monkeypatch.setattr(orchestrator, "build_fused_payload", fake_build)
+    monkeypatch.setattr(
+        orchestrator, "resolve_fallback_omni_configs", lambda config: fallbacks
+    )
+    monkeypatch.setattr(
+        orchestrator, "parse_identity_assignments", lambda raw, **kwargs: []
+    )
+    return built_for
+
+
+@pytest.mark.asyncio
+async def test_fused_falls_back_past_bad_backup_credentials(monkeypatch):
+    primary = OmniConfig(model="primary", base_url="https://p/v1", api_key="p")
+    broken = OmniConfig(model="broken", base_url="https://a/v1", api_key="a")
+    healthy = OmniConfig(model="healthy", base_url="https://b/v1", api_key="b")
+    built_for = _patch_fused_payload(monkeypatch, [broken, healthy])
+    calls: list[tuple[str, bool]] = []
+
+    async def fake_messages(
+        messages, config, *, adapter=None, use_circuit_breaker=True
+    ):
+        calls.append((config.model, use_circuit_breaker))
+        if config.model == "primary":
+            raise _http_error(429)
+        if config.model == "broken":
+            raise _http_error(401)
+        return {"choices": [{"message": {"content": '{"caption": "fallback ok"}'}}]}
+
+    monkeypatch.setattr(orchestrator, "_call_omni_messages", fake_messages)
+    engine = _fused_engine()
+
+    output = await orchestrator.run_omni_fused([], OmniContext(), primary, engine)
+
+    assert output.caption[0].description == "fallback ok"
+    assert calls == [("primary", True), ("broken", False), ("healthy", False)]
+    assert len(built_for) == 3
+    engine.deliver_fused_response.assert_awaited_once_with([])
+    engine.deliver_fused_failure.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_fused_reports_failure_once_when_all_providers_fail(monkeypatch):
+    primary = OmniConfig(model="primary", base_url="https://p/v1", api_key="p")
+    backup = OmniConfig(model="backup", base_url="https://b/v1", api_key="b")
+    _patch_fused_payload(monkeypatch, [backup])
+    calls: list[str] = []
+
+    async def fake_messages(
+        messages, config, *, adapter=None, use_circuit_breaker=True
+    ):
+        calls.append(config.model)
+        raise _http_error(429 if config.model == "primary" else 503)
+
+    monkeypatch.setattr(orchestrator, "_call_omni_messages", fake_messages)
+    engine = _fused_engine()
+
+    with pytest.raises(OmniError):
+        await orchestrator.run_omni_fused([], OmniContext(), primary, engine)
+
+    assert calls == ["primary", "backup"]
+    engine.deliver_fused_response.assert_not_awaited()
+    engine.deliver_fused_failure.assert_awaited_once()
